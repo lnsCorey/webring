@@ -1,0 +1,53 @@
+import { contextBridge, ipcRenderer } from 'electron';
+import { WebringDeepLinkAction } from '../src/shared/schema';
+
+contextBridge.exposeInMainWorld('studioApi', {
+  getBundle: () => ipcRenderer.invoke('studio:get-bundle'),
+  listPersonas: () => ipcRenderer.invoke('studio:list-personas'),
+  createPersona: (input: unknown) => ipcRenderer.invoke('studio:create-persona', input),
+  switchPersona: (personaId: string) => ipcRenderer.invoke('studio:switch-persona', personaId),
+  updatePersonaLabel: (personaId: string, label: string) =>
+    ipcRenderer.invoke('studio:update-persona-label', personaId, label),
+  deletePersona: (personaId: string, deleteFiles?: boolean) =>
+    ipcRenderer.invoke('studio:delete-persona', personaId, deleteFiles),
+  updateProfile: (updates: unknown) => ipcRenderer.invoke('studio:update-profile', updates),
+  createAlbum: (input: unknown) => ipcRenderer.invoke('studio:create-album', input),
+  deleteAlbum: (albumId: string) => ipcRenderer.invoke('studio:delete-album', albumId),
+  addPhoto: (input: unknown) => ipcRenderer.invoke('studio:add-photo', input),
+  pickAndImportPhoto: (albumId: string) => ipcRenderer.invoke('studio:pick-and-import-photo', albumId),
+  deletePhoto: (photoId: string) => ipcRenderer.invoke('studio:delete-photo', photoId),
+  createItem: (input: unknown) => ipcRenderer.invoke('studio:create-item', input),
+  deleteItem: (itemId: string) => ipcRenderer.invoke('studio:delete-item', itemId),
+  addFriend: (input: unknown) => ipcRenderer.invoke('studio:add-friend', input),
+  setFriendVisibility: (friendId: string, visibility: 'private' | 'public') =>
+    ipcRenderer.invoke('studio:set-friend-visibility', friendId, visibility),
+  deleteFriend: (friendId: string) => ipcRenderer.invoke('studio:delete-friend', friendId),
+  addWebring: (input: unknown) => ipcRenderer.invoke('studio:add-webring', input),
+  deleteWebring: (ringId: string) => ipcRenderer.invoke('studio:delete-webring', ringId),
+  crawlFriend: (siteUrl: string, localDirOverride?: string) =>
+    ipcRenderer.invoke('studio:crawl-friend', siteUrl, localDirOverride),
+  crawlAllFriends: () => ipcRenderer.invoke('studio:crawl-all-friends'),
+  syncWebringHub: (hubUrl: string) => ipcRenderer.invoke('studio:sync-webring-hub', hubUrl),
+  chooseExportFolder: () => ipcRenderer.invoke('studio:choose-export-folder'),
+  exportLocal: (targetDir?: string) => ipcRenderer.invoke('studio:export-local', targetDir),
+  testExportPreview: (openInBrowser?: boolean) =>
+    ipcRenderer.invoke('studio:test-export-preview', openInBrowser),
+  openExternal: (url: string) => ipcRenderer.invoke('studio:open-external', url),
+  publishRemote: (settings: unknown) => ipcRenderer.invoke('studio:publish-remote', settings),
+  openPath: (targetPath: string) => ipcRenderer.invoke('studio:open-path', targetPath),
+  simulatePeerSite: () => ipcRenderer.invoke('studio:simulate-peer-site'),
+  getMcpInfo: () => ipcRenderer.invoke('studio:get-mcp-info'),
+  callMcpTool: (toolName: string, args?: Record<string, unknown>) =>
+    ipcRenderer.invoke('studio:call-mcp-tool', toolName, args),
+  onMcpActivity: (callback: (entry: unknown) => void) => {
+    const listener = (_event: unknown, entry: unknown) => callback(entry);
+    ipcRenderer.on('studio:mcp-activity', listener);
+    return () => ipcRenderer.removeListener('studio:mcp-activity', listener);
+  },
+  onDeepLink: (callback: (action: WebringDeepLinkAction) => void) => {
+    const listener = (_event: unknown, action: WebringDeepLinkAction) => callback(action);
+    ipcRenderer.on('webring:deep-link', listener);
+    return () => ipcRenderer.removeListener('webring:deep-link', listener);
+  },
+});
+
