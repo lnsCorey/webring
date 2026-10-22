@@ -65,6 +65,12 @@ export interface PublishSettings {
   adsHeaderSlotId?: string;
   adsInFeedSlotId?: string;
   adsFooterSlotId?: string;
+  // Add-On 3: GitHub Pages Deploy
+  githubOwner?: string;
+  githubRepo?: string;
+  githubBranch?: string;
+  githubToken?: string;
+  githubCustomDomain?: string;
 }
 
 export interface NetworkFeedEntry {
@@ -299,6 +305,49 @@ export class StudioDatabase {
     if (!columns.some((c) => c.name === 'key_status')) {
       this.db.exec(`ALTER TABLE friends ADD COLUMN key_status TEXT NOT NULL DEFAULT 'unverified';`);
     }
+
+    this.migrateLegacyAbsoluteCustomLinks();
+  }
+
+  /**
+   * Early builds seeded the default "My Webring Feed" / "DID Identity" custom links as root-absolute
+   * paths (e.g. `/api/manifest.json`). Those 404 once the site is exported to a subfolder (e.g. a
+   * GitHub Pages project site at `username.github.io/repo-name/`), since the browser resolves them
+   * against the domain root instead of the page's own folder. Rewrites them to relative paths
+   * in-place for any already-seeded profile; leaves anything the user customized untouched.
+   */
+  private migrateLegacyAbsoluteCustomLinks(): void {
+    const legacyToFixed: Record<string, string> = {
+      '/api/manifest.json': './api/manifest.json',
+      '/.well-known/did.json': './.well-known/did.json',
+    };
+    const row = this.db
+      .prepare('SELECT custom_links_json FROM profile WHERE id = 1')
+      .get() as { custom_links_json?: string } | undefined;
+    if (!row?.custom_links_json) return;
+
+    let links: Array<{ label: string; url: string }>;
+    try {
+      links = JSON.parse(row.custom_links_json);
+    } catch {
+      return;
+    }
+    if (!Array.isArray(links)) return;
+
+    let changed = false;
+    const fixedLinks = links.map((link) => {
+      if (link && typeof link.url === 'string' && legacyToFixed[link.url]) {
+        changed = true;
+        return { ...link, url: legacyToFixed[link.url] };
+      }
+      return link;
+    });
+
+    if (changed) {
+      this.db
+        .prepare('UPDATE profile SET custom_links_json = ? WHERE id = 1')
+        .run(JSON.stringify(fixedLinks));
+    }
   }
 
   private ensureDefaultProfile(options?: StudioDatabaseOptions): void {
@@ -324,9 +373,11 @@ export class StudioDatabase {
         (shouldSeedStarter
           ? ['IndieWeb', 'Photography', 'Self-Hosting', 'Decentralized Web', 'Sci-Fi']
           : ['IndieWeb', 'Decentralized Web']);
+      // Relative, not root-absolute: these must still resolve correctly when the exported site is
+      // hosted in a subfolder (e.g. a GitHub Pages project site at username.github.io/repo-name/).
       const defaultLinks = [
-        { label: 'My Webring Feed', url: '/api/manifest.json' },
-        { label: 'DID Identity', url: '/.well-known/did.json' },
+        { label: 'My Webring Feed', url: './api/manifest.json' },
+        { label: 'DID Identity', url: './.well-known/did.json' },
       ];
       this.db
         .prepare(
@@ -593,6 +644,11 @@ export class StudioDatabase {
       adsHeaderSlotId: '',
       adsInFeedSlotId: '',
       adsFooterSlotId: '',
+      githubOwner: '',
+      githubRepo: '',
+      githubBranch: 'gh-pages',
+      githubToken: '',
+      githubCustomDomain: '',
       ...storedPublish,
     };
 
@@ -1091,6 +1147,37 @@ export class StudioDatabase {
       );
 
     return this.getWebrings().find((w) => w.hubUrl === input.hubUrl.trim())!;
+  }
+
+  public updateWebring(
+    ringId: string,
+    updates: {
+      name?: string;
+      hubUrl?: string;
+      description?: string;
+      prevSiteUrl?: string;
+      nextSiteUrl?: string;
+    }
+  ): WebringMembership {
+    const current = this.getWebrings().find((w) => w.id === ringId);
+    if (!current) {
+      throw new Error(`Webring membership "${ringId}" not found.`);
+    }
+    const merged = { ...current, ...updates };
+    this.db
+      .prepare(
+        `UPDATE webrings SET name = ?, hub_url = ?, description = ?, prev_site_url = ?, next_site_url = ?
+         WHERE id = ?`
+      )
+      .run(
+        merged.name,
+        merged.hubUrl.trim(),
+        merged.description || '',
+        merged.prevSiteUrl || '',
+        merged.nextSiteUrl || '',
+        ringId
+      );
+    return this.getWebrings().find((w) => w.id === ringId)!;
   }
 
   public deleteWebring(ringId: string): void {
