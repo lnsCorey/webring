@@ -218,6 +218,9 @@ function registerIpcHandlers() {
     electron_1.ipcMain.handle('studio:add-webring', (_e, input) => {
         return personaManager.getActiveContext().db.addWebring(input);
     });
+    electron_1.ipcMain.handle('studio:update-webring', (_e, ringId, updates) => {
+        return personaManager.getActiveContext().db.updateWebring(ringId, updates);
+    });
     electron_1.ipcMain.handle('studio:delete-webring', (_e, ringId) => {
         personaManager.getActiveContext().db.deleteWebring(ringId);
         return { ok: true };
@@ -286,6 +289,25 @@ function registerIpcHandlers() {
             fs.rmSync(stagingDir, { recursive: true, force: true });
         }
         return await ctx.sitePublisher.publishToRemoteHost(settings, stagingDir);
+    });
+    electron_1.ipcMain.handle('studio:publish-github', async (_e, settings) => {
+        const ctx = personaManager.getActiveContext();
+        const currentProfile = ctx.db.getProfile();
+        ctx.db.updateProfile({
+            publishSettings: {
+                ...currentProfile.publishSettings,
+                ...(settings || {}),
+            },
+        });
+        const stagingDir = path.join(electron_1.app.getPath('temp'), `webring-studio-github-staging-${ctx.persona.id}`);
+        if (fs.existsSync(stagingDir)) {
+            fs.rmSync(stagingDir, { recursive: true, force: true });
+        }
+        return await ctx.sitePublisher.publishToGitHubPages(settings, stagingDir);
+    });
+    electron_1.ipcMain.handle('studio:check-github-repo', async (_e, settings) => {
+        const ctx = personaManager.getActiveContext();
+        return await ctx.sitePublisher.checkGitHubRepo(settings);
     });
     electron_1.ipcMain.handle('studio:open-path', async (_e, targetPath) => {
         await electron_1.shell.openPath(targetPath);

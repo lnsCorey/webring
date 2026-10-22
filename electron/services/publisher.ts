@@ -7,11 +7,23 @@ import { StaticSiteGenerator } from './siteGenerator';
 
 export interface PublishResult {
   success: boolean;
-  mode: 'local' | 'sftp' | 'ftp';
+  mode: 'local' | 'sftp' | 'ftp' | 'github-pages';
   destination: string;
   filesPublished: number;
   message: string;
 }
+
+export interface GitHubRepoCheckResult {
+  success: boolean;
+  defaultBranch?: string;
+  branchExists?: boolean;
+  canPush?: boolean;
+  pagesEnabled?: boolean;
+  pagesUrl?: string;
+  message: string;
+}
+
+const GITHUB_API_BASE = 'https://api.github.com';
 
 export class SitePublisher {
   constructor(private generator: StaticSiteGenerator) {}
@@ -113,6 +125,316 @@ export class SitePublisher {
         };
       }
     }
+  }
+
+  /**
+   * Generates the site to a staging folder and pushes it to a GitHub repository branch via the
+   * GitHub REST "Git Data" API (blobs/trees/commits), then enables/updates GitHub Pages for that
+   * repo to serve from the branch. Requires a Personal Access Token with `repo` scope (classic)
+   * or Contents: Read & Write + Pages: Read & Write (fine-grained).
+   */
+  public async publishToGitHubPages(
+    settings: PublishSettings,
+    stagingDir: string
+  ): Promise<PublishResult> {
+    const owner = (settings.githubOwner || '').trim();
+    const repo = (settings.githubRepo || '').trim();
+    const branch = (settings.githubBranch || 'gh-pages').trim();
+    const token = (settings.githubToken || '').trim();
+
+    if (!owner || !repo || !token) {
+      return {
+        success: false,
+        mode: 'github-pages',
+        destination: '',
+        filesPublished: 0,
+        message: 'GitHub Pages deploy requires an owner, repository name, and access token.',
+      };
+    }
+
+    const genResult = this.generator.generateToDirectory(stagingDir);
+
+    const customDomain = (settings.githubCustomDomain || '').trim();
+    if (customDomain) {
+      fs.writeFileSync(path.join(stagingDir, 'CNAME'), `${customDomain}\n`, 'utf8');
+      genResult.filesWritten.push('CNAME');
+    }
+
+    const gh = this.githubRequest.bind(this, token);
+    const repoPath = `/repos/${owner}/${repo}`;
+
+    try {
+      // 0. Confirm up front that the token can actually push, so a permissions problem fails fast
+      // with a clear message instead of after reads (and maybe a branch creation) have succeeded.
+      const repoInfoRes = await gh(repoPath);
+      if (repoInfoRes.status !== 200) {
+        throw new Error(
+          `Repository ${owner}/${repo} not found or token lacks access (HTTP ${repoInfoRes.status})${this.githubErrorDetail(repoInfoRes.body)}`
+        );
+      }
+      const repoInfoBody = repoInfoRes.body as {
+        default_branch: string;
+        permissions?: { push?: boolean; admin?: boolean };
+      };
+      if (repoInfoBody.permissions && repoInfoBody.permissions.push === false) {
+        throw new Error(
+          `Resource not accessible by personal access token — it can read ${owner}/${repo} but not push to it. ` +
+            `For a classic token, grant the "repo" scope; for a fine-grained token, grant "Contents: Read and write" ` +
+            `(and "Pages: Read and write" to auto-enable Pages) on this repository, then save your settings again.`
+        );
+      }
+
+      // 1. Resolve (or create) the target branch's current commit + tree.
+      let baseCommitSha: string;
+      const refRes = await gh(`${repoPath}/git/ref/heads/${encodeURIComponent(branch)}`);
+      if (refRes.status === 200) {
+        baseCommitSha = (refRes.body as { object: { sha: string } }).object.sha;
+      } else if (refRes.status === 404) {
+        const defaultBranch = repoInfoBody.default_branch;
+        const defaultRefRes = await gh(
+          `${repoPath}/git/ref/heads/${encodeURIComponent(defaultBranch)}`
+        );
+        if (defaultRefRes.status !== 200) {
+          throw new Error(`Repository ${owner}/${repo} has no commits yet; push an initial commit first.`);
+        }
+        const defaultSha = (defaultRefRes.body as { object: { sha: string } }).object.sha;
+        const createRefRes = await gh(`${repoPath}/git/refs`, 'POST', {
+          ref: `refs/heads/${branch}`,
+          sha: defaultSha,
+        });
+        if (createRefRes.status !== 201) {
+          throw new Error(`Failed to create branch "${branch}" (HTTP ${createRefRes.status})${this.githubErrorDetail(createRefRes.body)}`);
+        }
+        baseCommitSha = defaultSha;
+      } else {
+        throw new Error(`Failed to resolve branch "${branch}" (HTTP ${refRes.status})${this.githubErrorDetail(refRes.body)}`);
+      }
+
+      const baseCommitRes = await gh(`${repoPath}/git/commits/${baseCommitSha}`);
+      if (baseCommitRes.status !== 200) {
+        throw new Error(`Failed to read base commit (HTTP ${baseCommitRes.status})${this.githubErrorDetail(baseCommitRes.body)}`);
+      }
+      const baseTreeSha = (baseCommitRes.body as { tree: { sha: string } }).tree.sha;
+
+      // 2. Upload every file in the staging dir as a blob. GitHub's abuse-detection rate limiter
+      // flags concurrent writes to this endpoint, so these go one at a time (retried internally
+      // with backoff by githubRequest on 403/429) rather than in parallel chunks.
+      const files = this.listFilesRecursive(stagingDir);
+      const treeEntries: Array<{ path: string; mode: string; type: string; sha: string }> = [];
+      for (const relPath of files) {
+        const content = fs.readFileSync(path.join(stagingDir, relPath)).toString('base64');
+        const blobRes = await gh(`${repoPath}/git/blobs`, 'POST', {
+          content,
+          encoding: 'base64',
+        });
+        if (blobRes.status !== 201) {
+          throw new Error(
+            `Failed to upload "${relPath}" (HTTP ${blobRes.status})${this.githubErrorDetail(blobRes.body)}`
+          );
+        }
+        treeEntries.push({
+          path: relPath,
+          mode: '100644',
+          type: 'blob',
+          sha: (blobRes.body as { sha: string }).sha,
+        });
+      }
+
+      // 3. Create a new tree + commit on top of the branch's current state, then fast-forward the ref.
+      const treeRes = await gh(`${repoPath}/git/trees`, 'POST', {
+        base_tree: baseTreeSha,
+        tree: treeEntries,
+      });
+      if (treeRes.status !== 201) {
+        throw new Error(`Failed to create tree (HTTP ${treeRes.status})${this.githubErrorDetail(treeRes.body)}`);
+      }
+      const newTreeSha = (treeRes.body as { sha: string }).sha;
+
+      const commitRes = await gh(`${repoPath}/git/commits`, 'POST', {
+        message: `Publish site via Webring Studio (${genResult.filesWritten.length} files)`,
+        tree: newTreeSha,
+        parents: [baseCommitSha],
+      });
+      if (commitRes.status !== 201) {
+        throw new Error(`Failed to create commit (HTTP ${commitRes.status})${this.githubErrorDetail(commitRes.body)}`);
+      }
+      const newCommitSha = (commitRes.body as { sha: string }).sha;
+
+      const updateRefRes = await gh(`${repoPath}/git/refs/heads/${encodeURIComponent(branch)}`, 'PATCH', {
+        sha: newCommitSha,
+        force: true,
+      });
+      if (updateRefRes.status !== 200) {
+        throw new Error(`Failed to update branch "${branch}" (HTTP ${updateRefRes.status})${this.githubErrorDetail(updateRefRes.body)}`);
+      }
+
+      // 4. Ensure GitHub Pages is configured to serve from this branch (best-effort; not fatal).
+      let pagesNote = '';
+      try {
+        const pagesCreateRes = await gh(`${repoPath}/pages`, 'POST', {
+          source: { branch, path: '/' },
+        });
+        if (pagesCreateRes.status === 201) {
+          pagesNote = ' GitHub Pages was enabled for this repo.';
+        } else if (pagesCreateRes.status === 409) {
+          await gh(`${repoPath}/pages`, 'PUT', { source: { branch, path: '/' } });
+        }
+      } catch {
+        pagesNote = ' (Could not confirm GitHub Pages site settings — check them in the repo settings.)';
+      }
+
+      return {
+        success: true,
+        mode: 'github-pages',
+        destination: `https://github.com/${owner}/${repo}/tree/${branch}`,
+        filesPublished: genResult.filesWritten.length,
+        message: `Pushed ${genResult.filesWritten.length} files to ${owner}/${repo}@${branch}.${pagesNote}`,
+      };
+    } catch (err: unknown) {
+      return {
+        success: false,
+        mode: 'github-pages',
+        destination: `${owner}/${repo}`,
+        filesPublished: 0,
+        message: `GitHub Pages deploy failed: ${err instanceof Error ? err.message : String(err)}`,
+      };
+    }
+  }
+
+  /**
+   * Verifies the stored GitHub token can see the repo and reports branch/Pages status, without
+   * publishing anything — used by the "Check Repo Access" button.
+   */
+  public async checkGitHubRepo(settings: PublishSettings): Promise<GitHubRepoCheckResult> {
+    const owner = (settings.githubOwner || '').trim();
+    const repo = (settings.githubRepo || '').trim();
+    const branch = (settings.githubBranch || 'gh-pages').trim();
+    const token = (settings.githubToken || '').trim();
+
+    if (!owner || !repo || !token) {
+      return { success: false, message: 'Enter an owner, repository name, and access token first.' };
+    }
+
+    const gh = this.githubRequest.bind(this, token);
+    const repoPath = `/repos/${owner}/${repo}`;
+
+    const repoRes = await gh(repoPath);
+    if (repoRes.status === 401) {
+      return { success: false, message: 'GitHub rejected the token (401 Unauthorized).' };
+    }
+    if (repoRes.status === 404) {
+      return { success: false, message: `Repository ${owner}/${repo} was not found, or the token can't see it.` };
+    }
+    if (repoRes.status !== 200) {
+      return { success: false, message: `GitHub returned HTTP ${repoRes.status}.` };
+    }
+
+    const repoInfoBody = repoRes.body as {
+      default_branch: string;
+      permissions?: { push?: boolean };
+    };
+    const defaultBranch = repoInfoBody.default_branch;
+    const canPush = repoInfoBody.permissions?.push !== false;
+
+    if (!canPush) {
+      return {
+        success: false,
+        defaultBranch,
+        canPush: false,
+        message:
+          `Token can read ${owner}/${repo} but can't push to it. For a classic token, grant the ` +
+          `"repo" scope; for a fine-grained token, grant "Contents: Read and write" on this repo.`,
+      };
+    }
+
+    const refRes = await gh(`${repoPath}/git/ref/heads/${encodeURIComponent(branch)}`);
+    const branchExists = refRes.status === 200;
+
+    const pagesRes = await gh(`${repoPath}/pages`);
+    const pagesEnabled = pagesRes.status === 200;
+    const pagesUrl = pagesEnabled ? (pagesRes.body as { html_url?: string }).html_url : undefined;
+
+    return {
+      success: true,
+      defaultBranch,
+      branchExists,
+      canPush,
+      pagesEnabled,
+      pagesUrl,
+      message: branchExists
+        ? `Connected to ${owner}/${repo}. Branch "${branch}" exists.${pagesEnabled ? ' GitHub Pages is already enabled.' : ' GitHub Pages is not yet enabled — it will be enabled on first deploy.'}`
+        : `Connected to ${owner}/${repo}. Branch "${branch}" doesn't exist yet — it will be created from "${defaultBranch}" on first deploy.`,
+    };
+  }
+
+  /**
+   * GitHub aggressively secondary-rate-limits concurrent writes to mutating endpoints (like blob
+   * creation), returning 403 with a `retry_after`/Retry-After hint rather than a scope/permission
+   * error. We retry those (and raw 429s) with backoff instead of failing the whole deploy on one
+   * unlucky request.
+   */
+  private async githubRequest(
+    token: string,
+    urlPath: string,
+    method: 'GET' | 'POST' | 'PATCH' | 'PUT' = 'GET',
+    body?: unknown,
+    attempt = 1
+  ): Promise<{ status: number; body: unknown }> {
+    const res = await fetch(`${GITHUB_API_BASE}${urlPath}`, {
+      method,
+      headers: {
+        Authorization: `Bearer ${token}`,
+        Accept: 'application/vnd.github+json',
+        'X-GitHub-Api-Version': '2022-11-28',
+        'User-Agent': 'webring-studio',
+        ...(body ? { 'Content-Type': 'application/json' } : {}),
+      },
+      body: body ? JSON.stringify(body) : undefined,
+    });
+    const text = await res.text();
+    let parsed: unknown = {};
+    try {
+      parsed = text ? JSON.parse(text) : {};
+    } catch {
+      parsed = { raw: text };
+    }
+
+    const isRateLimited =
+      res.status === 429 ||
+      (res.status === 403 &&
+        (res.headers.get('retry-after') ||
+          res.headers.get('x-ratelimit-remaining') === '0' ||
+          /rate limit/i.test(String((parsed as { message?: string }).message || ''))));
+
+    if (isRateLimited && attempt < 5) {
+      const retryAfterHeader = Number(res.headers.get('retry-after'));
+      const waitMs = Number.isFinite(retryAfterHeader) && retryAfterHeader > 0
+        ? retryAfterHeader * 1000
+        : 1000 * 2 ** attempt;
+      await new Promise((resolve) => setTimeout(resolve, waitMs));
+      return this.githubRequest(token, urlPath, method, body, attempt + 1);
+    }
+
+    return { status: res.status, body: parsed };
+  }
+
+  /** Extracts GitHub's human-readable `message` field from a response body, if present. */
+  private githubErrorDetail(body: unknown): string {
+    const msg = (body as { message?: string } | null)?.message;
+    return msg ? ` — ${msg}` : '';
+  }
+
+  private listFilesRecursive(dir: string, prefix = ''): string[] {
+    const out: string[] = [];
+    for (const entry of fs.readdirSync(dir, { withFileTypes: true })) {
+      const relPath = prefix ? `${prefix}/${entry.name}` : entry.name;
+      if (entry.isDirectory()) {
+        out.push(...this.listFilesRecursive(path.join(dir, entry.name), relPath));
+      } else {
+        out.push(relPath);
+      }
+    }
+    return out;
   }
 
   /**
