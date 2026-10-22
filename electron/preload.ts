@@ -23,6 +23,8 @@ contextBridge.exposeInMainWorld('studioApi', {
     ipcRenderer.invoke('studio:set-friend-visibility', friendId, visibility),
   deleteFriend: (friendId: string) => ipcRenderer.invoke('studio:delete-friend', friendId),
   addWebring: (input: unknown) => ipcRenderer.invoke('studio:add-webring', input),
+  updateWebring: (ringId: string, updates: unknown) =>
+    ipcRenderer.invoke('studio:update-webring', ringId, updates),
   deleteWebring: (ringId: string) => ipcRenderer.invoke('studio:delete-webring', ringId),
   crawlFriend: (siteUrl: string, localDirOverride?: string) =>
     ipcRenderer.invoke('studio:crawl-friend', siteUrl, localDirOverride),
@@ -34,6 +36,8 @@ contextBridge.exposeInMainWorld('studioApi', {
     ipcRenderer.invoke('studio:test-export-preview', openInBrowser),
   openExternal: (url: string) => ipcRenderer.invoke('studio:open-external', url),
   publishRemote: (settings: unknown) => ipcRenderer.invoke('studio:publish-remote', settings),
+  publishGithub: (settings: unknown) => ipcRenderer.invoke('studio:publish-github', settings),
+  checkGithubRepo: (settings: unknown) => ipcRenderer.invoke('studio:check-github-repo', settings),
   openPath: (targetPath: string) => ipcRenderer.invoke('studio:open-path', targetPath),
   simulatePeerSite: () => ipcRenderer.invoke('studio:simulate-peer-site'),
   getMcpInfo: () => ipcRenderer.invoke('studio:get-mcp-info'),

@@ -13,6 +13,7 @@ import {
   siteUrlToDidWeb,
   WEBRING_SCHEMA_VERSION,
   WebringDeepLinkAction,
+  WebringMembership,
 } from '../shared/schema';
 import { ProfileSiteApp } from '../profile-site/ProfileSiteApp';
 import {
@@ -76,6 +77,11 @@ interface PublishSettingsState {
   adsHeaderSlotId?: string;
   adsInFeedSlotId?: string;
   adsFooterSlotId?: string;
+  githubOwner?: string;
+  githubRepo?: string;
+  githubBranch?: string;
+  githubToken?: string;
+  githubCustomDomain?: string;
 }
 
 interface NetworkFeedEntry {
@@ -180,6 +186,7 @@ declare global {
       ) => Promise<FriendConnection | undefined>;
       deleteFriend: (friendId: string) => Promise<unknown>;
       addWebring: (input: unknown) => Promise<unknown>;
+      updateWebring: (ringId: string, updates: unknown) => Promise<unknown>;
       deleteWebring: (ringId: string) => Promise<unknown>;
       crawlFriend: (siteUrl: string, localDirOverride?: string) => Promise<{
         siteUrl: string;
@@ -206,6 +213,21 @@ declare global {
         success: boolean;
         destination: string;
         filesPublished: number;
+        message: string;
+      }>;
+      publishGithub: (settings: unknown) => Promise<{
+        success: boolean;
+        destination: string;
+        filesPublished: number;
+        message: string;
+      }>;
+      checkGithubRepo: (settings: unknown) => Promise<{
+        success: boolean;
+        defaultBranch?: string;
+        branchExists?: boolean;
+        canPush?: boolean;
+        pagesEnabled?: boolean;
+        pagesUrl?: string;
         message: string;
       }>;
       openPath: (targetPath: string) => Promise<unknown>;
@@ -321,6 +343,7 @@ export const App: React.FC = () => {
   const [interestsInput, setInterestsInput] = useState('');
   const [theme, setTheme] = useState<ProfileTheme>('neo-webring');
   const [atprotoHandle, setAtprotoHandle] = useState('');
+  const [customLinks, setCustomLinks] = useState<Array<{ label: string; url: string }>>([]);
 
   // Publish settings state
   const [publishSettings, setPublishSettings] = useState<PublishSettingsState>({
@@ -354,6 +377,11 @@ export const App: React.FC = () => {
     adsHeaderSlotId: '',
     adsInFeedSlotId: '',
     adsFooterSlotId: '',
+    githubOwner: '',
+    githubRepo: '',
+    githubBranch: 'gh-pages',
+    githubToken: '',
+    githubCustomDomain: '',
   });
 
   // New Album / Photo state
@@ -391,10 +419,33 @@ export const App: React.FC = () => {
   const [ringPrevUrl, setRingPrevUrl] = useState('');
   const [ringNextUrl, setRingNextUrl] = useState('');
 
+  // Editing an already-joined webring's name/description/neighbors
+  const [editingRingId, setEditingRingId] = useState<string | null>(null);
+  const [editRingDraft, setEditRingDraft] = useState<{
+    name: string;
+    hubUrl: string;
+    description: string;
+    prevSiteUrl: string;
+    nextSiteUrl: string;
+  }>({ name: '', hubUrl: '', description: '', prevSiteUrl: '', nextSiteUrl: '' });
+
   // Schema Inspector state
   const [selectedSchemaFile, setSelectedSchemaFile] = useState<
     'manifest' | 'did' | 'profile' | 'albums' | 'items' | 'connections'
   >('manifest');
+
+  // GitHub Pages Deploy state
+  const [githubCheckResult, setGithubCheckResult] = useState<{
+    success: boolean;
+    defaultBranch?: string;
+    branchExists?: boolean;
+    canPush?: boolean;
+    pagesEnabled?: boolean;
+    pagesUrl?: string;
+    message: string;
+  } | null>(null);
+  const [githubChecking, setGithubChecking] = useState(false);
+  const [githubDeploying, setGithubDeploying] = useState(false);
 
   // Local Test Export & Live HTTP Server Preview state
   const [testExportResult, setTestExportResult] = useState<TestExportPreviewState | null>(null);
@@ -464,6 +515,7 @@ export const App: React.FC = () => {
     setInterestsInput((p.interests || []).join(', '));
     setTheme(p.theme);
     setAtprotoHandle(p.atprotoHandle || '');
+    setCustomLinks((p.customLinks || []).map((l) => ({ label: l.label, url: l.url })));
     if (p.publishSettings) {
       setPublishSettings((prev) => ({
         exportPath: '',
@@ -491,6 +543,11 @@ export const App: React.FC = () => {
         adsHeaderSlotId: '',
         adsInFeedSlotId: '',
         adsFooterSlotId: '',
+        githubOwner: '',
+        githubRepo: '',
+        githubBranch: 'gh-pages',
+        githubToken: '',
+        githubCustomDomain: '',
         ...p.publishSettings,
       }));
     }
@@ -643,6 +700,9 @@ export const App: React.FC = () => {
         .filter(Boolean),
       theme,
       atprotoHandle,
+      customLinks: customLinks
+        .map((l) => ({ label: l.label.trim(), url: l.url.trim() }))
+        .filter((l) => l.label && l.url),
       publishSettings,
     });
     await refreshStudioData();
@@ -809,6 +869,47 @@ export const App: React.FC = () => {
     notify(`Joined Webring "${ringName}"!`);
   };
 
+  const handleStartEditWebring = (ring: WebringMembership) => {
+    setEditingRingId(ring.id);
+    setEditRingDraft({
+      name: ring.name,
+      hubUrl: ring.hubUrl,
+      description: ring.description || '',
+      prevSiteUrl: ring.prevSiteUrl || '',
+      nextSiteUrl: ring.nextSiteUrl || '',
+    });
+  };
+
+  const handleCancelEditWebring = () => {
+    setEditingRingId(null);
+  };
+
+  const handleSaveEditWebring = async () => {
+    if (!editingRingId || !window.studioApi) return;
+    await window.studioApi.updateWebring(editingRingId, {
+      name: editRingDraft.name.trim(),
+      hubUrl: editRingDraft.hubUrl.trim(),
+      description: editRingDraft.description.trim(),
+      prevSiteUrl: editRingDraft.prevSiteUrl.trim(),
+      nextSiteUrl: editRingDraft.nextSiteUrl.trim(),
+    });
+    setEditingRingId(null);
+    await refreshStudioData();
+    notify(`Updated Webring "${editRingDraft.name.trim()}"!`);
+  };
+
+  const handleDeleteWebring = async (ring: WebringMembership) => {
+    if (!window.studioApi) return;
+    const confirmed = window.confirm(
+      `Remove "${ring.name}" from your joined webrings? This deletes the webring bar it adds to your exported site.`
+    );
+    if (!confirmed) return;
+    await window.studioApi.deleteWebring(ring.id);
+    if (editingRingId === ring.id) setEditingRingId(null);
+    await refreshStudioData();
+    notify(`Left Webring "${ring.name}".`);
+  };
+
   const handleSimulatePeerSync = async () => {
     if (!window.studioApi) return;
     const res = await window.studioApi.simulatePeerSite();
@@ -892,6 +993,64 @@ export const App: React.FC = () => {
     const res = await window.studioApi.publishRemote(publishSettings);
     await refreshStudioData();
     notify(res.message);
+  };
+
+  const handleSaveGithubSettings = async () => {
+    if (!window.studioApi) return;
+    await window.studioApi.updateProfile({ publishSettings });
+    await refreshStudioData();
+    notify('Saved GitHub Pages connection settings for this persona in SQLite!');
+  };
+
+  const handleClearGithubSettings = async () => {
+    if (!window.studioApi) return;
+    const activeLabel =
+      personas.find((p) => p.id === activePersonaId)?.label || bundle?.profile.displayName || 'this persona';
+    const confirmed = window.confirm(
+      `Delete the stored GitHub owner, repo, branch, token, and custom domain from ${activeLabel}'s database?`
+    );
+    if (!confirmed) return;
+
+    const clearedSettings: PublishSettingsState = {
+      ...publishSettings,
+      githubOwner: '',
+      githubRepo: '',
+      githubBranch: 'gh-pages',
+      githubToken: '',
+      githubCustomDomain: '',
+    };
+    setPublishSettings(clearedSettings);
+    setGithubCheckResult(null);
+    await window.studioApi.updateProfile({ publishSettings: clearedSettings });
+    await refreshStudioData();
+    notify(`Deleted stored GitHub Pages credentials from ${activeLabel}'s database.`);
+  };
+
+  const handleCheckGithubRepo = async () => {
+    if (!window.studioApi) return;
+    setGithubChecking(true);
+    try {
+      const res = await window.studioApi.checkGithubRepo(publishSettings);
+      setGithubCheckResult(res);
+      notify(res.message);
+    } finally {
+      setGithubChecking(false);
+    }
+  };
+
+  const handlePublishGithub = async (e: React.FormEvent) => {
+    e.preventDefault();
+    if (!window.studioApi) return;
+    await window.studioApi.updateProfile({ publishSettings });
+    notify(`Saved settings & deploying to github.com/${publishSettings.githubOwner}/${publishSettings.githubRepo}...`);
+    setGithubDeploying(true);
+    try {
+      const res = await window.studioApi.publishGithub(publishSettings);
+      await refreshStudioData();
+      notify(res.message);
+    } finally {
+      setGithubDeploying(false);
+    }
   };
 
   if (!bundle) {
@@ -1289,6 +1448,68 @@ export const App: React.FC = () => {
                       placeholder="yourname.bsky.social"
                     />
                   </div>
+                </div>
+
+                <div className="space-y-2">
+                  <div className="flex items-center justify-between">
+                    <label className="block text-xs font-semibold uppercase tracking-wider text-slate-400">
+                      Custom Links (shown below your bio)
+                    </label>
+                    <button
+                      type="button"
+                      onClick={() =>
+                        setCustomLinks((prev) => [...prev, { label: '', url: '' }])
+                      }
+                      className="text-xs px-2.5 py-1 rounded-lg bg-slate-800 hover:bg-slate-700 font-medium"
+                    >
+                      + Add Link
+                    </button>
+                  </div>
+                  <p className="text-[11px] text-slate-500">
+                    Use a URL starting with <code>./</code> (e.g. <code>./api/manifest.json</code>)
+                    to point at a file inside your own exported site — not a leading{' '}
+                    <code>/</code>, which breaks once your site is hosted in a subfolder (like a
+                    GitHub Pages project site at <code>username.github.io/repo-name/</code>).
+                  </p>
+                  {customLinks.length === 0 && (
+                    <p className="text-xs text-slate-500 italic">No custom links yet.</p>
+                  )}
+                  {customLinks.map((link, idx) => (
+                    <div key={idx} className="flex gap-2 items-center">
+                      <input
+                        type="text"
+                        value={link.label}
+                        onChange={(e) =>
+                          setCustomLinks((prev) =>
+                            prev.map((l, i) => (i === idx ? { ...l, label: e.target.value } : l))
+                          )
+                        }
+                        placeholder="Label"
+                        className="w-40 px-3 py-2 rounded-xl bg-slate-950 border border-slate-800 text-sm"
+                      />
+                      <input
+                        type="text"
+                        value={link.url}
+                        onChange={(e) =>
+                          setCustomLinks((prev) =>
+                            prev.map((l, i) => (i === idx ? { ...l, url: e.target.value } : l))
+                          )
+                        }
+                        placeholder="./api/manifest.json or https://..."
+                        className="flex-1 px-3 py-2 rounded-xl bg-slate-950 border border-slate-800 text-sm font-mono"
+                      />
+                      <button
+                        type="button"
+                        onClick={() =>
+                          setCustomLinks((prev) => prev.filter((_, i) => i !== idx))
+                        }
+                        className="p-2 rounded-lg bg-rose-950/40 hover:bg-rose-900/50 border border-rose-500/30 text-rose-300"
+                        title="Remove this link"
+                      >
+                        <Trash2 className="w-3.5 h-3.5" />
+                      </button>
+                    </div>
+                  ))}
                 </div>
 
                 <div className="pt-2 flex items-center justify-between">
@@ -2222,6 +2443,145 @@ export const App: React.FC = () => {
                 </form>
               </div>
 
+              {/* Joined Webrings List (edit the banner text shown on your site) */}
+              {bundle.connections.webrings.length > 0 && (
+                <div>
+                  <div className="flex flex-wrap items-center justify-between gap-2 mb-3">
+                    <h3 className="font-bold text-lg">
+                      Joined Webrings ({bundle.connections.webrings.length})
+                    </h3>
+                    <p className="text-xs text-slate-400">
+                      This is the banner shown at the top of your Live Site Preview & exported site.
+                    </p>
+                  </div>
+                  <div className="space-y-3">
+                    {bundle.connections.webrings.map((ring) => {
+                      const isEditing = editingRingId === ring.id;
+                      return (
+                        <div
+                          key={ring.id}
+                          className="bg-slate-900 border border-slate-800 rounded-xl p-4 space-y-3"
+                        >
+                          {isEditing ? (
+                            <>
+                              <div className="grid grid-cols-1 md:grid-cols-2 gap-3">
+                                <div>
+                                  <label className="block text-xs text-slate-400 mb-1">Webring Name</label>
+                                  <input
+                                    type="text"
+                                    value={editRingDraft.name}
+                                    onChange={(e) =>
+                                      setEditRingDraft((prev) => ({ ...prev, name: e.target.value }))
+                                    }
+                                    className="w-full px-3 py-2 rounded-xl bg-slate-950 border border-slate-800 text-sm"
+                                  />
+                                </div>
+                                <div>
+                                  <label className="block text-xs text-slate-400 mb-1">Webring Hub JSON URL</label>
+                                  <input
+                                    type="text"
+                                    value={editRingDraft.hubUrl}
+                                    onChange={(e) =>
+                                      setEditRingDraft((prev) => ({ ...prev, hubUrl: e.target.value }))
+                                    }
+                                    className="w-full px-3 py-2 rounded-xl bg-slate-950 border border-slate-800 text-sm font-mono"
+                                  />
+                                </div>
+                              </div>
+                              <div>
+                                <label className="block text-xs text-slate-400 mb-1">Description</label>
+                                <input
+                                  type="text"
+                                  value={editRingDraft.description}
+                                  onChange={(e) =>
+                                    setEditRingDraft((prev) => ({ ...prev, description: e.target.value }))
+                                  }
+                                  placeholder="A circle of independent creators..."
+                                  className="w-full px-3 py-2 rounded-xl bg-slate-950 border border-slate-800 text-sm"
+                                />
+                              </div>
+                              <div className="grid grid-cols-1 md:grid-cols-2 gap-3">
+                                <div>
+                                  <label className="block text-xs text-slate-400 mb-1">Previous Neighbor URL</label>
+                                  <input
+                                    type="text"
+                                    value={editRingDraft.prevSiteUrl}
+                                    onChange={(e) =>
+                                      setEditRingDraft((prev) => ({ ...prev, prevSiteUrl: e.target.value }))
+                                    }
+                                    className="w-full px-3 py-2 rounded-xl bg-slate-950 border border-slate-800 text-sm"
+                                  />
+                                </div>
+                                <div>
+                                  <label className="block text-xs text-slate-400 mb-1">Next Neighbor URL</label>
+                                  <input
+                                    type="text"
+                                    value={editRingDraft.nextSiteUrl}
+                                    onChange={(e) =>
+                                      setEditRingDraft((prev) => ({ ...prev, nextSiteUrl: e.target.value }))
+                                    }
+                                    className="w-full px-3 py-2 rounded-xl bg-slate-950 border border-slate-800 text-sm"
+                                  />
+                                </div>
+                              </div>
+                              <div className="flex items-center gap-2 pt-1">
+                                <button
+                                  type="button"
+                                  onClick={handleSaveEditWebring}
+                                  className="px-4 py-2 rounded-xl bg-emerald-600 hover:bg-emerald-500 text-white font-semibold text-xs flex items-center gap-1.5"
+                                >
+                                  <CheckCircle2 className="w-3.5 h-3.5" />
+                                  Save Changes
+                                </button>
+                                <button
+                                  type="button"
+                                  onClick={handleCancelEditWebring}
+                                  className="px-3.5 py-2 rounded-xl bg-slate-800 hover:bg-slate-700 text-xs font-medium"
+                                >
+                                  Cancel
+                                </button>
+                              </div>
+                            </>
+                          ) : (
+                            <div className="flex items-start justify-between gap-4">
+                              <div className="min-w-0">
+                                <div className="flex items-center gap-2 flex-wrap">
+                                  <span className="px-2 py-0.5 rounded-full bg-indigo-500/20 text-indigo-400 text-[10px] font-bold tracking-wide">
+                                    WEBRING
+                                  </span>
+                                  <h4 className="font-bold text-sm truncate">{ring.name}</h4>
+                                </div>
+                                {ring.description && (
+                                  <p className="text-xs text-slate-400 mt-1">— {ring.description}</p>
+                                )}
+                                <p className="text-xs text-indigo-400 font-mono truncate mt-1">{ring.hubUrl}</p>
+                              </div>
+                              <div className="flex items-center gap-2 shrink-0">
+                                <button
+                                  type="button"
+                                  onClick={() => handleStartEditWebring(ring)}
+                                  className="px-3 py-1.5 rounded-lg bg-slate-800 hover:bg-slate-700 text-xs font-medium"
+                                >
+                                  Edit
+                                </button>
+                                <button
+                                  type="button"
+                                  onClick={() => handleDeleteWebring(ring)}
+                                  className="px-2.5 py-1.5 rounded-lg bg-rose-950/40 hover:bg-rose-900/50 border border-rose-500/30 text-rose-300"
+                                  title="Leave this webring (removes its banner from your site)"
+                                >
+                                  <Trash2 className="w-3.5 h-3.5" />
+                                </button>
+                              </div>
+                            </div>
+                          )}
+                        </div>
+                      );
+                    })}
+                  </div>
+                </div>
+              )}
+
               {/* Friends List */}
               <div>
                 <div className="flex flex-wrap items-center justify-between gap-2 mb-3">
@@ -2411,9 +2771,9 @@ export const App: React.FC = () => {
                           key={entry.id}
                           className="bg-slate-900 border border-slate-800 rounded-2xl p-5 space-y-4"
                         >
-                          <div className="flex flex-col sm:flex-row gap-4 justify-between">
-                            <div className="space-y-2 flex-1">
-                              <div className="flex items-center gap-2.5">
+                          <div className="space-y-2 min-w-0">
+                            <div className="flex items-start justify-between gap-3">
+                              <div className="flex items-center gap-2.5 min-w-0">
                                 <img
                                   src={
                                     entry.friendAvatarUrl ||
@@ -2422,10 +2782,10 @@ export const App: React.FC = () => {
                                     )}`
                                   }
                                   alt={entry.friendName}
-                                  className="w-8 h-8 rounded-full object-cover"
+                                  className="w-8 h-8 rounded-full object-cover shrink-0"
                                 />
-                                <div>
-                                  <div className="flex items-center gap-2">
+                                <div className="min-w-0">
+                                  <div className="flex items-center gap-2 flex-wrap">
                                     <span className="font-bold text-sm">{entry.friendName}</span>
                                     {entry.verifiedSignature && (
                                       <span className="text-[10px] px-2 py-0.5 rounded-full bg-emerald-500/20 text-emerald-400 font-mono">
@@ -2433,32 +2793,14 @@ export const App: React.FC = () => {
                                       </span>
                                     )}
                                   </div>
-                                  <p className="text-[11px] text-slate-400 font-mono">
+                                  <p className="text-[11px] text-slate-400 font-mono truncate">
                                     {entry.friendSiteUrl}
                                   </p>
                                 </div>
                               </div>
 
-                              {entry.mediaUrl && (
-                                <img
-                                  src={entry.mediaUrl}
-                                  alt={entry.title}
-                                  className="w-full max-h-72 object-cover rounded-xl mt-2"
-                                />
-                              )}
-
-                              <h4 className="font-bold text-base pt-1">{entry.title}</h4>
-                              <p className="text-sm text-slate-300 whitespace-pre-line">
-                                {entry.commentary}
-                              </p>
-                              <p className="text-xs font-mono text-indigo-400 truncate">
-                                Indexed Target: {entry.targetUrl}
-                              </p>
-                            </div>
-
-                            <div className="flex sm:flex-col justify-between items-end gap-2 shrink-0">
                               <span
-                                className={`text-xs uppercase font-bold px-2.5 py-0.5 rounded-full ${
+                                className={`text-xs uppercase font-bold px-2.5 py-0.5 rounded-full shrink-0 ${
                                   entry.entryType === 'post'
                                     ? 'bg-emerald-500/20 text-emerald-300 border border-emerald-500/30'
                                     : 'bg-indigo-500/20 text-indigo-300'
@@ -2466,52 +2808,69 @@ export const App: React.FC = () => {
                               >
                                 {entry.entryType === 'post' ? '📝 Wall Post' : entry.entryType}
                               </span>
-                              <div className="flex flex-wrap gap-2">
-                                <button
-                                  onClick={() =>
-                                    handleIncomingDeepLink({
-                                      action: 'like',
-                                      targetUrl: entry.canonicalUrl,
-                                      title: entry.title,
-                                      authorName: entry.friendName,
-                                      authorUrl: entry.friendSiteUrl,
-                                      mediaUrl: entry.mediaUrl,
-                                    })
-                                  }
-                                  className="px-3 py-1.5 rounded-lg bg-pink-500/20 text-pink-300 hover:bg-pink-500/30 text-xs font-medium flex items-center gap-1"
-                                >
-                                  <Heart className="w-3.5 h-3.5" /> Like
-                                </button>
-                                <button
-                                  onClick={() =>
-                                    handleIncomingDeepLink({
-                                      action: 'comment',
-                                      targetUrl: entry.canonicalUrl,
-                                      title: entry.title,
-                                      authorName: entry.friendName,
-                                      authorUrl: entry.friendSiteUrl,
-                                    })
-                                  }
-                                  className="px-3 py-1.5 rounded-lg bg-emerald-500/20 text-emerald-300 hover:bg-emerald-500/30 text-xs font-medium flex items-center gap-1"
-                                >
-                                  <MessageSquare className="w-3.5 h-3.5" /> Comment
-                                </button>
-                                <button
-                                  onClick={() =>
-                                    handleIncomingDeepLink({
-                                      action: 'share',
-                                      targetUrl: entry.targetUrl,
-                                      title: entry.title,
-                                      authorName: entry.friendName,
-                                      authorUrl: entry.friendSiteUrl,
-                                      mediaUrl: entry.mediaUrl,
-                                    })
-                                  }
-                                  className="px-3 py-1.5 rounded-lg bg-indigo-500/20 text-indigo-300 hover:bg-indigo-500/30 text-xs font-medium flex items-center gap-1"
-                                >
-                                  <Repeat2 className="w-3.5 h-3.5" /> Re-share
-                                </button>
-                              </div>
+                            </div>
+
+                            {entry.mediaUrl && (
+                              <img
+                                src={entry.mediaUrl}
+                                alt={entry.title}
+                                className="w-full max-h-72 object-cover rounded-xl mt-2"
+                              />
+                            )}
+
+                            <h4 className="font-bold text-base pt-1">{entry.title}</h4>
+                            <p className="text-sm text-slate-300 whitespace-pre-line">
+                              {entry.commentary}
+                            </p>
+                            <p className="text-xs font-mono text-indigo-400 truncate">
+                              Indexed Target: {entry.targetUrl}
+                            </p>
+
+                            <div className="flex flex-wrap gap-2 pt-1">
+                              <button
+                                onClick={() =>
+                                  handleIncomingDeepLink({
+                                    action: 'like',
+                                    targetUrl: entry.canonicalUrl,
+                                    title: entry.title,
+                                    authorName: entry.friendName,
+                                    authorUrl: entry.friendSiteUrl,
+                                    mediaUrl: entry.mediaUrl,
+                                  })
+                                }
+                                className="px-3 py-1.5 rounded-lg bg-pink-500/20 text-pink-300 hover:bg-pink-500/30 text-xs font-medium flex items-center gap-1"
+                              >
+                                <Heart className="w-3.5 h-3.5" /> Like
+                              </button>
+                              <button
+                                onClick={() =>
+                                  handleIncomingDeepLink({
+                                    action: 'comment',
+                                    targetUrl: entry.canonicalUrl,
+                                    title: entry.title,
+                                    authorName: entry.friendName,
+                                    authorUrl: entry.friendSiteUrl,
+                                  })
+                                }
+                                className="px-3 py-1.5 rounded-lg bg-emerald-500/20 text-emerald-300 hover:bg-emerald-500/30 text-xs font-medium flex items-center gap-1"
+                              >
+                                <MessageSquare className="w-3.5 h-3.5" /> Comment
+                              </button>
+                              <button
+                                onClick={() =>
+                                  handleIncomingDeepLink({
+                                    action: 'share',
+                                    targetUrl: entry.targetUrl,
+                                    title: entry.title,
+                                    authorName: entry.friendName,
+                                    authorUrl: entry.friendSiteUrl,
+                                    mediaUrl: entry.mediaUrl,
+                                  })
+                                }
+                                className="px-3 py-1.5 rounded-lg bg-indigo-500/20 text-indigo-300 hover:bg-indigo-500/30 text-xs font-medium flex items-center gap-1"
+                              >
+                                <Repeat2 className="w-3.5 h-3.5" /> Re-share
+                              </button>
                             </div>
                           </div>
 
@@ -3106,13 +3465,169 @@ export const App: React.FC = () => {
                 </div>
               </form>
 
-              {/* Option 3: Real-Time Static Site Comments (Optional Third-Party Provider) */}
+              {/* Option 3: GitHub Pages Deploy */}
+              <form
+                onSubmit={handlePublishGithub}
+                className="bg-slate-900 border border-slate-800 rounded-2xl p-6 space-y-4"
+              >
+                <div className="flex flex-wrap items-center justify-between gap-2">
+                  <div>
+                    <h3 className="font-bold text-lg flex items-center gap-2">
+                      <Globe className="w-5 h-5 text-slate-200" />
+                      3. GitHub Pages Deploy
+                    </h3>
+                    <p className="text-xs text-slate-400 mt-0.5">
+                      Pushes the generated site straight to a repo branch via the GitHub API and
+                      enables Pages for it. Needs a token with <code>repo</code> scope (classic) or
+                      Contents + Pages read/write (fine-grained). Stored in this persona's SQLite
+                      database, same as the SFTP/FTP credentials above.
+                    </p>
+                  </div>
+                  {(publishSettings.githubOwner || publishSettings.githubRepo) && (
+                    <span className="text-[11px] px-2.5 py-1 rounded-full bg-emerald-500/15 border border-emerald-500/30 text-emerald-300 font-medium flex items-center gap-1.5">
+                      <CheckCircle2 className="w-3.5 h-3.5" />
+                      Stored for Persona: {personas.find((p) => p.id === activePersonaId)?.label || 'Primary'}
+                    </span>
+                  )}
+                </div>
+
+                <div className="grid grid-cols-1 md:grid-cols-3 gap-4">
+                  <div>
+                    <label className="block text-xs text-slate-400 mb-1">Repo Owner (user or org)</label>
+                    <input
+                      type="text"
+                      required
+                      value={publishSettings.githubOwner || ''}
+                      onChange={(e) =>
+                        setPublishSettings((prev) => ({ ...prev, githubOwner: e.target.value }))
+                      }
+                      placeholder="octocat"
+                      className="w-full px-3 py-2 rounded-xl bg-slate-950 border border-slate-800 text-sm font-mono"
+                    />
+                  </div>
+                  <div>
+                    <label className="block text-xs text-slate-400 mb-1">Repository Name</label>
+                    <input
+                      type="text"
+                      required
+                      value={publishSettings.githubRepo || ''}
+                      onChange={(e) =>
+                        setPublishSettings((prev) => ({ ...prev, githubRepo: e.target.value }))
+                      }
+                      placeholder="octocat.github.io"
+                      className="w-full px-3 py-2 rounded-xl bg-slate-950 border border-slate-800 text-sm font-mono"
+                    />
+                  </div>
+                  <div>
+                    <label className="block text-xs text-slate-400 mb-1">Branch</label>
+                    <input
+                      type="text"
+                      value={publishSettings.githubBranch || 'gh-pages'}
+                      onChange={(e) =>
+                        setPublishSettings((prev) => ({ ...prev, githubBranch: e.target.value }))
+                      }
+                      placeholder="gh-pages"
+                      className="w-full px-3 py-2 rounded-xl bg-slate-950 border border-slate-800 text-sm font-mono"
+                    />
+                  </div>
+                </div>
+
+                <div className="grid grid-cols-1 md:grid-cols-2 gap-4">
+                  <div>
+                    <label className="block text-xs text-slate-400 mb-1">
+                      Personal Access Token
+                    </label>
+                    <input
+                      type="password"
+                      required
+                      value={publishSettings.githubToken || ''}
+                      onChange={(e) =>
+                        setPublishSettings((prev) => ({ ...prev, githubToken: e.target.value }))
+                      }
+                      placeholder="ghp_..."
+                      className="w-full px-3 py-2 rounded-xl bg-slate-950 border border-slate-800 text-sm font-mono"
+                    />
+                  </div>
+                  <div>
+                    <label className="block text-xs text-slate-400 mb-1">
+                      Custom Domain (optional — writes <code>CNAME</code>)
+                    </label>
+                    <input
+                      type="text"
+                      value={publishSettings.githubCustomDomain || ''}
+                      onChange={(e) =>
+                        setPublishSettings((prev) => ({ ...prev, githubCustomDomain: e.target.value }))
+                      }
+                      placeholder="yourdomain.com"
+                      className="w-full px-3 py-2 rounded-xl bg-slate-950 border border-slate-800 text-sm font-mono"
+                    />
+                  </div>
+                </div>
+
+                {githubCheckResult && (
+                  <div
+                    className={`p-3 rounded-xl text-xs border ${
+                      githubCheckResult.success
+                        ? 'bg-emerald-500/10 border-emerald-500/30 text-emerald-200'
+                        : 'bg-rose-500/10 border-rose-500/30 text-rose-200'
+                    }`}
+                  >
+                    {githubCheckResult.message}
+                  </div>
+                )}
+
+                <div className="flex flex-wrap items-center justify-between gap-3 pt-2 border-t border-slate-800/80">
+                  <div className="flex flex-wrap items-center gap-2.5">
+                    <button
+                      type="button"
+                      onClick={handleCheckGithubRepo}
+                      disabled={githubChecking}
+                      className="px-4 py-2.5 rounded-xl bg-slate-800 hover:bg-slate-700 border border-slate-700 text-slate-100 font-semibold text-xs flex items-center gap-1.5 transition disabled:opacity-50"
+                    >
+                      <RefreshCw className={`w-4 h-4 text-indigo-400 ${githubChecking ? 'animate-spin' : ''}`} />
+                      {githubChecking ? 'Checking...' : 'Check Repo Access'}
+                    </button>
+                    <button
+                      type="button"
+                      onClick={handleSaveGithubSettings}
+                      className="px-4 py-2.5 rounded-xl bg-slate-800 hover:bg-slate-700 border border-slate-700 text-slate-100 font-semibold text-xs flex items-center gap-1.5 transition"
+                    >
+                      <CheckCircle2 className="w-4 h-4 text-emerald-400" />
+                      Save GitHub Settings
+                    </button>
+                    <button
+                      type="submit"
+                      disabled={githubDeploying}
+                      className="px-5 py-2.5 rounded-xl bg-indigo-600 hover:bg-indigo-500 text-white font-semibold text-xs shadow flex items-center gap-2 transition disabled:opacity-50"
+                    >
+                      <UploadCloud className={`w-4 h-4 ${githubDeploying ? 'animate-pulse' : ''}`} />
+                      {githubDeploying ? 'Deploying...' : 'Save & Deploy to GitHub Pages'}
+                    </button>
+                  </div>
+
+                  {(publishSettings.githubOwner ||
+                    publishSettings.githubRepo ||
+                    publishSettings.githubToken) && (
+                    <button
+                      type="button"
+                      onClick={handleClearGithubSettings}
+                      className="px-3.5 py-2 rounded-xl bg-rose-950/40 hover:bg-rose-900/50 border border-rose-500/30 text-rose-300 font-semibold text-xs flex items-center gap-1.5 transition"
+                      title="Delete the stored GitHub owner, repo, branch, token, and custom domain from this persona's SQLite database"
+                    >
+                      <Trash2 className="w-3.5 h-3.5" />
+                      Delete Stored GitHub Info
+                    </button>
+                  )}
+                </div>
+              </form>
+
+              {/* Option 4: Real-Time Static Site Comments (Optional Third-Party Provider) */}
               <div className="bg-slate-900 border border-slate-800 rounded-2xl p-6 space-y-4">
                 <div className="flex flex-wrap items-center justify-between gap-2">
                   <div>
                     <h3 className="font-bold text-lg flex items-center gap-2">
                       <MessageSquare className="w-5 h-5 text-purple-400" />
-                      3. Real-Time Public Comment Threads (Optional — Giscus / Utterances)
+                      4. Real-Time Public Comment Threads (Optional — Giscus / Utterances)
                     </h3>
                     <p className="text-xs text-slate-400 mt-1">
                       In addition to zero-setup pull-federated ring comments, you can optionally
@@ -3237,7 +3752,7 @@ export const App: React.FC = () => {
                 )}
               </div>
 
-              {/* Option 4: Optional Add-On 1 — Google Analytics (GA4) */}
+              {/* Option 5: Optional Add-On 1 — Google Analytics (GA4) */}
               <div className="bg-slate-900 border border-slate-800 rounded-2xl p-6 space-y-4">
                 <div className="flex flex-wrap items-center justify-between gap-3">
                   <div>
@@ -3252,7 +3767,7 @@ export const App: React.FC = () => {
                       )}
                     </div>
                     <h3 className="font-bold text-lg mt-1">
-                      4. Google Analytics (GA4) Profile Add-On
+                      5. Google Analytics (GA4) Profile Add-On
                     </h3>
                     <p className="text-xs text-slate-400 mt-0.5">
                       Optionally inject Google Analytics 4 (<code>gtag.js</code>) into your exported{' '}
@@ -3377,7 +3892,7 @@ export const App: React.FC = () => {
                 </div>
               </div>
 
-              {/* Option 5: Optional Add-On 2 — Google AdSense / Ads Monetization */}
+              {/* Option 6: Optional Add-On 2 — Google AdSense / Ads Monetization */}
               <div className="bg-slate-900 border border-slate-800 rounded-2xl p-6 space-y-4">
                 <div className="flex flex-wrap items-center justify-between gap-3">
                   <div>
@@ -3392,7 +3907,7 @@ export const App: React.FC = () => {
                       )}
                     </div>
                     <h3 className="font-bold text-lg mt-1">
-                      5. Google AdSense / Ads Monetization Add-On
+                      6. Google AdSense / Ads Monetization Add-On
                     </h3>
                     <p className="text-xs text-slate-400 mt-0.5">
                       Offset your hosting costs by enabling Google AdSense on your static profile
@@ -4288,6 +4803,17 @@ export const App: React.FC = () => {
                       </p>
                     </div>
 
+                    <div className="p-3.5 rounded-xl bg-indigo-500/10 border border-indigo-500/30 text-xs text-indigo-200 flex items-start gap-2.5">
+                      <UploadCloud className="w-4 h-4 mt-0.5 shrink-0" />
+                      <span>
+                        <strong>Skip the terminal:</strong> Webring Studio can push and deploy for you
+                        directly from the app. Go to the <strong>Publish & SFTP</strong> tab → <em>3.
+                        GitHub Pages Deploy</em>, add a repo + access token, and click{' '}
+                        <strong>Save & Deploy to GitHub Pages</strong>. The steps below are what it does
+                        under the hood, and are here for anyone who prefers plain <code>git</code>.
+                      </span>
+                    </div>
+
                     {/* Step 1 */}
                     <div className="space-y-2">
                       <h4 className="font-bold text-sm text-indigo-300">
@@ -4586,7 +5112,7 @@ git push -u origin main --force`}
                         1. Google Analytics 4 (GA4) Telemetry Add-On
                       </h4>
                       <p className="text-xs text-slate-300 leading-relaxed">
-                        Located in <strong>Publish & SFTP → 4. Google Analytics (GA4) Profile Add-On</strong>:
+                        Located in <strong>Publish & SFTP → 5. Google Analytics (GA4) Profile Add-On</strong>:
                       </p>
                       <ol className="text-xs text-slate-400 list-decimal list-inside space-y-1.5 pl-1">
                         <li>
@@ -4630,7 +5156,7 @@ git push -u origin main --force`}
                         2. Google AdSense / Ads Monetization Add-On & Automatic <code>/ads.txt</code>
                       </h4>
                       <p className="text-xs text-slate-300 leading-relaxed">
-                        Located in <strong>Publish & SFTP → 5. Google AdSense / Ads Monetization Add-On</strong>.
+                        Located in <strong>Publish & SFTP → 6. Google AdSense / Ads Monetization Add-On</strong>.
                         Designed so static profile owners can generate ad revenue to offset hosting or
                         custom domain costs:
                       </p>
@@ -4682,7 +5208,7 @@ git push -u origin main --force`}
                         3. Public Guestbook Widget (Giscus / Utterances) & Dynamic CSP Hardening
                       </h4>
                       <p className="text-xs text-slate-300 leading-relaxed">
-                        In <strong>Publish & SFTP → 3. Public Visitor Comment Widget</strong>, you can
+                        In <strong>Publish & SFTP → 4. Real-Time Public Comment Threads</strong>, you can
                         also enable <strong>Giscus (GitHub Discussions)</strong> or{' '}
                         <strong>Utterances (GitHub Issues)</strong> so visitors without Webring Studio
                         can leave comments at the bottom of your wall.
