@@ -10,8 +10,11 @@
     "build": "npm run build:vite && npm run build:electron",
     "dev": "npm run build && electron .",
     "start": "npm run build && electron .",
-    "mcp": "npm run build:electron && node dist-electron/electron/mcp/cli.js",
-    "test": "vitest run"
+    "mcp": "npm run build:electron && ELECTRON_RUN_AS_NODE=1 electron dist-electron/electron/mcp/cli.js",
+    "test": "vitest run",
+    "postinstall": "electron-rebuild -f -w better-sqlite3",
+    "rebuild:node": "npm rebuild better-sqlite3",
+    "rebuild:electron": "electron-rebuild -f -w better-sqlite3"
   },
   "dependencies": {
     "basic-ftp": "^5.0.5",
@@ -23,6 +26,7 @@
     "zod": "^3.23.8"
   },
   "devDependencies": {
+    "@electron/rebuild": "^4.2.1",
     "@types/better-sqlite3": "^7.6.11",
     "@types/node": "^22.7.5",
     "@types/react": "^18.3.11",
@@ -38,4 +42,3 @@
     "vitest": "^2.1.3"
   }
 }
-
