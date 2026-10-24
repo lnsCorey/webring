@@ -263,6 +263,13 @@ export type ItemsDocument = z.infer<typeof ItemsDocumentSchema>;
 export const FriendVisibilitySchema = z.enum(['private', 'public']);
 export type FriendVisibility = z.infer<typeof FriendVisibilitySchema>;
 
+/**
+ * Client-side moderation, keyed by site URL. `mute` hides a site from the local feed only;
+ * `block` also drops its endorsements from the published site and stops crawling it.
+ */
+export const ModerationActionSchema = z.enum(['mute', 'block']);
+export type ModerationAction = z.infer<typeof ModerationActionSchema>;
+
 export const FriendKeyStatusSchema = z.enum(['unverified', 'pinned', 'changed']);
 export type FriendKeyStatus = z.infer<typeof FriendKeyStatusSchema>;
 
@@ -278,6 +285,7 @@ export const FriendConnectionSchema = z.object({
   visibility: FriendVisibilitySchema.default('private').optional(),
   pinnedPublicKeyPem: z.string().optional(),
   keyStatus: FriendKeyStatusSchema.default('unverified').optional(),
+  lastCrawledAt: z.string().optional(),
   addedAt: z.string(),
 });
 export type FriendConnection = z.infer<typeof FriendConnectionSchema>;
@@ -290,6 +298,9 @@ export const WebringMembershipSchema = z.object({
   prevSiteUrl: z.string().optional(),
   nextSiteUrl: z.string().optional(),
   joinedAt: z.string(),
+  // v2: lets the site render small rings sensibly and link Random to the ring directory
+  memberCount: z.number().optional(),
+  directoryUrl: z.string().optional(),
 });
 export type WebringMembership = z.infer<typeof WebringMembershipSchema>;
 
@@ -323,7 +334,7 @@ export const ConnectionsDocumentSchema = z.object({
 export type ConnectionsDocument = z.infer<typeof ConnectionsDocumentSchema>;
 
 /**
- * Standalone Webring Hub Directory Schema (webring-hub.json)
+ * Webring hub: a ring's signed member list, published by its maintainer (api/rings/<slug>.json)
  * Allows any user or community to host a static JSON file that acts as a Webring directory.
  */
 export const WebringHubDocumentSchema = z.object({
@@ -339,10 +350,96 @@ export const WebringHubDocumentSchema = z.object({
       displayName: z.string(),
       did: z.string().optional(),
       joinedAt: z.string(),
+      // v2: false = still a member, but skipped by Prev / Next / Random
+      inRotation: z.boolean().optional(),
     })
   ),
+  // v2 fields (v1 hubs omit them; v1 readers ignore them)
+  maintainerDid: z.string().optional(),
+  status: z.enum(['active', 'closed']).optional(),
+  directoryUrl: z.string().optional(),
+  proof: SignatureProofSchema.optional(),
 });
 export type WebringHubDocument = z.infer<typeof WebringHubDocumentSchema>;
+export type WebringHubMember = WebringHubDocument['members'][number];
+
+/**
+ * A private, signed request to join a ring. The applicant signs it with their site key and sends
+ * it to the maintainer as a `webring://ring-request?token=…` link; nothing is published.
+ */
+export const RingJoinRequestSchema = z.object({
+  type: z.literal('webring-join-request'),
+  version: z.literal(1),
+  hubUrl: z.string(),
+  siteUrl: z.string(),
+  did: z.string(),
+  displayName: z.string().max(120),
+  createdAt: z.string(),
+  proof: SignatureProofSchema.optional(),
+});
+export type RingJoinRequest = z.infer<typeof RingJoinRequestSchema>;
+
+export function encodeRingRequestToken(request: RingJoinRequest): string {
+  return Buffer.from(JSON.stringify(request), 'utf8').toString('base64url');
+}
+
+export function decodeRingRequestToken(token: string): RingJoinRequest {
+  const raw = JSON.parse(Buffer.from(token.trim(), 'base64url').toString('utf8'));
+  return RingJoinRequestSchema.parse(raw);
+}
+
+export function buildRingRequestUri(token: string): string {
+  return `webring://ring-request?token=${encodeURIComponent(token)}`;
+}
+
+/**
+ * Reads a `webring://ring-request?token=…` link (or a bare token). Kept separate from
+ * `parseWebringUri`, which falls back to `share` for unknown actions.
+ */
+export function parseRingRequestUri(uriOrToken: string): string | null {
+  const trimmed = uriOrToken.trim();
+  if (!trimmed.startsWith('webring:')) return trimmed || null;
+  try {
+    const parsed = new URL(trimmed);
+    if (parsed.hostname !== 'ring-request' && parsed.pathname.replace(/^\/+/, '') !== 'ring-request') {
+      return null;
+    }
+    return parsed.searchParams.get('token');
+  } catch {
+    return null;
+  }
+}
+
+/**
+ * Prev / next neighbours for `siteUrl` among members in rotation. Returns nothing for a site
+ * that isn't a member (no more "prev = last, next = first" for outsiders).
+ */
+export function computeRingNeighbors(
+  members: Array<{ siteUrl: string; inRotation?: boolean }>,
+  siteUrl: string
+): { isMember: boolean; prevSiteUrl?: string; nextSiteUrl?: string; memberCount: number } {
+  const me = normalizeSiteUrl(siteUrl);
+  const all = members.map((m) => ({ ...m, siteUrl: normalizeSiteUrl(m.siteUrl) }));
+  const isMember = all.some((m) => m.siteUrl === me);
+  const rotation = all.filter((m) => m.inRotation !== false || m.siteUrl === me);
+  if (!isMember || rotation.length < 2) {
+    return { isMember, memberCount: all.length };
+  }
+  const idx = rotation.findIndex((m) => m.siteUrl === me);
+  return {
+    isMember,
+    prevSiteUrl: rotation[(idx - 1 + rotation.length) % rotation.length].siteUrl,
+    nextSiteUrl: rotation[(idx + 1) % rotation.length].siteUrl,
+    memberCount: all.length,
+  };
+}
+
+/**
+ * Short, stable fingerprint of a public key, used to recognise a banned key on a new domain.
+ */
+export function publicKeyFingerprint(publicKeyPem: string): string {
+  return getNodeCrypto().createHash('sha256').update(publicKeyPem.trim()).digest('hex').slice(0, 32);
+}
 
 /**
  * Complete Hydrated Bundle for the Standalone Profile Site
@@ -402,6 +499,22 @@ export function normalizeSiteUrl(rawUrl: string): string {
   if (!trimmed) return 'https://my-profile.local';
   const withProto = /^https?:\/\//i.test(trimmed) ? trimmed : `https://${trimmed}`;
   return withProto.replace(/\/+$/, '');
+}
+
+/**
+ * True when `url` lives under `siteUrl` (same origin and path prefix), e.g. a friend's
+ * canonical item URL must sit on that friend's own site so it can't overwrite another peer's rows.
+ */
+export function isUrlWithinSite(url: string, siteUrl: string): boolean {
+  try {
+    const target = new URL(url);
+    const base = new URL(normalizeSiteUrl(siteUrl));
+    if (target.origin.toLowerCase() !== base.origin.toLowerCase()) return false;
+    const basePath = base.pathname.replace(/\/+$/, '');
+    return !basePath || target.pathname === basePath || target.pathname.startsWith(`${basePath}/`);
+  } catch {
+    return false;
+  }
 }
 
 /**

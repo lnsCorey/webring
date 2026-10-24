@@ -58,7 +58,6 @@ interface PublishSettingsState {
   publishFriendsList?: boolean;
   stripRelationshipTags?: boolean;
   publishEndorsements?: boolean;
-  publishWebringHub?: boolean;
   redactItemSourceAuthors?: boolean;
   commentProvider?: 'none' | 'giscus' | 'utterances';
   giscusRepo?: string;
@@ -82,6 +81,157 @@ interface PublishSettingsState {
   githubBranch?: string;
   githubToken?: string;
   githubCustomDomain?: string;
+  lastPublishedAt?: string;
+  lastPublishedCounts?: {
+    albumCount: number;
+    photoCount: number;
+    itemCount: number;
+    friendCount: number;
+    webringCount: number;
+    endorsementCount: number;
+  };
+}
+
+type ModerationAction = 'mute' | 'block';
+
+interface ModerationEntry {
+  siteUrl: string;
+  action: ModerationAction;
+  createdAt: string;
+}
+
+interface FeedExclusions {
+  muted: number;
+  blocked: number;
+  unverified: number;
+}
+
+type JoinedRingStatus = 'requested' | 'member' | 'removed' | 'closed' | 'legacy';
+
+interface JoinedRing {
+  id: string;
+  name: string;
+  hubUrl: string;
+  description: string;
+  status: JoinedRingStatus;
+  maintainerUrl: string;
+  prevSiteUrl?: string;
+  nextSiteUrl?: string;
+  memberCount: number;
+  directoryUrl?: string;
+  hubVerified: boolean;
+  lastSyncedAt?: string;
+  requestToken?: string;
+  syncWarning?: string;
+  joinedAt: string;
+}
+
+interface HostedRingMember {
+  siteUrl: string;
+  displayName: string;
+  position: number;
+  joinedAt: string;
+  confirmedAt?: string;
+  lastVerifiedAt?: string;
+  failCount: number;
+  hidden: boolean;
+  flagged: boolean;
+}
+
+interface HostedRing {
+  id: string;
+  slug: string;
+  name: string;
+  description: string;
+  hubUrl: string;
+  directoryUrl: string;
+  maintainerIsMember: boolean;
+  status: 'active' | 'closed';
+  updatedAt: string;
+  members: HostedRingMember[];
+  bans: Array<{ siteUrl: string; reason: string; createdAt: string }>;
+}
+
+interface RingRequestReview {
+  ring: { id: string; name: string; hubUrl: string };
+  applicant: { siteUrl: string; displayName: string; did: string };
+  state: 'new' | 'already-member' | 'banned';
+  banReason?: string;
+}
+
+type RingMemberAction = 'remove' | 'ban' | 'unban' | 'hide' | 'show' | 'up' | 'down';
+
+type SchedulePreset =
+  | { kind: 'interval'; minutes: 15 | 60 | 360 | 720 }
+  | { kind: 'daily'; time: string }
+  | { kind: 'weekly'; weekday: number; time: string };
+
+interface ScheduleJobResult {
+  at: string;
+  status: 'ok' | 'skipped' | 'failed';
+  message: string;
+}
+
+interface ScheduleJob {
+  enabled: boolean;
+  preset: SchedulePreset;
+  lastRunAt?: string;
+  lastResult?: ScheduleJobResult;
+}
+
+interface PersonaScheduleView {
+  personaId: string;
+  label: string;
+  schedule: {
+    sync: ScheduleJob;
+    publish: ScheduleJob & { destination: 'local' | 'remote' | 'github'; syncFirst: boolean };
+  };
+  nextSyncAt: string | null;
+  nextPublishAt: string | null;
+  describe: { sync: string; publish: string };
+}
+
+interface ScheduleOverview {
+  app: { runInBackground: boolean; startAtLogin: boolean; paused: boolean; notifyOnFailure: boolean };
+  personas: PersonaScheduleView[];
+  history: Array<ScheduleJobResult & { personaId: string; job: 'sync' | 'publish'; label: string }>;
+  running: { personaId: string; job: 'sync' | 'publish' } | null;
+}
+
+function formatUpcoming(iso: string): string {
+  const ms = new Date(iso).getTime() - Date.now();
+  if (ms <= 60000) return 'due now';
+  const minutes = Math.round(ms / 60000);
+  if (minutes < 60) return `in ${minutes} min`;
+  const hours = Math.round(minutes / 60);
+  if (hours < 24) return `in ${hours} hr`;
+  return new Date(iso).toLocaleString([], { weekday: 'short', hour: '2-digit', minute: '2-digit' });
+}
+
+interface CrawlSiteResult {
+  siteUrl: string;
+  success: boolean;
+  displayName?: string;
+  itemsIndexed: number;
+  photosIndexed: number;
+  endorsementsFound: number;
+  entriesRejected: number;
+  entriesPruned: number;
+  verifiedSignature: boolean;
+  keyChangedWarning?: boolean;
+  blocked?: boolean;
+  error?: string;
+}
+
+function formatRelativeTime(iso: string): string {
+  const seconds = Math.round((Date.now() - new Date(iso).getTime()) / 1000);
+  if (seconds < 60) return 'just now';
+  const minutes = Math.round(seconds / 60);
+  if (minutes < 60) return `${minutes} min ago`;
+  const hours = Math.round(minutes / 60);
+  if (hours < 24) return `${hours} hr ago`;
+  const days = Math.round(hours / 24);
+  return `${days} day${days === 1 ? '' : 's'} ago`;
 }
 
 interface NetworkFeedEntry {
@@ -135,6 +285,12 @@ declare global {
           publishSettings: PublishSettingsState;
         };
         networkFeed: NetworkFeedEntry[];
+        feedExclusions: FeedExclusions;
+        moderation: ModerationEntry[];
+        changesSinceLastPublish: number;
+        joinedRings: JoinedRing[];
+        hostedRings: HostedRing[];
+        publishedUpToDate: boolean;
         previewHtml: string;
       }>;
       listPersonas: () => Promise<{
@@ -185,21 +341,46 @@ declare global {
         visibility: FriendVisibility
       ) => Promise<FriendConnection | undefined>;
       deleteFriend: (friendId: string) => Promise<unknown>;
-      addWebring: (input: unknown) => Promise<unknown>;
+      setModeration: (siteUrl: string, action: ModerationAction | null) => Promise<ModerationEntry[]>;
       updateWebring: (ringId: string, updates: unknown) => Promise<unknown>;
       deleteWebring: (ringId: string) => Promise<unknown>;
-      crawlFriend: (siteUrl: string, localDirOverride?: string) => Promise<{
-        siteUrl: string;
-        success: boolean;
-        displayName?: string;
-        itemsIndexed: number;
-        photosIndexed: number;
-        endorsementsFound: number;
-        verifiedSignature: boolean;
-        error?: string;
+      crawlFriend: (siteUrl: string, localDirOverride?: string) => Promise<CrawlSiteResult>;
+      crawlAllFriends: () => Promise<CrawlSiteResult[]>;
+      requestToJoinRing: (
+        hubUrl: string
+      ) => Promise<{ ring: JoinedRing; requestLink: string; warning?: string }>;
+      reviewRingRequest: (link: string) => Promise<RingRequestReview>;
+      decideRingRequest: (
+        link: string,
+        decision: 'approve' | 'decline' | 'ban',
+        reason?: string
+      ) => Promise<RingRequestReview>;
+      syncRings: () => Promise<{
+        joined: Array<{ name: string; outcome: string; warning?: string }>;
+        hosted: Array<{ name: string; autoRemoved: string[]; failing: string[]; confirmed: string[] }>;
       }>;
-      crawlAllFriends: () => Promise<unknown[]>;
-      syncWebringHub: (hubUrl: string) => Promise<unknown>;
+      createHostedRing: (input: { name: string; description?: string }) => Promise<HostedRing>;
+      updateHostedRing: (
+        ringId: string,
+        updates: { name?: string; description?: string; maintainerIsMember?: boolean; status?: 'active' | 'closed' }
+      ) => Promise<HostedRing>;
+      updateRingMember: (
+        ringId: string,
+        siteUrl: string,
+        change: { action: RingMemberAction; reason?: string }
+      ) => Promise<HostedRing>;
+      onRingRequestLink?: (cb: (link: string) => void) => () => void;
+      getSchedule: () => Promise<ScheduleOverview>;
+      setSchedule: (
+        change:
+          | { personaId: string; sync?: Partial<ScheduleJob>; publish?: Partial<PersonaScheduleView['schedule']['publish']> }
+          | { app: Partial<ScheduleOverview['app']> }
+      ) => Promise<ScheduleOverview>;
+      runJobNow: (
+        personaId: string,
+        job: 'sync' | 'publish'
+      ) => Promise<{ result: ScheduleJobResult; overview: ScheduleOverview }>;
+      onScheduleUpdated?: (cb: () => void) => () => void;
       chooseExportFolder: () => Promise<string | null>;
       exportLocal: (targetDir?: string) => Promise<{
         success: boolean;
@@ -246,6 +427,8 @@ declare global {
           port: number;
           endpointUrl: string;
           sseUrl: string;
+          authorizedEndpointUrl?: string;
+          authorizedSseUrl?: string;
           toolCount: number;
           resourceCount: number;
           promptCount: number;
@@ -312,11 +495,20 @@ export const App: React.FC = () => {
     | 'addons'
     | 'mcp-agents'
     | 'privacy-faq'
+    | 'webrings'
   >('quickstart');
   const [bundle, setBundle] = useState<CompleteSiteBundle | null>(null);
   const [allFriends, setAllFriends] = useState<FriendConnection[]>([]);
   const [allEndorsements, setAllEndorsements] = useState<EndorsementItem[]>([]);
   const [networkFeed, setNetworkFeed] = useState<NetworkFeedEntry[]>([]);
+  const [feedExclusions, setFeedExclusions] = useState<FeedExclusions>({
+    muted: 0,
+    blocked: 0,
+    unverified: 0,
+  });
+  const [moderation, setModeration] = useState<ModerationEntry[]>([]);
+  const [changesSinceLastPublish, setChangesSinceLastPublish] = useState(0);
+  const [isSyncingFriends, setIsSyncingFriends] = useState(false);
   const [statusMessage, setStatusMessage] = useState<string | null>(null);
 
   // Multi-Persona compartmentalization state
@@ -358,7 +550,6 @@ export const App: React.FC = () => {
     publishFriendsList: false,
     stripRelationshipTags: true,
     publishEndorsements: false,
-    publishWebringHub: false,
     redactItemSourceAuthors: false,
     commentProvider: 'none',
     giscusRepo: '',
@@ -413,11 +604,19 @@ export const App: React.FC = () => {
   const [friendRel, setFriendRel] = useState('friend, met');
   const [friendVisibility, setFriendVisibility] = useState<FriendVisibility>('private');
 
-  const [ringName, setRingName] = useState('');
   const [ringHubUrl, setRingHubUrl] = useState('');
-  const [ringDesc, setRingDesc] = useState('');
-  const [ringPrevUrl, setRingPrevUrl] = useState('');
-  const [ringNextUrl, setRingNextUrl] = useState('');
+  const [isJoiningRing, setIsJoiningRing] = useState(false);
+  const [lastRequestLink, setLastRequestLink] = useState<{ ringName: string; link: string } | null>(null);
+  const [joinedRings, setJoinedRings] = useState<JoinedRing[]>([]);
+  const [hostedRings, setHostedRings] = useState<HostedRing[]>([]);
+  const [newHostedRingName, setNewHostedRingName] = useState('');
+  const [newHostedRingDesc, setNewHostedRingDesc] = useState('');
+  const [ringRequestLink, setRingRequestLink] = useState('');
+  const [ringRequestReview, setRingRequestReview] = useState<RingRequestReview | null>(null);
+  const [ringRequestError, setRingRequestError] = useState<string | null>(null);
+  const [scheduleOverview, setScheduleOverview] = useState<ScheduleOverview | null>(null);
+  const [runningJob, setRunningJob] = useState<'sync' | 'publish' | null>(null);
+  const [publishedUpToDate, setPublishedUpToDate] = useState(false);
 
   // Editing an already-joined webring's name/description/neighbors
   const [editingRingId, setEditingRingId] = useState<string | null>(null);
@@ -459,6 +658,8 @@ export const App: React.FC = () => {
       port: number;
       endpointUrl: string;
       sseUrl: string;
+      authorizedEndpointUrl?: string;
+      authorizedSseUrl?: string;
       toolCount: number;
       resourceCount: number;
       promptCount: number;
@@ -502,6 +703,15 @@ export const App: React.FC = () => {
     setAllFriends(data.allFriends || []);
     setAllEndorsements(data.allEndorsements || []);
     setNetworkFeed(data.networkFeed || []);
+    setFeedExclusions(data.feedExclusions || { muted: 0, blocked: 0, unverified: 0 });
+    setModeration(data.moderation || []);
+    setChangesSinceLastPublish(data.changesSinceLastPublish || 0);
+    setJoinedRings(data.joinedRings || []);
+    setHostedRings(data.hostedRings || []);
+    setPublishedUpToDate(Boolean(data.publishedUpToDate));
+    if (window.studioApi.getSchedule) {
+      window.studioApi.getSchedule().then(setScheduleOverview).catch(() => undefined);
+    }
 
     const p = data.profileWithSettings;
     setSiteUrl(p.siteUrl);
@@ -517,19 +727,13 @@ export const App: React.FC = () => {
     setAtprotoHandle(p.atprotoHandle || '');
     setCustomLinks((p.customLinks || []).map((l) => ({ label: l.label, url: l.url })));
     if (p.publishSettings) {
-      setPublishSettings((prev) => ({
-        exportPath: '',
-        protocol: 'sftp',
-        host: '',
-        port: 22,
-        username: '',
+      // Required fields always come from the profile; these defaults cover the optional ones
+      setPublishSettings({
         password: '',
-        remotePath: '/var/www/html',
         atprotoPdsUrl: 'https://bsky.social',
         publishFriendsList: false,
         stripRelationshipTags: true,
         publishEndorsements: false,
-        publishWebringHub: false,
         redactItemSourceAuthors: false,
         analyticsEnabled: false,
         analyticsMeasurementId: '',
@@ -549,7 +753,7 @@ export const App: React.FC = () => {
         githubToken: '',
         githubCustomDomain: '',
         ...p.publishSettings,
-      }));
+      });
     }
     if (data.bundle.albums.albums.length > 0) {
       const currentExists = data.bundle.albums.albums.some((a) => a.id === selectedAlbumId);
@@ -629,6 +833,19 @@ export const App: React.FC = () => {
           handleIncomingDeepLink(action);
         })
       );
+      if (window.studioApi.onScheduleUpdated) {
+        // A scheduled job finished (maybe for this persona): refresh what's on screen
+        cleanups.push(window.studioApi.onScheduleUpdated(() => refreshStudioData()));
+      }
+      if (window.studioApi.onRingRequestLink) {
+        cleanups.push(
+          window.studioApi.onRingRequestLink((link) => {
+            // Opens the review screen only; approving still needs a click
+            setActiveTab('friends');
+            handleReviewRingRequest(link);
+          })
+        );
+      }
       if (window.studioApi.onMcpActivity) {
         cleanups.push(
           window.studioApi.onMcpActivity(() => {
@@ -651,10 +868,10 @@ export const App: React.FC = () => {
       setActiveTab('friends');
       notify(`Deep Link: Pre-filled friend "${action.title || action.targetUrl}"`);
     } else if (action.action === 'join-ring') {
+      // Only pre-fills the join form; nothing is requested until the user clicks
       setRingHubUrl(action.targetUrl);
-      setRingName(action.title || 'Community Webring');
       setActiveTab('friends');
-      notify(`Deep Link: Ready to join webring "${action.title || action.targetUrl}"`);
+      notify(`Deep Link: Ready to join webring "${action.title || action.targetUrl}". Review it, then click Request to Join.`);
     } else {
       const mappedType: SharedItemType =
         action.action === 'like'
@@ -850,23 +1067,114 @@ export const App: React.FC = () => {
     notify('Updated social graph privacy policy and re-signed static JSON bundle!');
   };
 
-  const handleAddWebring = async (e: React.FormEvent) => {
+  const errorMessage = (err: unknown) =>
+    (err instanceof Error ? err.message : String(err)).replace(/^Error invoking remote method '[^']+': (Error: )?/, '');
+
+  const handleRequestToJoinRing = async (e: React.FormEvent) => {
     e.preventDefault();
-    if (!ringName.trim() || !ringHubUrl.trim() || !window.studioApi) return;
-    await window.studioApi.addWebring({
-      name: ringName.trim(),
-      hubUrl: ringHubUrl.trim(),
-      description: ringDesc.trim(),
-      prevSiteUrl: ringPrevUrl.trim(),
-      nextSiteUrl: ringNextUrl.trim(),
+    if (!ringHubUrl.trim() || !window.studioApi || isJoiningRing) return;
+    setIsJoiningRing(true);
+    try {
+      const res = await window.studioApi.requestToJoinRing(ringHubUrl.trim());
+      setLastRequestLink({ ringName: res.ring.name, link: res.requestLink });
+      setRingHubUrl('');
+      await refreshStudioData();
+      notify(
+        res.ring.status === 'member'
+          ? `You're already a member of "${res.ring.name}".`
+          : `Request ready for "${res.ring.name}". Publish your site, then send the maintainer the link.`
+      );
+    } catch (err) {
+      notify(`Couldn't join: ${errorMessage(err)}`);
+    } finally {
+      setIsJoiningRing(false);
+    }
+  };
+
+  const handleReviewRingRequest = async (link = ringRequestLink) => {
+    if (!window.studioApi || !link.trim()) return;
+    setRingRequestLink(link);
+    setRingRequestError(null);
+    setRingRequestReview(null);
+    try {
+      setRingRequestReview(await window.studioApi.reviewRingRequest(link.trim()));
+    } catch (err) {
+      setRingRequestError(errorMessage(err));
+    }
+  };
+
+  const handleDecideRingRequest = async (decision: 'approve' | 'decline' | 'ban') => {
+    if (!window.studioApi || !ringRequestReview) return;
+    let reason: string | undefined;
+    if (decision === 'ban') {
+      const answer = window.prompt(
+        `Ban ${ringRequestReview.applicant.siteUrl} from "${ringRequestReview.ring.name}"? Optional private note:`,
+        ''
+      );
+      if (answer === null) return;
+      reason = answer;
+    }
+    try {
+      await window.studioApi.decideRingRequest(ringRequestLink.trim(), decision, reason);
+      setRingRequestReview(null);
+      setRingRequestLink('');
+      await refreshStudioData();
+      notify(
+        decision === 'approve'
+          ? `Approved ${ringRequestReview.applicant.displayName}. Publish your site to make it live.`
+          : decision === 'ban'
+          ? `Banned ${ringRequestReview.applicant.siteUrl}.`
+          : `Declined ${ringRequestReview.applicant.displayName}'s request.`
+      );
+    } catch (err) {
+      setRingRequestError(errorMessage(err));
+    }
+  };
+
+  const handleCreateHostedRing = async (e: React.FormEvent) => {
+    e.preventDefault();
+    if (!window.studioApi || !newHostedRingName.trim()) return;
+    const ring = await window.studioApi.createHostedRing({
+      name: newHostedRingName.trim(),
+      description: newHostedRingDesc.trim(),
     });
-    setRingName('');
-    setRingHubUrl('');
-    setRingDesc('');
-    setRingPrevUrl('');
-    setRingNextUrl('');
+    setNewHostedRingName('');
+    setNewHostedRingDesc('');
     await refreshStudioData();
-    notify(`Joined Webring "${ringName}"!`);
+    notify(`Created "${ring.name}". Publish your site to put its hub online.`);
+  };
+
+  const handleUpdateHostedRing = async (
+    ring: HostedRing,
+    updates: { maintainerIsMember?: boolean; status?: 'active' | 'closed' }
+  ) => {
+    if (!window.studioApi) return;
+    if (
+      updates.status === 'closed' &&
+      !window.confirm(
+        `Close "${ring.name}"? Members' Studios will drop it on their next sync after you publish. You can reopen it later.`
+      )
+    ) {
+      return;
+    }
+    await window.studioApi.updateHostedRing(ring.id, updates);
+    await refreshStudioData();
+    notify(`Updated "${ring.name}". Publish to make it live.`);
+  };
+
+  const handleRingMemberAction = async (ring: HostedRing, member: { siteUrl: string; displayName: string }, action: RingMemberAction) => {
+    if (!window.studioApi) return;
+    let reason: string | undefined;
+    if (action === 'remove' && !window.confirm(`Remove ${member.displayName} from "${ring.name}"? They can ask to join again.`)) {
+      return;
+    }
+    if (action === 'ban') {
+      const answer = window.prompt(`Ban ${member.siteUrl} from "${ring.name}"? Optional private note:`, '');
+      if (answer === null) return;
+      reason = answer;
+    }
+    await window.studioApi.updateRingMember(ring.id, member.siteUrl, { action, reason });
+    await refreshStudioData();
   };
 
   const handleStartEditWebring = (ring: WebringMembership) => {
@@ -901,7 +1209,7 @@ export const App: React.FC = () => {
   const handleDeleteWebring = async (ring: WebringMembership) => {
     if (!window.studioApi) return;
     const confirmed = window.confirm(
-      `Remove "${ring.name}" from your joined webrings? This deletes the webring bar it adds to your exported site.`
+      `Leave "${ring.name}"? Its bar disappears from your site at your next publish, and the maintainer's Studio removes you on its next sync.`
     );
     if (!confirmed) return;
     await window.studioApi.deleteWebring(ring.id);
@@ -920,6 +1228,173 @@ export const App: React.FC = () => {
       );
     }
   };
+
+  const handleSyncAllFriends = async () => {
+    if (!window.studioApi || isSyncingFriends) return;
+    if (allFriends.length === 0 && joinedRings.length === 0 && hostedRings.length === 0) {
+      notify('Nothing to sync yet. Add a friend or join a ring, or use "Add Demo Peer" in the Feed tab.');
+      return;
+    }
+    setIsSyncingFriends(true);
+    notify(`Syncing ${allFriends.length} friend site(s) and your rings...`);
+    try {
+      const results = await window.studioApi.crawlAllFriends();
+      const rings = await window.studioApi.syncRings();
+      await refreshStudioData();
+      const ok = results.filter((r) => r.success).length;
+      const failed = results.filter((r) => !r.success && !r.blocked).length;
+      const blocked = results.filter((r) => r.blocked).length;
+      const keyChanged = results.filter((r) => r.keyChangedWarning).length;
+      const rejected = results.reduce((acc, r) => acc + (r.entriesRejected || 0), 0);
+      const parts = [`${ok} synced`];
+      if (failed) parts.push(`${failed} failed`);
+      if (blocked) parts.push(`${blocked} blocked (skipped)`);
+      if (keyChanged) parts.push(`${keyChanged} key changed`);
+      if (rejected) parts.push(`${rejected} spoofed entries rejected`);
+      const newMember = rings.joined.filter((r) => r.outcome === 'member').length;
+      const removedFrom = rings.joined.filter((r) => r.outcome === 'removed' || r.outcome === 'closed');
+      const leavers = rings.hosted.reduce((acc, r) => acc + r.autoRemoved.length, 0);
+      if (newMember) parts.push(`${newMember} ring(s) current`);
+      if (removedFrom.length) parts.push(`no longer in ${removedFrom.map((r) => `"${r.name}"`).join(', ')}`);
+      if (leavers) parts.push(`${leavers} member(s) left your rings`);
+      notify(`Sync: ${parts.join(', ')}.`);
+    } finally {
+      setIsSyncingFriends(false);
+    }
+  };
+
+  const moderationFor = (siteUrl: string): ModerationAction | undefined =>
+    moderation.find((m) => m.siteUrl === siteUrl.replace(/\/+$/, ''))?.action;
+
+  const handleSetModeration = async (
+    siteUrl: string,
+    label: string,
+    action: ModerationAction | null
+  ) => {
+    if (!window.studioApi) return;
+    if (
+      action === 'block' &&
+      !window.confirm(
+        `Block ${label}? Their posts are hidden, their endorsements are left out of your published site, and their site won't be crawled.`
+      )
+    ) {
+      return;
+    }
+    await window.studioApi.setModeration(siteUrl, action);
+    await refreshStudioData();
+    notify(
+      action === 'mute'
+        ? `Muted ${label}. Their posts are hidden from your feed.`
+        : action === 'block'
+        ? `Blocked ${label}.`
+        : `Cleared mute/block for ${label}.`
+    );
+  };
+
+  const activeSchedule = scheduleOverview?.personas.find((p) => p.personaId === activePersonaId);
+
+  const handleSetSchedule = async (
+    change:
+      | { sync?: Partial<ScheduleJob>; publish?: Partial<PersonaScheduleView['schedule']['publish']> }
+      | { app: Partial<ScheduleOverview['app']> }
+  ) => {
+    if (!window.studioApi) return;
+    const payload = 'app' in change ? change : { personaId: activePersonaId, ...change };
+    setScheduleOverview(await window.studioApi.setSchedule(payload));
+  };
+
+  const handleRunJobNow = async (job: 'sync' | 'publish') => {
+    if (!window.studioApi || runningJob) return;
+    setRunningJob(job);
+    notify(job === 'sync' ? 'Running scheduled sync...' : 'Running scheduled publish...');
+    try {
+      const { result, overview } = await window.studioApi.runJobNow(activePersonaId, job);
+      setScheduleOverview(overview);
+      await refreshStudioData();
+      notify(`${job === 'sync' ? 'Sync' : 'Publish'}: ${result.message}`);
+    } finally {
+      setRunningJob(null);
+    }
+  };
+
+  const renderPresetPicker = (preset: SchedulePreset, onChange: (preset: SchedulePreset) => void) => {
+    const kindValue = preset.kind === 'interval' ? `interval-${preset.minutes}` : preset.kind;
+    const time = preset.kind === 'interval' ? '09:00' : preset.time;
+    return (
+      <div className="flex flex-wrap items-center gap-2">
+        <select
+          value={kindValue}
+          onChange={(e) => {
+            const value = e.target.value;
+            if (value.startsWith('interval-')) {
+              onChange({ kind: 'interval', minutes: Number(value.split('-')[1]) as 15 | 60 | 360 | 720 });
+            } else if (value === 'daily') {
+              onChange({ kind: 'daily', time });
+            } else {
+              onChange({ kind: 'weekly', weekday: 1, time });
+            }
+          }}
+          className="px-2 py-1.5 rounded-lg bg-slate-950 border border-slate-800 text-xs"
+        >
+          <option value="interval-15">Every 15 minutes</option>
+          <option value="interval-60">Every hour</option>
+          <option value="interval-360">Every 6 hours</option>
+          <option value="interval-720">Every 12 hours</option>
+          <option value="daily">Daily at…</option>
+          <option value="weekly">Weekly on…</option>
+        </select>
+        {preset.kind === 'weekly' && (
+          <select
+            value={preset.weekday}
+            onChange={(e) => onChange({ ...preset, weekday: Number(e.target.value) })}
+            className="px-2 py-1.5 rounded-lg bg-slate-950 border border-slate-800 text-xs"
+          >
+            {['Sunday', 'Monday', 'Tuesday', 'Wednesday', 'Thursday', 'Friday', 'Saturday'].map((day, i) => (
+              <option key={day} value={i}>
+                {day}
+              </option>
+            ))}
+          </select>
+        )}
+        {preset.kind !== 'interval' && (
+          <input
+            type="time"
+            value={preset.time}
+            onChange={(e) => e.target.value && onChange({ ...preset, time: e.target.value })}
+            className="px-2 py-1 rounded-lg bg-slate-950 border border-slate-800 text-xs"
+          />
+        )}
+      </div>
+    );
+  };
+
+  const renderJobStatus = (job: ScheduleJob, nextAt: string | null) => (
+    <div className="text-[11px] text-slate-400 space-y-0.5">
+      <div>
+        {job.enabled
+          ? scheduleOverview?.app.paused
+            ? 'Paused'
+            : nextAt
+              ? `Next run ${formatUpcoming(nextAt)}`
+              : ''
+          : 'Off'}
+      </div>
+      {job.lastResult && (
+        <div
+          className={
+            job.lastResult.status === 'failed'
+              ? 'text-rose-300'
+              : job.lastResult.status === 'skipped'
+                ? 'text-slate-400'
+                : 'text-emerald-300'
+          }
+          title={job.lastResult.at}
+        >
+          Last run {formatRelativeTime(job.lastResult.at)}: {job.lastResult.message}
+        </div>
+      )}
+    </div>
+  );
 
   const handleExportLocalSite = async () => {
     if (!window.studioApi) return;
@@ -1300,12 +1775,13 @@ export const App: React.FC = () => {
               </div>
             )}
             <button
-              onClick={handleSimulatePeerSync}
-              className="px-3 py-1.5 rounded-lg bg-slate-800 hover:bg-slate-700 text-xs font-medium text-indigo-300 flex items-center gap-1.5 border border-slate-700"
-              title="Simulates a peer's static JSON website on disk and crawls their likes/shares of your items"
+              onClick={handleSyncAllFriends}
+              disabled={isSyncingFriends}
+              className="px-3 py-1.5 rounded-lg bg-slate-800 hover:bg-slate-700 disabled:opacity-60 text-xs font-medium text-indigo-300 flex items-center gap-1.5 border border-slate-700"
+              title="Crawl every friend's signed JSON endpoints and refresh your feed and endorsements"
             >
-              <RefreshCw className="w-3.5 h-3.5" />
-              Simulate & Crawl Peer Ring
+              <RefreshCw className={`w-3.5 h-3.5 ${isSyncingFriends ? 'animate-spin' : ''}`} />
+              {isSyncingFriends ? 'Syncing...' : 'Sync All Friends'}
             </button>
           </div>
         </header>
@@ -2237,26 +2713,6 @@ export const App: React.FC = () => {
                     </div>
                   </label>
 
-                  <label className="flex items-start gap-2.5 p-3 rounded-xl bg-slate-950 border border-slate-800 cursor-pointer">
-                    <input
-                      type="checkbox"
-                      checked={Boolean(publishSettings.publishWebringHub)}
-                      onChange={(e) =>
-                        handleUpdatePrivacySetting({ publishWebringHub: e.target.checked })
-                      }
-                      className="mt-0.5 accent-indigo-500"
-                    />
-                    <div>
-                      <span className="font-semibold text-slate-200 block">
-                        Generate Public <code>/api/webring-hub.json</code> Directory
-                      </span>
-                      <span className="text-slate-400">
-                        Only enable if you want your site to act as a public directory hub for your
-                        public friends.
-                      </span>
-                    </div>
-                  </label>
-
                   <label className="flex items-start gap-2.5 p-3 rounded-xl bg-slate-950 border border-slate-800 cursor-pointer md:col-span-2">
                     <input
                       type="checkbox"
@@ -2370,93 +2826,94 @@ export const App: React.FC = () => {
                   </button>
                 </form>
 
-                {/* Join Webring Form */}
+                {/* Join a Webring (curated: verify the hub, then send the maintainer a signed request) */}
                 <form
-                  onSubmit={handleAddWebring}
+                  onSubmit={handleRequestToJoinRing}
                   className="bg-slate-900 border border-slate-800 rounded-2xl p-5 space-y-4"
                 >
                   <h3 className="font-bold text-base flex items-center gap-2">
-                    <Layers className="w-4 h-4 text-indigo-400" /> Join a Webring Directory
+                    <Layers className="w-4 h-4 text-indigo-400" /> Join a Webring
                   </h3>
-                  <div className="grid grid-cols-2 gap-3">
-                    <div>
-                      <label className="block text-xs text-slate-400 mb-1">Webring Name</label>
-                      <input
-                        type="text"
-                        required
-                        value={ringName}
-                        onChange={(e) => setRingName(e.target.value)}
-                        placeholder="Analog Photo Ring"
-                        className="w-full px-3 py-2 rounded-xl bg-slate-950 border border-slate-800 text-sm"
-                      />
-                    </div>
-                    <div>
-                      <label className="block text-xs text-slate-400 mb-1">Webring Hub JSON URL</label>
-                      <input
-                        type="text"
-                        required
-                        value={ringHubUrl}
-                        onChange={(e) => setRingHubUrl(e.target.value)}
-                        placeholder="https://ring.example/webring-hub.json"
-                        className="w-full px-3 py-2 rounded-xl bg-slate-950 border border-slate-800 text-sm"
-                      />
-                    </div>
-                  </div>
+                  <p className="text-xs text-slate-400">
+                    Paste the ring's hub address (from its directory page or a member's{' '}
+                    <strong>Join Ring</strong> link). Studio checks the ring's signature and creates a
+                    private, signed request link for you to send the ring's maintainer. Publish your
+                    site first so the maintainer can verify it.
+                  </p>
                   <div>
-                    <label className="block text-xs text-slate-400 mb-1">Description</label>
+                    <label className="block text-xs text-slate-400 mb-1">Ring Hub URL (https)</label>
                     <input
-                      type="text"
-                      value={ringDesc}
-                      onChange={(e) => setRingDesc(e.target.value)}
-                      placeholder="A circle of independent creators..."
-                      className="w-full px-3 py-2 rounded-xl bg-slate-950 border border-slate-800 text-sm"
+                      type="url"
+                      required
+                      value={ringHubUrl}
+                      onChange={(e) => setRingHubUrl(e.target.value)}
+                      placeholder="https://maintainer.example/api/rings/photo-ring.json"
+                      className="w-full px-3 py-2 rounded-xl bg-slate-950 border border-slate-800 text-sm font-mono"
                     />
-                  </div>
-                  <div className="grid grid-cols-2 gap-3">
-                    <div>
-                      <label className="block text-xs text-slate-400 mb-1">Previous Neighbor URL</label>
-                      <input
-                        type="text"
-                        value={ringPrevUrl}
-                        onChange={(e) => setRingPrevUrl(e.target.value)}
-                        placeholder="https://prev.example"
-                        className="w-full px-3 py-2 rounded-xl bg-slate-950 border border-slate-800 text-sm"
-                      />
-                    </div>
-                    <div>
-                      <label className="block text-xs text-slate-400 mb-1">Next Neighbor URL</label>
-                      <input
-                        type="text"
-                        value={ringNextUrl}
-                        onChange={(e) => setRingNextUrl(e.target.value)}
-                        placeholder="https://next.example"
-                        className="w-full px-3 py-2 rounded-xl bg-slate-950 border border-slate-800 text-sm"
-                      />
-                    </div>
                   </div>
                   <button
                     type="submit"
-                    className="px-4 py-2 rounded-xl bg-indigo-600 hover:bg-indigo-500 text-white font-semibold text-xs"
+                    disabled={isJoiningRing}
+                    className="px-4 py-2 rounded-xl bg-indigo-600 hover:bg-indigo-500 disabled:opacity-60 text-white font-semibold text-xs"
                   >
-                    + Add Webring Bar to My Site
+                    {isJoiningRing ? 'Checking ring...' : 'Check Ring & Request to Join'}
                   </button>
+                  {lastRequestLink && (
+                    <div className="p-3 rounded-xl bg-indigo-950/40 border border-indigo-500/30 space-y-2 text-xs">
+                      <p className="text-indigo-200">
+                        Send this link to the maintainer of <strong>{lastRequestLink.ringName}</strong>{' '}
+                        (email, chat, anything). You'll appear in the ring after they approve it and
+                        publish, and you next sync.
+                      </p>
+                      <div className="flex gap-2">
+                        <code className="flex-1 truncate px-2 py-1 rounded bg-slate-950 text-slate-300">
+                          {lastRequestLink.link}
+                        </code>
+                        <button
+                          type="button"
+                          onClick={() => {
+                            navigator.clipboard.writeText(lastRequestLink.link);
+                            notify('Copied request link.');
+                          }}
+                          className="px-2.5 py-1 rounded-lg bg-slate-800 hover:bg-slate-700 flex items-center gap-1"
+                        >
+                          <Copy className="w-3 h-3" /> Copy
+                        </button>
+                      </div>
+                    </div>
+                  )}
                 </form>
               </div>
 
               {/* Joined Webrings List (edit the banner text shown on your site) */}
-              {bundle.connections.webrings.length > 0 && (
+              {joinedRings.length > 0 && (
                 <div>
                   <div className="flex flex-wrap items-center justify-between gap-2 mb-3">
                     <h3 className="font-bold text-lg">
-                      Joined Webrings ({bundle.connections.webrings.length})
+                      Rings You've Joined ({joinedRings.length})
                     </h3>
                     <p className="text-xs text-slate-400">
-                      This is the banner shown at the top of your Live Site Preview & exported site.
+                      Rings marked <strong>Member</strong> show as a bar on your site. Sync All
+                      refreshes them.
                     </p>
                   </div>
                   <div className="space-y-3">
-                    {bundle.connections.webrings.map((ring) => {
+                    {joinedRings.map((ring) => {
                       const isEditing = editingRingId === ring.id;
+                      const statusStyle: Record<JoinedRingStatus, string> = {
+                        member: 'bg-emerald-500/20 text-emerald-300',
+                        requested: 'bg-amber-500/20 text-amber-300',
+                        removed: 'bg-rose-500/20 text-rose-300',
+                        closed: 'bg-slate-700 text-slate-300',
+                        legacy: 'bg-slate-700 text-slate-300',
+                      };
+                      const statusLabel: Record<JoinedRingStatus, string> = {
+                        member: 'Member',
+                        requested: 'Requested',
+                        removed: 'Removed by maintainer',
+                        closed: 'Ring closed',
+                        legacy: 'Unverified (older ring)',
+                      };
                       return (
                         <div
                           key={ring.id}
@@ -2555,15 +3012,56 @@ export const App: React.FC = () => {
                                   <p className="text-xs text-slate-400 mt-1">— {ring.description}</p>
                                 )}
                                 <p className="text-xs text-indigo-400 font-mono truncate mt-1">{ring.hubUrl}</p>
+                                <div className="flex flex-wrap items-center gap-2 mt-1.5 text-[11px] text-slate-400">
+                                  <span className={`px-2 py-0.5 rounded-full font-medium ${statusStyle[ring.status]}`}>
+                                    {statusLabel[ring.status]}
+                                  </span>
+                                  {ring.status === 'member' && (
+                                    <span>
+                                      {ring.memberCount} member{ring.memberCount === 1 ? '' : 's'}
+                                      {ring.hubVerified ? ' · ✓ signed hub' : ' · unsigned hub'}
+                                    </span>
+                                  )}
+                                  <span>
+                                    {ring.lastSyncedAt
+                                      ? `Synced ${formatRelativeTime(ring.lastSyncedAt)}`
+                                      : 'Not synced yet'}
+                                  </span>
+                                </div>
+                                {ring.syncWarning && (
+                                  <p className="text-[11px] text-amber-300 mt-1">⚠ {ring.syncWarning}</p>
+                                )}
+                                {ring.status === 'requested' && (
+                                  <p className="text-[11px] text-slate-400 mt-1">
+                                    Waiting for the maintainer. Send them your request link, then use
+                                    Sync All after they approve and publish.
+                                  </p>
+                                )}
                               </div>
                               <div className="flex items-center gap-2 shrink-0">
-                                <button
-                                  type="button"
-                                  onClick={() => handleStartEditWebring(ring)}
-                                  className="px-3 py-1.5 rounded-lg bg-slate-800 hover:bg-slate-700 text-xs font-medium"
-                                >
-                                  Edit
-                                </button>
+                                {ring.status === 'requested' && ring.requestToken && (
+                                  <button
+                                    type="button"
+                                    onClick={() => {
+                                      navigator.clipboard.writeText(
+                                        `webring://ring-request?token=${encodeURIComponent(ring.requestToken!)}`
+                                      );
+                                      notify('Copied request link.');
+                                    }}
+                                    className="px-3 py-1.5 rounded-lg bg-slate-800 hover:bg-slate-700 text-xs font-medium flex items-center gap-1"
+                                  >
+                                    <Copy className="w-3 h-3" /> Request Link
+                                  </button>
+                                )}
+                                {ring.status === 'legacy' && (
+                                  <button
+                                    type="button"
+                                    onClick={() => handleStartEditWebring(ring)}
+                                    className="px-3 py-1.5 rounded-lg bg-slate-800 hover:bg-slate-700 text-xs font-medium"
+                                  >
+                                    Edit
+                                  </button>
+                                )}
                                 <button
                                   type="button"
                                   onClick={() => handleDeleteWebring(ring)}
@@ -2581,6 +3079,267 @@ export const App: React.FC = () => {
                   </div>
                 </div>
               )}
+
+              {/* Rings this persona maintains */}
+              <div className="space-y-3">
+                <div className="flex flex-wrap items-center justify-between gap-2">
+                  <h3 className="font-bold text-lg">Rings You Host ({hostedRings.length})</h3>
+                  <p className="text-xs text-slate-400">
+                    Each ring is published as a signed hub plus a directory page. Changes go live when
+                    you publish.
+                  </p>
+                </div>
+
+                <div className="grid grid-cols-1 lg:grid-cols-2 gap-4">
+                  <form
+                    onSubmit={handleCreateHostedRing}
+                    className="bg-slate-900 border border-slate-800 rounded-2xl p-5 space-y-3"
+                  >
+                    <h4 className="font-bold text-sm">Start a New Ring</h4>
+                    <input
+                      type="text"
+                      required
+                      value={newHostedRingName}
+                      onChange={(e) => setNewHostedRingName(e.target.value)}
+                      placeholder="Analog Photo Ring"
+                      className="w-full px-3 py-2 rounded-xl bg-slate-950 border border-slate-800 text-sm"
+                    />
+                    <input
+                      type="text"
+                      value={newHostedRingDesc}
+                      onChange={(e) => setNewHostedRingDesc(e.target.value)}
+                      placeholder="What the ring is about"
+                      className="w-full px-3 py-2 rounded-xl bg-slate-950 border border-slate-800 text-sm"
+                    />
+                    <button
+                      type="submit"
+                      className="px-4 py-2 rounded-xl bg-indigo-600 hover:bg-indigo-500 text-white font-semibold text-xs"
+                    >
+                      + Create Ring
+                    </button>
+                  </form>
+
+                  <div className="bg-slate-900 border border-slate-800 rounded-2xl p-5 space-y-3">
+                    <h4 className="font-bold text-sm">Review a Join Request</h4>
+                    <p className="text-xs text-slate-400">
+                      Paste the <code>webring://ring-request</code> link an applicant sent you. Studio
+                      checks their signature against their site before you decide.
+                    </p>
+                    <div className="flex gap-2">
+                      <input
+                        type="text"
+                        value={ringRequestLink}
+                        onChange={(e) => setRingRequestLink(e.target.value)}
+                        placeholder="webring://ring-request?token=..."
+                        className="flex-1 px-3 py-2 rounded-xl bg-slate-950 border border-slate-800 text-xs font-mono"
+                      />
+                      <button
+                        type="button"
+                        onClick={() => handleReviewRingRequest()}
+                        className="px-3 py-2 rounded-xl bg-slate-800 hover:bg-slate-700 text-xs font-medium"
+                      >
+                        Check
+                      </button>
+                    </div>
+                    {ringRequestError && <p className="text-xs text-rose-300">⚠ {ringRequestError}</p>}
+                    {ringRequestReview && (
+                      <div className="p-3 rounded-xl bg-slate-950 border border-slate-800 space-y-2 text-xs">
+                        <p>
+                          <strong>{ringRequestReview.applicant.displayName}</strong>{' '}
+                          <span className="font-mono text-indigo-300">{ringRequestReview.applicant.siteUrl}</span>{' '}
+                          wants to join <strong>{ringRequestReview.ring.name}</strong>.{' '}
+                          <span className="text-emerald-300">✓ Signature verified</span>
+                        </p>
+                        {ringRequestReview.state === 'already-member' && (
+                          <p className="text-slate-400">They're already a member.</p>
+                        )}
+                        {ringRequestReview.state === 'banned' && (
+                          <p className="text-rose-300">
+                            This site is banned from the ring
+                            {ringRequestReview.banReason ? ` (${ringRequestReview.banReason})` : ''}.
+                            Unban them below to approve.
+                          </p>
+                        )}
+                        <div className="flex flex-wrap gap-2">
+                          {ringRequestReview.state === 'new' && (
+                            <button
+                              type="button"
+                              onClick={() => handleDecideRingRequest('approve')}
+                              className="px-3 py-1.5 rounded-lg bg-emerald-600 hover:bg-emerald-500 text-white font-semibold"
+                            >
+                              Approve
+                            </button>
+                          )}
+                          <button
+                            type="button"
+                            onClick={() => handleDecideRingRequest('decline')}
+                            className="px-3 py-1.5 rounded-lg bg-slate-800 hover:bg-slate-700"
+                          >
+                            Decline
+                          </button>
+                          {ringRequestReview.state !== 'banned' && (
+                            <button
+                              type="button"
+                              onClick={() => handleDecideRingRequest('ban')}
+                              className="px-3 py-1.5 rounded-lg bg-rose-950/40 hover:bg-rose-900/50 border border-rose-500/30 text-rose-300"
+                            >
+                              Ban
+                            </button>
+                          )}
+                        </div>
+                      </div>
+                    )}
+                  </div>
+                </div>
+
+                {hostedRings.map((ring) => (
+                  <div key={ring.id} className="bg-slate-900 border border-slate-800 rounded-2xl p-5 space-y-3">
+                    <div className="flex flex-wrap items-start justify-between gap-3">
+                      <div className="min-w-0">
+                        <div className="flex items-center gap-2 flex-wrap">
+                          <h4 className="font-bold text-sm">{ring.name}</h4>
+                          <span
+                            className={`text-[10px] px-2 py-0.5 rounded-full font-medium ${
+                              ring.status === 'active'
+                                ? 'bg-emerald-500/20 text-emerald-300'
+                                : 'bg-slate-700 text-slate-300'
+                            }`}
+                          >
+                            {ring.status === 'active' ? 'Active' : 'Closed'}
+                          </span>
+                        </div>
+                        {ring.description && <p className="text-xs text-slate-400 mt-0.5">{ring.description}</p>}
+                        <p className="text-[11px] font-mono text-indigo-300 truncate mt-1">{ring.hubUrl}</p>
+                      </div>
+                      <div className="flex flex-wrap items-center gap-2 text-xs">
+                        <button
+                          type="button"
+                          onClick={() => {
+                            navigator.clipboard.writeText(ring.hubUrl);
+                            notify('Copied hub URL. Share it (or your directory page) with people who want to join.');
+                          }}
+                          className="px-2.5 py-1.5 rounded-lg bg-slate-800 hover:bg-slate-700 flex items-center gap-1"
+                        >
+                          <Copy className="w-3 h-3" /> Hub URL
+                        </button>
+                        <label className="flex items-center gap-1.5 px-2.5 py-1.5 rounded-lg bg-slate-800">
+                          <input
+                            type="checkbox"
+                            checked={ring.maintainerIsMember}
+                            onChange={(e) => handleUpdateHostedRing(ring, { maintainerIsMember: e.target.checked })}
+                            className="accent-indigo-500"
+                          />
+                          I'm a member
+                        </label>
+                        <button
+                          type="button"
+                          onClick={() =>
+                            handleUpdateHostedRing(ring, { status: ring.status === 'active' ? 'closed' : 'active' })
+                          }
+                          className="px-2.5 py-1.5 rounded-lg bg-slate-800 hover:bg-slate-700"
+                        >
+                          {ring.status === 'active' ? 'Close Ring' : 'Reopen'}
+                        </button>
+                      </div>
+                    </div>
+
+                    {ring.members.length === 0 ? (
+                      <p className="text-xs text-slate-500">
+                        No other members yet. Share the hub URL, then review the request links people send you.
+                      </p>
+                    ) : (
+                      <ul className="divide-y divide-slate-800 text-xs">
+                        {ring.members.map((member, idx) => (
+                          <li key={member.siteUrl} className="py-2 flex flex-wrap items-center justify-between gap-2">
+                            <div className="min-w-0">
+                              <span className="font-medium">{member.displayName}</span>{' '}
+                              <span className="font-mono text-slate-400">{member.siteUrl}</span>
+                              <div className="text-[11px] text-slate-500">
+                                {member.confirmedAt
+                                  ? `Confirmed${member.lastVerifiedAt ? ` · checked ${formatRelativeTime(member.lastVerifiedAt)}` : ''}`
+                                  : 'Approved, waiting for them to publish the ring'}
+                                {member.hidden && ' · hidden from Prev/Next/Random'}
+                                {member.flagged && (
+                                  <span className="text-amber-300">
+                                    {' '}· ⚠ site unreachable or key changed for over a week
+                                  </span>
+                                )}
+                              </div>
+                            </div>
+                            <div className="flex items-center gap-1">
+                              <button
+                                type="button"
+                                disabled={idx === 0}
+                                onClick={() => handleRingMemberAction(ring, member, 'up')}
+                                className="px-2 py-1 rounded bg-slate-800 hover:bg-slate-700 disabled:opacity-40"
+                                title="Move up"
+                              >
+                                ↑
+                              </button>
+                              <button
+                                type="button"
+                                disabled={idx === ring.members.length - 1}
+                                onClick={() => handleRingMemberAction(ring, member, 'down')}
+                                className="px-2 py-1 rounded bg-slate-800 hover:bg-slate-700 disabled:opacity-40"
+                                title="Move down"
+                              >
+                                ↓
+                              </button>
+                              <button
+                                type="button"
+                                onClick={() => handleRingMemberAction(ring, member, member.hidden ? 'show' : 'hide')}
+                                className="px-2 py-1 rounded bg-slate-800 hover:bg-slate-700"
+                                title="Hidden members stay in the ring but are skipped by Prev / Next / Random"
+                              >
+                                {member.hidden ? 'Show' : 'Hide'}
+                              </button>
+                              <button
+                                type="button"
+                                onClick={() => handleRingMemberAction(ring, member, 'remove')}
+                                className="px-2 py-1 rounded bg-slate-800 hover:bg-slate-700"
+                              >
+                                Remove
+                              </button>
+                              <button
+                                type="button"
+                                onClick={() => handleRingMemberAction(ring, member, 'ban')}
+                                className="px-2 py-1 rounded bg-rose-950/40 hover:bg-rose-900/50 border border-rose-500/30 text-rose-300"
+                              >
+                                Ban
+                              </button>
+                            </div>
+                          </li>
+                        ))}
+                      </ul>
+                    )}
+
+                    {ring.bans.length > 0 && (
+                      <details className="text-xs">
+                        <summary className="cursor-pointer text-slate-400">Banned sites ({ring.bans.length}, private)</summary>
+                        <ul className="mt-2 space-y-1">
+                          {ring.bans.map((ban) => (
+                            <li key={ban.siteUrl} className="flex items-center justify-between gap-2">
+                              <span className="font-mono text-slate-400">
+                                {ban.siteUrl}
+                                {ban.reason ? ` · ${ban.reason}` : ''}
+                              </span>
+                              <button
+                                type="button"
+                                onClick={() =>
+                                  handleRingMemberAction(ring, { siteUrl: ban.siteUrl, displayName: ban.siteUrl }, 'unban')
+                                }
+                                className="px-2 py-1 rounded bg-slate-800 hover:bg-slate-700"
+                              >
+                                Unban
+                              </button>
+                            </li>
+                          ))}
+                        </ul>
+                      </details>
+                    )}
+                  </div>
+                ))}
+              </div>
 
               {/* Friends List */}
               <div>
@@ -2647,6 +3406,16 @@ export const App: React.FC = () => {
                             <p className="text-xs text-indigo-400 font-mono truncate">
                               {friend.siteUrl}
                             </p>
+                            <p
+                              className="text-[11px] text-slate-500 mt-0.5"
+                              title={friend.lastCrawledAt || undefined}
+                            >
+                              {friend.lastCrawledAt
+                                ? `Last synced ${formatRelativeTime(friend.lastCrawledAt)}`
+                                : 'Never synced'}
+                              {moderationFor(friend.siteUrl) === 'mute' && ' · Muted'}
+                              {moderationFor(friend.siteUrl) === 'block' && ' · Blocked'}
+                            </p>
                             <p className="text-xs text-slate-400 truncate mt-0.5">{friend.bio}</p>
                             <div className="flex gap-1 mt-1">
                               {friend.relationship.map((r) => (
@@ -2695,10 +3464,19 @@ export const App: React.FC = () => {
                               const res = await window.studioApi?.crawlFriend(friend.siteUrl);
                               await refreshStudioData();
                               if (res?.success) {
-                                notify(`Synced ${friend.displayName}: ${res.itemsIndexed} items indexed!`);
+                                notify(
+                                  `Synced ${friend.displayName}: ${res.itemsIndexed} items indexed` +
+                                    (res.entriesPruned ? `, ${res.entriesPruned} removed` : '') +
+                                    (res.entriesRejected
+                                      ? `, ${res.entriesRejected} spoofed entries rejected`
+                                      : '') +
+                                    '.'
+                                );
+                              } else if (res?.blocked) {
+                                notify(`${friend.displayName} is blocked, so their site wasn't crawled.`);
                               } else {
                                 notify(
-                                  `Note: ${friend.siteUrl} is offline or simulated. Use "Simulate & Crawl Peer Ring" top-right to test!`
+                                  `Couldn't sync ${friend.siteUrl}: ${res?.error || 'site unreachable'}`
                                 );
                               }
                             }}
@@ -2706,8 +3484,31 @@ export const App: React.FC = () => {
                           >
                             <RefreshCw className="w-3 h-3" /> Sync JSON
                           </button>
+                          <select
+                            value={moderationFor(friend.siteUrl) || ''}
+                            onChange={(e) =>
+                              handleSetModeration(
+                                friend.siteUrl,
+                                friend.displayName,
+                                (e.target.value || null) as ModerationAction | null
+                              )
+                            }
+                            className="px-2 py-1.5 rounded-lg bg-slate-800 text-xs"
+                            title="Mute hides this friend from your feed. Block also drops their endorsements from your published site and stops crawling them."
+                          >
+                            <option value="">Visible</option>
+                            <option value="mute">Muted</option>
+                            <option value="block">Blocked</option>
+                          </select>
                           <button
                             onClick={async () => {
+                              if (
+                                !window.confirm(
+                                  `Remove ${friend.displayName}? Their crawled posts and endorsements are deleted too.`
+                                )
+                              ) {
+                                return;
+                              }
                               await window.studioApi?.deleteFriend(friend.id);
                               await refreshStudioData();
                             }}
@@ -2735,23 +3536,74 @@ export const App: React.FC = () => {
                     <code>/api/albums.json</code> and <code>/api/items.json</code> endpoints.
                   </p>
                 </div>
-                <button
-                  onClick={handleSimulatePeerSync}
-                  className="px-4 py-2 rounded-xl bg-indigo-600 hover:bg-indigo-500 text-white font-semibold text-xs flex items-center gap-2 shadow"
-                >
-                  <RefreshCw className="w-4 h-4" />
-                  Crawl & Sync Ring Peers Now
-                </button>
+                <div className="flex flex-wrap items-center gap-2">
+                  <button
+                    onClick={handleSimulatePeerSync}
+                    className="px-3 py-2 rounded-xl bg-slate-800 hover:bg-slate-700 text-xs font-medium"
+                    title="Generates a simulated peer site (Maya Lin) on disk and crawls it, for trying out the feed"
+                  >
+                    Add Demo Peer (Maya)
+                  </button>
+                  <button
+                    onClick={handleSyncAllFriends}
+                    disabled={isSyncingFriends}
+                    className="px-4 py-2 rounded-xl bg-indigo-600 hover:bg-indigo-500 disabled:opacity-60 text-white font-semibold text-xs flex items-center gap-2 shadow"
+                  >
+                    <RefreshCw className={`w-4 h-4 ${isSyncingFriends ? 'animate-spin' : ''}`} />
+                    {isSyncingFriends ? 'Syncing...' : 'Sync All Friends Now'}
+                  </button>
+                </div>
               </div>
+
+              <p className="text-xs text-slate-400">
+                Showing {networkFeed.length} entr{networkFeed.length === 1 ? 'y' : 'ies'} from{' '}
+                {new Set(networkFeed.map((e) => e.friendSiteUrl)).size} site(s)
+                {feedExclusions.muted + feedExclusions.blocked > 0 &&
+                  ` · ${feedExclusions.muted + feedExclusions.blocked} hidden (muted ${feedExclusions.muted}, blocked ${feedExclusions.blocked})`}
+                {feedExclusions.unverified > 0 &&
+                  ` · ${feedExclusions.unverified} shown without a verified signature`}
+                . Feed entries are never published; blocked sites' endorsements and unverified
+                endorsements are also left out of your exported site.
+              </p>
+
+              {moderation.length > 0 && (
+                <div className="bg-slate-900 border border-slate-800 rounded-xl p-4 space-y-2">
+                  <h3 className="text-xs font-bold uppercase tracking-wider text-slate-400">
+                    Muted & Blocked Sites
+                  </h3>
+                  {moderation.map((m) => (
+                    <div key={m.siteUrl} className="flex items-center justify-between gap-3 text-xs">
+                      <span className="font-mono text-slate-300 truncate">{m.siteUrl}</span>
+                      <div className="flex items-center gap-2 shrink-0">
+                        <span
+                          className={`px-2 py-0.5 rounded-full font-medium ${
+                            m.action === 'block'
+                              ? 'bg-rose-500/20 text-rose-300'
+                              : 'bg-amber-500/20 text-amber-300'
+                          }`}
+                        >
+                          {m.action === 'block' ? 'Blocked' : 'Muted'}
+                        </span>
+                        <button
+                          onClick={() => handleSetModeration(m.siteUrl, m.siteUrl, null)}
+                          className="px-2 py-1 rounded-lg bg-slate-800 hover:bg-slate-700"
+                        >
+                          {m.action === 'block' ? 'Unblock' : 'Unmute'}
+                        </button>
+                      </div>
+                    </div>
+                  ))}
+                </div>
+              )}
 
               {networkFeed.length === 0 ? (
                 <div className="bg-slate-900 border border-slate-800 rounded-2xl p-10 text-center space-y-3">
                   <Radio className="w-10 h-10 text-indigo-400 mx-auto" />
                   <h3 className="font-bold text-base">Your Neighborhood Feed is Ready</h3>
                   <p className="text-xs text-slate-400 max-w-md mx-auto">
-                    Click <strong>"Crawl & Sync Ring Peers Now"</strong> above to generate a live
-                    simulated peer site (Maya Lin) and crawl her signed JSON endpoints into your
-                    local SQLite database!
+                    Click <strong>"Sync All Friends Now"</strong> above to crawl your friends'
+                    signed JSON endpoints, or <strong>"Add Demo Peer (Maya)"</strong> to try it with
+                    a simulated peer site.
                   </p>
                 </div>
               ) : (
@@ -2796,6 +3648,24 @@ export const App: React.FC = () => {
                                   <p className="text-[11px] text-slate-400 font-mono truncate">
                                     {entry.friendSiteUrl}
                                   </p>
+                                  <div className="flex gap-2 mt-0.5 text-[10px]">
+                                    <button
+                                      onClick={() =>
+                                        handleSetModeration(entry.friendSiteUrl, entry.friendName, 'mute')
+                                      }
+                                      className="text-slate-500 hover:text-amber-300"
+                                    >
+                                      Mute
+                                    </button>
+                                    <button
+                                      onClick={() =>
+                                        handleSetModeration(entry.friendSiteUrl, entry.friendName, 'block')
+                                      }
+                                      className="text-slate-500 hover:text-rose-300"
+                                    >
+                                      Block
+                                    </button>
+                                  </div>
                                 </div>
                               </div>
 
@@ -3192,6 +4062,201 @@ export const App: React.FC = () => {
                 </button>
               </div>
 
+              <div className="bg-slate-900 border border-slate-800 rounded-2xl p-4 text-sm flex flex-wrap items-center justify-between gap-3">
+                {publishSettings.lastPublishedAt ? (
+                  <div className="space-y-0.5">
+                    <p>
+                      Last published{' '}
+                      <strong title={publishSettings.lastPublishedAt}>
+                        {formatRelativeTime(publishSettings.lastPublishedAt)}
+                      </strong>{' '}
+                      <span className="text-xs text-slate-500 font-mono">
+                        ({new Date(publishSettings.lastPublishedAt).toLocaleString()})
+                      </span>
+                    </p>
+                    <p className="text-xs text-slate-400">
+                      Your public site is a snapshot from that moment. Anything added since then,
+                      including newly synced endorsements, appears after you publish again.
+                      {publishSettings.lastPublishedCounts &&
+                        ` It contains ${publishSettings.lastPublishedCounts.itemCount} items, ${publishSettings.lastPublishedCounts.photoCount} photos and ${publishSettings.lastPublishedCounts.endorsementCount} endorsements.`}
+                    </p>
+                  </div>
+                ) : (
+                  <p className="text-slate-400">Not published yet.</p>
+                )}
+                {publishSettings.lastPublishedAt && publishedUpToDate && (
+                  <span className="text-xs px-2.5 py-1 rounded-full bg-emerald-500/20 text-emerald-300 font-medium">
+                    ✓ Up to date
+                  </span>
+                )}
+                {publishSettings.lastPublishedAt && !publishedUpToDate && changesSinceLastPublish > 0 && (
+                  <span className="text-xs px-2.5 py-1 rounded-full bg-amber-500/20 text-amber-300 font-medium">
+                    {changesSinceLastPublish} change{changesSinceLastPublish === 1 ? '' : 's'} since
+                    last publish
+                  </span>
+                )}
+              </div>
+
+              {/* Scheduled sync & publish */}
+              {scheduleOverview && activeSchedule && (
+                <div className="bg-slate-900 border border-slate-800 rounded-2xl p-6 space-y-5">
+                  <div className="flex flex-wrap items-start justify-between gap-3">
+                    <div>
+                      <h3 className="font-bold text-base flex items-center gap-2">
+                        <RefreshCw className="w-4 h-4 text-indigo-400" /> Schedule
+                      </h3>
+                      <p className="text-xs text-slate-400 mt-1">
+                        Keep <strong>{activeSchedule.label}</strong> synced and published automatically.
+                        Schedules run while Studio is open or in the menu bar; missed runs happen once
+                        when Studio is back.
+                      </p>
+                    </div>
+                    {scheduleOverview.app.paused && (
+                      <span className="text-xs px-2.5 py-1 rounded-full bg-amber-500/20 text-amber-300 font-medium">
+                        All schedules paused
+                      </span>
+                    )}
+                  </div>
+
+                  <div className="grid grid-cols-1 md:grid-cols-2 gap-4">
+                    <div className="p-4 rounded-xl bg-slate-950 border border-slate-800 space-y-3">
+                      <label className="flex items-center gap-2 text-sm font-semibold">
+                        <input
+                          type="checkbox"
+                          checked={activeSchedule.schedule.sync.enabled}
+                          onChange={(e) => handleSetSchedule({ sync: { enabled: e.target.checked } })}
+                          className="accent-indigo-500"
+                        />
+                        Sync friends &amp; rings
+                      </label>
+                      {renderPresetPicker(activeSchedule.schedule.sync.preset, (preset) =>
+                        handleSetSchedule({ sync: { preset } })
+                      )}
+                      {renderJobStatus(activeSchedule.schedule.sync, activeSchedule.nextSyncAt)}
+                      <button
+                        type="button"
+                        disabled={Boolean(runningJob)}
+                        onClick={() => handleRunJobNow('sync')}
+                        className="px-3 py-1.5 rounded-lg bg-slate-800 hover:bg-slate-700 disabled:opacity-50 text-xs"
+                      >
+                        {runningJob === 'sync' ? 'Syncing...' : 'Run now'}
+                      </button>
+                    </div>
+
+                    <div className="p-4 rounded-xl bg-slate-950 border border-slate-800 space-y-3">
+                      <label className="flex items-center gap-2 text-sm font-semibold">
+                        <input
+                          type="checkbox"
+                          checked={activeSchedule.schedule.publish.enabled}
+                          onChange={(e) => handleSetSchedule({ publish: { enabled: e.target.checked } })}
+                          className="accent-indigo-500"
+                        />
+                        Publish if anything changed
+                      </label>
+                      {renderPresetPicker(activeSchedule.schedule.publish.preset, (preset) =>
+                        handleSetSchedule({ publish: { preset } })
+                      )}
+                      <div className="flex flex-wrap items-center gap-3 text-xs">
+                        <select
+                          value={activeSchedule.schedule.publish.destination}
+                          onChange={(e) =>
+                            handleSetSchedule({
+                              publish: { destination: e.target.value as 'local' | 'remote' | 'github' },
+                            })
+                          }
+                          className="px-2 py-1.5 rounded-lg bg-slate-900 border border-slate-800"
+                        >
+                          <option value="local">To export folder</option>
+                          <option value="remote">To SFTP / FTP host</option>
+                          <option value="github">To GitHub Pages</option>
+                        </select>
+                        <label className="flex items-center gap-1.5 text-slate-300">
+                          <input
+                            type="checkbox"
+                            checked={activeSchedule.schedule.publish.syncFirst}
+                            onChange={(e) => handleSetSchedule({ publish: { syncFirst: e.target.checked } })}
+                            className="accent-indigo-500"
+                          />
+                          Sync first
+                        </label>
+                      </div>
+                      {renderJobStatus(activeSchedule.schedule.publish, activeSchedule.nextPublishAt)}
+                      <button
+                        type="button"
+                        disabled={Boolean(runningJob)}
+                        onClick={() => handleRunJobNow('publish')}
+                        className="px-3 py-1.5 rounded-lg bg-slate-800 hover:bg-slate-700 disabled:opacity-50 text-xs"
+                      >
+                        {runningJob === 'publish' ? 'Publishing...' : 'Run now'}
+                      </button>
+                    </div>
+                  </div>
+
+                  {scheduleOverview.personas.length > 1 && (
+                    <div className="overflow-x-auto">
+                      <table className="w-full text-xs">
+                        <thead className="text-slate-500 text-left">
+                          <tr>
+                            <th className="py-1 pr-3 font-medium">Persona</th>
+                            <th className="py-1 pr-3 font-medium">Sync</th>
+                            <th className="py-1 font-medium">Publish</th>
+                          </tr>
+                        </thead>
+                        <tbody className="text-slate-300">
+                          {scheduleOverview.personas.map((p) => (
+                            <tr key={p.personaId} className="border-t border-slate-800">
+                              <td className="py-1.5 pr-3">{p.label}</td>
+                              <td className="py-1.5 pr-3">
+                                {p.schedule.sync.enabled
+                                  ? `${p.describe.sync}${p.nextSyncAt ? ` · ${formatUpcoming(p.nextSyncAt)}` : ''}`
+                                  : 'Off'}
+                                {p.schedule.sync.lastResult?.status === 'failed' && (
+                                  <span className="text-rose-300"> · last run failed</span>
+                                )}
+                              </td>
+                              <td className="py-1.5">
+                                {p.schedule.publish.enabled
+                                  ? `${p.describe.publish}${p.nextPublishAt ? ` · ${formatUpcoming(p.nextPublishAt)}` : ''}`
+                                  : 'Off'}
+                                {p.schedule.publish.lastResult?.status === 'failed' && (
+                                  <span className="text-rose-300"> · last run failed</span>
+                                )}
+                              </td>
+                            </tr>
+                          ))}
+                        </tbody>
+                      </table>
+                    </div>
+                  )}
+
+                  <div className="flex flex-wrap gap-4 text-xs text-slate-300 border-t border-slate-800 pt-4">
+                    {(
+                      [
+                        ['runInBackground', 'Keep running in the menu bar when the window is closed'],
+                        ['startAtLogin', 'Start Studio at login (in the menu bar)'],
+                        ['notifyOnFailure', 'Notify me when a scheduled job fails'],
+                        ['paused', 'Pause all schedules'],
+                      ] as const
+                    ).map(([key, label]) => (
+                      <label key={key} className="flex items-center gap-1.5">
+                        <input
+                          type="checkbox"
+                          checked={scheduleOverview.app[key]}
+                          onChange={(e) => handleSetSchedule({ app: { [key]: e.target.checked } })}
+                          className="accent-indigo-500"
+                        />
+                        {label}
+                      </label>
+                    ))}
+                  </div>
+                  {!scheduleOverview.app.runInBackground && (
+                    <p className="text-[11px] text-amber-300">
+                      With background mode off, schedules only run while the Studio window is open.
+                    </p>
+                  )}
+                </div>
+              )}
+
               {/* Pre-Publish Test Export & Local Browser Preview */}
               <div className="bg-indigo-950/25 border border-indigo-500/30 rounded-2xl p-6 space-y-4">
                 <div className="flex flex-wrap items-start justify-between gap-4">
@@ -3277,7 +4342,8 @@ export const App: React.FC = () => {
                   Generates <code>index.html</code>, <code>/.well-known/did.json</code>,{' '}
                   <code>/api/manifest.json</code>, <code>/api/profile.json</code>,{' '}
                   <code>/api/albums.json</code>, <code>/api/items.json</code>,{' '}
-                  <code>/api/connections.json</code>, and <code>/api/webring-hub.json</code>.
+                  <code>/api/connections.json</code>, and a signed hub plus directory page for each
+                  ring you host.
                 </p>
 
                 <div className="flex gap-2">
@@ -4191,8 +5257,8 @@ export const App: React.FC = () => {
                             mcpServers: {
                               'webring-studio-live': {
                                 url:
-                                  mcpInfo?.status.endpointUrl ||
-                                  'http://127.0.0.1:<port>/mcp',
+                                  mcpInfo?.status.authorizedEndpointUrl ||
+                                  'http://127.0.0.1:<port>/mcp?token=<token>',
                               },
                             },
                           },
@@ -4210,19 +5276,46 @@ export const App: React.FC = () => {
                   <p className="text-xs text-slate-400">
                     Connects directly to this running Studio window on <code>127.0.0.1</code>. Any
                     posts, comments, persona switches, or crawls performed by your agent update this
-                    UI in real time!
+                    UI in real time! The port stays the same across restarts. Use the URLs below,
+                    which include your access token: clients running inside a browser or Electron
+                    window (anything that sends an <code>Origin</code> header) are refused without
+                    it, so web pages can't control Studio. Treat the token like a password.
                   </p>
+                  <div className="flex flex-wrap gap-2">
+                    <button
+                      type="button"
+                      onClick={() => {
+                        if (!mcpInfo?.status.authorizedSseUrl) return;
+                        navigator.clipboard.writeText(mcpInfo.status.authorizedSseUrl);
+                        notify('Copied SSE URL (with access token) to clipboard!');
+                      }}
+                      className="px-3 py-1.5 rounded-lg bg-slate-800 hover:bg-slate-700 text-xs font-medium flex items-center gap-1.5"
+                    >
+                      <Copy className="w-3.5 h-3.5" /> Copy SSE URL
+                    </button>
+                    <button
+                      type="button"
+                      onClick={() => {
+                        if (!mcpInfo?.status.authorizedEndpointUrl) return;
+                        navigator.clipboard.writeText(mcpInfo.status.authorizedEndpointUrl);
+                        notify('Copied HTTP URL (with access token) to clipboard!');
+                      }}
+                      className="px-3 py-1.5 rounded-lg bg-slate-800 hover:bg-slate-700 text-xs font-medium flex items-center gap-1.5"
+                    >
+                      <Copy className="w-3.5 h-3.5" /> Copy HTTP URL
+                    </button>
+                  </div>
                   <pre className="p-3.5 rounded-xl bg-slate-950 border border-slate-800 text-[11px] font-mono text-indigo-300 overflow-x-auto">
                     {JSON.stringify(
                       {
                         mcpServers: {
                           'webring-studio-live': {
                             url:
-                              mcpInfo?.status.endpointUrl ||
-                              'http://127.0.0.1:<port>/mcp',
+                              mcpInfo?.status.authorizedEndpointUrl ||
+                              'http://127.0.0.1:<port>/mcp?token=<token>',
                             sseUrl:
-                              mcpInfo?.status.sseUrl ||
-                              'http://127.0.0.1:<port>/mcp/sse',
+                              mcpInfo?.status.authorizedSseUrl ||
+                              'http://127.0.0.1:<port>/mcp/sse?token=<token>',
                           },
                         },
                       },
@@ -4520,9 +5613,10 @@ export const App: React.FC = () => {
                   </h2>
                   <p className="text-sm text-slate-400 mt-1">
                     Complete documentation for compartmentalized personas, wall posts & threaded
-                    comments, local test exports, <strong>GitHub Pages</strong> &{' '}
-                    <strong>SFTP / FTP</strong> deployment, <strong>Google Analytics / AdSense</strong>{' '}
-                    add-ons, and <strong>AI Agent (MCP)</strong> automation.
+                    comments, syncing friends with mute &amp; block, local test exports,{' '}
+                    <strong>GitHub Pages</strong> & <strong>SFTP / FTP</strong> deployment and
+                    publish snapshots, <strong>Google Analytics / AdSense</strong> add-ons, and
+                    secure local <strong>AI Agent (MCP)</strong> automation.
                   </p>
                 </div>
 
@@ -4536,6 +5630,7 @@ export const App: React.FC = () => {
                       { id: 'addons', label: '4. Analytics & AdSense Add-Ons' },
                       { id: 'mcp-agents', label: '5. AI Agent (MCP) Guide' },
                       { id: 'privacy-faq', label: '6. Security & Privacy FAQ' },
+                      { id: 'webrings', label: '7. Webrings Guide' },
                     ] as const
                   ).map((sec) => (
                     <button
@@ -4672,6 +5767,24 @@ export const App: React.FC = () => {
                           exposing your social graph publicly. Click <strong>💬 Reply</strong> on any
                           feed item to publish a signed threaded comment!
                         </p>
+                        <ul className="text-xs text-slate-400 list-disc list-inside space-y-1">
+                          <li>
+                            <strong>Sync All Friends</strong> (top bar or Feed tab) crawls every
+                            friend's signed JSON. Each friend card shows when it was last synced.
+                          </li>
+                          <li>
+                            New here? <strong>Add Demo Peer (Maya)</strong> in the Feed tab builds a
+                            simulated friend site so you can try the feed.
+                          </li>
+                          <li>
+                            Use <strong>Mute</strong> or <strong>Block</strong> on a friend or feed
+                            post to curate your feed (see the Security &amp; Privacy FAQ).
+                          </li>
+                          <li>
+                            Removing a friend also deletes the posts and endorsements crawled from
+                            their site.
+                          </li>
+                        </ul>
                         <div className="flex gap-3 pt-1">
                           <button
                             onClick={() => setActiveTab('friends')}
@@ -4738,6 +5851,18 @@ export const App: React.FC = () => {
                           an AI agent via the <strong>AI Agent (MCP)</strong> tab to automate posting,
                           ring crawling, and publishing via natural language prompts.
                         </p>
+                        <p className="text-xs text-slate-400 leading-relaxed">
+                          Your public site is a <strong>snapshot</strong>. The Publish tab shows when
+                          you last published and how many changes you've made since. New posts and
+                          newly synced endorsements go live the next time you publish.
+                        </p>
+                        <p className="text-xs text-slate-400 leading-relaxed">
+                          Use the <strong>Schedule</strong> card on the Publish tab to sync and publish
+                          automatically for each persona (every 15 minutes up to weekly). Scheduled
+                          publishes skip when nothing changed. With background mode on, closing the window
+                          keeps Studio in the menu bar so schedules keep running; it can also start at
+                          login. Missed runs happen once when Studio is back.
+                        </p>
                         <div className="flex gap-3 pt-1">
                           <button
                             onClick={() => setHelpSection('github-pages')}
@@ -4777,7 +5902,8 @@ export const App: React.FC = () => {
 │   ├── albums.json          # Signed photo galleries with canonical item URIs
 │   ├── items.json           # Signed wall posts, threaded comments, likes & recommendations
 │   ├── connections.json     # Signed webring bars, opt-in public friends & incoming peer replies
-│   └── webring-hub.json     # (Optional) Community ring directory if enabled
+│   └── rings/<name>.json    # Signed member list for each ring you host
+├── rings/<name>/index.html  # Script-free directory page for each ring you host
 └── media/
     └── albums/              # Local imported photos copied automatically`}
                     </pre>
@@ -5235,7 +6361,9 @@ git push -u origin main --force`}
                   <div className="bg-slate-900 border border-slate-800 rounded-2xl p-6 space-y-5">
                     <div className="border-b border-slate-800 pb-4">
                       <span className="text-xs font-bold uppercase tracking-wider px-2.5 py-0.5 rounded-full bg-indigo-500/20 text-indigo-300">
-                        24 MCP Tools • 8 Resources • 4 Guided Prompts
+                        {mcpInfo?.tools.length ?? 38} MCP Tools •{' '}
+                        {mcpInfo?.resources.length ?? 5} Resources •{' '}
+                        {mcpInfo?.prompts.length ?? 3} Guided Prompts
                       </span>
                       <h3 className="text-xl font-bold mt-2">
                         Automating Webring Studio with an AI Agent (MCP Guide)
@@ -5260,6 +6388,11 @@ git push -u origin main --force`}
                           over standard input/output. Ideal for Claude Desktop, Cursor, or scheduled
                           background tasks—works even when the Webring Studio desktop window is closed.
                         </p>
+                        <p className="text-xs text-amber-300/90 leading-relaxed">
+                          It can read, post and sync, but it <strong>can't publish</strong>: your
+                          signing key is locked in the OS keychain, which only the running Studio app
+                          can open. Use Transport Option 2 for publishing.
+                        </p>
                       </div>
 
                       <div className="p-4 rounded-xl bg-slate-950 border border-slate-800 space-y-2">
@@ -5269,17 +6402,47 @@ git push -u origin main --force`}
                         <h4 className="font-bold text-sm">Live Studio Window Sync</h4>
                         <p className="text-xs text-slate-400 leading-relaxed">
                           While Webring Studio is open, it listens on{' '}
-                          <code>{mcpInfo?.status.endpointUrl || 'http://127.0.0.1:<port>/mcp'}</code>.
-                          Any tool call executed by your AI agent updates the Studio UI and Live
-                          Activity Log in real time!
+                          <code>{mcpInfo?.status.endpointUrl || 'http://127.0.0.1:<port>/mcp'}</code>{' '}
+                          (SSE: <code>/mcp/sse</code>). The port stays the same across restarts. Any
+                          tool call executed by your AI agent updates the Studio UI and Live Activity
+                          Log in real time, and this transport can publish.
+                        </p>
+                        <p className="text-xs text-slate-400 leading-relaxed">
+                          Clients that run inside a browser or Electron window send an{' '}
+                          <code>Origin</code> header and must use the URL with your{' '}
+                          <strong>access token</strong> (<code>?token=…</code>). Command-line agents
+                          don't need it. Web pages are always refused.
                         </p>
                       </div>
+                    </div>
+
+                    {/* Electron / browser-based client setup */}
+                    <div className="p-4 rounded-xl bg-emerald-950/20 border border-emerald-500/30 space-y-2">
+                      <h4 className="font-bold text-sm text-emerald-300">
+                        Connecting an Electron or browser-based MCP client (SSE)
+                      </h4>
+                      <ol className="text-xs text-slate-300 list-decimal list-inside space-y-1">
+                        <li>Open Webring Studio (it must be running for SSE).</li>
+                        <li>
+                          In the <strong>AI Agent (MCP)</strong> tab, click{' '}
+                          <strong>Copy SSE URL</strong>. It includes your access token.
+                        </li>
+                        <li>
+                          In your client, add a server with transport <strong>SSE</strong> and paste
+                          the URL. Leave the command, arguments and environment variables empty.
+                        </li>
+                      </ol>
+                      <p className="text-xs text-slate-400 leading-relaxed">
+                        Treat the token like a password: anything that has it can control Studio. To
+                        issue a new one, quit Studio, delete <code>mcp-http.json</code> from the Studio
+                        data folder, and reopen it.
+                      </p>
                     </div>
 
                     {/* Available Tool Categories */}
                     <div className="space-y-2 pt-2 border-t border-slate-800/80">
                       <h4 className="font-bold text-sm text-indigo-300">
-                        What Can Your AI Agent Control via MCP? (24 Tools)
+                        What Can Your AI Agent Control via MCP?
                       </h4>
                       <div className="grid grid-cols-1 md:grid-cols-2 gap-3 text-xs text-slate-300">
                         <div className="p-3 rounded-xl bg-slate-950 border border-slate-800">
@@ -5292,30 +6455,42 @@ git push -u origin main --force`}
                         </div>
                         <div className="p-3 rounded-xl bg-slate-950 border border-slate-800">
                           <strong className="text-white block mb-1">
-                            💬 Wall Posts, Replies & Albums (6 tools)
+                            💬 Wall Posts, Replies & Albums (9 tools)
                           </strong>
-                          <code>webring_create_post</code>, <code>webring_interact_with_url</code>,{' '}
-                          <code>webring_delete_item</code>, <code>webring_create_album</code>,{' '}
-                          <code>webring_add_photo</code>, <code>webring_delete_photo</code>
+                          <code>webring_list_items</code>, <code>webring_create_post</code>,{' '}
+                          <code>webring_interact_with_url</code>, <code>webring_delete_item</code>,{' '}
+                          <code>webring_list_albums</code>, <code>webring_create_album</code>,{' '}
+                          <code>webring_add_photo</code>, <code>webring_delete_album</code>,{' '}
+                          <code>webring_delete_photo</code>
                         </div>
                         <div className="p-3 rounded-xl bg-slate-950 border border-slate-800">
                           <strong className="text-white block mb-1">
-                            🕸️ Ring Crawler & Neighborhood Feed (7 tools)
+                            🕸️ Friends, Moderation & Neighborhood Feed (9 tools)
                           </strong>
-                          <code>webring_add_friend</code>, <code>webring_set_friend_visibility</code>,{' '}
-                          <code>webring_delete_friend</code>, <code>webring_add_webring</code>,{' '}
+                          <code>webring_list_friends</code>, <code>webring_add_friend</code>,{' '}
+                          <code>webring_set_friend_visibility</code>,{' '}
+                          <code>webring_set_moderation</code>, <code>webring_delete_friend</code>,{' '}
                           <code>webring_crawl_friend</code>, <code>webring_crawl_all_friends</code>,{' '}
-                          <code>webring_get_neighborhood_feed</code>
+                          <code>webring_get_neighborhood_feed</code>,{' '}
+                          <code>webring_get_endorsements</code>
+                        </div>
+                        <div className="p-3 rounded-xl bg-slate-950 border border-slate-800">
+                          <strong className="text-white block mb-1">💍 Webrings (7 tools)</strong>
+                          <code>webring_list_rings</code>, <code>webring_join_ring</code>,{' '}
+                          <code>webring_leave_ring</code>, <code>webring_sync_rings</code>,{' '}
+                          <code>webring_create_hosted_ring</code>,{' '}
+                          <code>webring_review_ring_request</code>, <code>webring_set_ring_member</code>
                         </div>
                         <div className="p-3 rounded-xl bg-slate-950 border border-slate-800">
                           <strong className="text-white block mb-1">
-                            🚀 Publishing, Privacy & Add-Ons (6 tools)
+                            🚀 Publishing, Schedules & Add-Ons (8 tools)
                           </strong>
-                          <code>webring_update_privacy_settings</code>,{' '}
+                          <code>webring_export_static_site</code>,{' '}
+                          <code>webring_start_preview_server</code>, <code>webring_get_schedule</code>,{' '}
+                          <code>webring_set_schedule</code>, <code>webring_run_scheduled_job</code>,{' '}
                           <code>webring_get_addons</code>,{' '}
                           <code>webring_configure_analytics_addon</code>,{' '}
-                          <code>webring_configure_ads_addon</code>, <code>webring_export_site</code>,{' '}
-                          <code>webring_test_export_preview</code>
+                          <code>webring_configure_ads_addon</code>
                         </div>
                       </div>
                     </div>
@@ -5330,6 +6505,133 @@ git push -u origin main --force`}
                         className="px-4 py-2 rounded-xl bg-indigo-600 hover:bg-indigo-500 text-white text-xs font-semibold transition"
                       >
                         Open AI Agent (MCP) Hub →
+                      </button>
+                    </div>
+                  </div>
+                </div>
+              )}
+
+              {/* SECTION 7: WEBRINGS */}
+              {helpSection === 'webrings' && (
+                <div className="space-y-6">
+                  <div className="bg-slate-900 border border-slate-800 rounded-2xl p-6 space-y-5">
+                    <div className="border-b border-slate-800 pb-4">
+                      <h3 className="text-xl font-bold">Webrings: Joining, Hosting & Membership</h3>
+                      <p className="text-xs text-slate-400 mt-1">
+                        A webring is a circle of sites linked by <strong>← Prev</strong>,{' '}
+                        <strong>Next →</strong> and <strong>Random</strong>. Each ring has a{' '}
+                        <strong>maintainer</strong> who decides who's in it. Everything works with static
+                        files: the maintainer publishes a signed member list (the ring's{' '}
+                        <em>hub</em>), and each member's site lists the rings it belongs to. You're a
+                        member when both agree.
+                      </p>
+                    </div>
+
+                    <div className="grid grid-cols-1 md:grid-cols-2 gap-4 text-xs">
+                      <div className="p-4 rounded-xl bg-slate-950 border border-slate-800 space-y-2">
+                        <h4 className="font-bold text-sm text-indigo-300">Joining a ring</h4>
+                        <ol className="list-decimal list-inside space-y-1 text-slate-300">
+                          <li>Publish your site at least once (the maintainer checks it).</li>
+                          <li>
+                            In <strong>Friends &amp; Webrings → Join a Webring</strong>, paste the ring's
+                            hub URL (or click <strong>Join Ring</strong> on a member's site).
+                          </li>
+                          <li>
+                            Studio verifies the ring and gives you a private, signed{' '}
+                            <strong>request link</strong>. Send it to the maintainer any way you like.
+                          </li>
+                          <li>
+                            Once they approve and publish, click <strong>Sync All</strong>. The ring
+                            becomes <strong>Member</strong>; publish to show its bar on your site.
+                          </li>
+                        </ol>
+                        <p className="text-slate-400">
+                          Your request is never published, so nobody else can see that you applied or
+                          were declined. You can join as many rings as you like.
+                        </p>
+                      </div>
+
+                      <div className="p-4 rounded-xl bg-slate-950 border border-slate-800 space-y-2">
+                        <h4 className="font-bold text-sm text-emerald-300">Hosting a ring</h4>
+                        <ol className="list-decimal list-inside space-y-1 text-slate-300">
+                          <li>
+                            In <strong>Rings You Host</strong>, create a ring and publish. Your site now
+                            has its signed hub (<code>api/rings/&lt;name&gt;.json</code>) and a public
+                            directory page (<code>rings/&lt;name&gt;/</code>).
+                          </li>
+                          <li>Share the hub URL or the directory page with people who'd like to join.</li>
+                          <li>
+                            Paste each request link into <strong>Review a Join Request</strong>. Studio
+                            checks the applicant's signature; you choose Approve, Decline or Ban.
+                          </li>
+                          <li>Publish to make approvals and other changes live.</li>
+                        </ol>
+                        <p className="text-slate-400">
+                          You can host several rings, each separate from your friend list. Use{' '}
+                          <strong>I'm a member</strong> to include or leave out your own site.
+                        </p>
+                      </div>
+
+                      <div className="p-4 rounded-xl bg-slate-950 border border-slate-800 space-y-2">
+                        <h4 className="font-bold text-sm text-amber-300">Leaving, removal &amp; bans</h4>
+                        <ul className="list-disc list-inside space-y-1 text-slate-300">
+                          <li>
+                            <strong>Leaving:</strong> remove the ring from your list and publish. The
+                            maintainer's next Sync All notices and removes you.
+                          </li>
+                          <li>
+                            <strong>Removed:</strong> the maintainer drops you from the hub. Your next
+                            sync marks the ring <em>Removed</em> and its bar disappears at your next
+                            publish. You can ask to join again.
+                          </li>
+                          <li>
+                            <strong>Banned:</strong> like removal, but new requests from your site (or
+                            your key, even on a new domain) are declined. Bans are private to the
+                            maintainer.
+                          </li>
+                          <li>
+                            <strong>Hidden:</strong> a maintainer can keep a member in the ring but skip
+                            them in Prev / Next / Random.
+                          </li>
+                          <li>
+                            <strong>Closed ring:</strong> the maintainer closes it; members' bars go away
+                            after their next sync and publish.
+                          </li>
+                        </ul>
+                      </div>
+
+                      <div className="p-4 rounded-xl bg-slate-950 border border-slate-800 space-y-2">
+                        <h4 className="font-bold text-sm text-cyan-300">How links stay fresh</h4>
+                        <ul className="list-disc list-inside space-y-1 text-slate-300">
+                          <li>
+                            Prev and Next are written into your page when you publish, so they work
+                            without JavaScript.
+                          </li>
+                          <li>
+                            When a visitor clicks Prev, Next or Random, the page quickly re-reads the
+                            ring's hub so removed or hidden sites are skipped. If that fails, it uses the
+                            saved link.
+                          </li>
+                          <li>
+                            Studio only trusts a hub signed by its maintainer's key, served from the
+                            maintainer's own site, and never older than the last one it saw. A key
+                            change freezes the ring until you review it; it never removes anyone.
+                          </li>
+                          <li>
+                            New members get 14 days to publish the ring before a maintainer's sync treats
+                            them as having left.
+                          </li>
+                        </ul>
+                      </div>
+                    </div>
+
+                    <div className="flex justify-end">
+                      <button
+                        type="button"
+                        onClick={() => setActiveTab('friends')}
+                        className="px-4 py-2 rounded-xl bg-indigo-600 hover:bg-indigo-500 text-white text-xs font-semibold"
+                      >
+                        Open Friends &amp; Webrings →
                       </button>
                     </div>
                   </div>
@@ -5424,25 +6726,117 @@ git push -u origin main --force`}
                         </h4>
                         <p className="text-xs text-slate-300 leading-relaxed">
                           Webring Studio's <code>RingCrawler</code> and static site generator include
-                          comprehensive defenses audited via Edward de Bono's Six Thinking Hats
-                          methodology:
+                          these defenses:
                         </p>
                         <ul className="text-xs text-slate-400 list-disc list-inside space-y-1 pl-2">
                           <li>
-                            <strong>SSRF & DNS-Rebinding Guard:</strong> Blocks loopback, link-local,
-                            and RFC1918 private IPs before fetching remote peer JSON files.
+                            <strong>Signature checks on every document:</strong> each crawled JSON file
+                            must carry a valid Ed25519 signature from the key in the friend's{' '}
+                            <code>did.json</code>. Unverified content shows without the ✓ Verified
+                            badge.
                           </li>
                           <li>
-                            <strong>DID Origin Binding & Cryptographic Verification:</strong> Verifies
-                            that a peer's <code>did:web</code> matches their actual HTTPS origin and
-                            validates Ed25519 signatures over canonical JCS payloads.
+                            <strong>Key pinning:</strong> the first key seen for a friend is pinned. If
+                            it later changes, the friend gets a 🚨 Key Changed warning and nothing from
+                            them verifies until you sort it out.
+                          </li>
+                          <li>
+                            <strong>No impersonating other friends:</strong> posts whose address points
+                            outside the friend's own site are rejected, so one friend can't overwrite
+                            another friend's posts.
+                          </li>
+                          <li>
+                            <strong>Safe removals:</strong> posts a friend deleted are removed from your
+                            feed only after a verified sync. A failed or tampered fetch never deletes
+                            anything.
+                          </li>
+                          <li>
+                            <strong>Fetch limits:</strong> endpoints on another domain are refused, and
+                            each file is limited to 5 MB and 10 seconds.
+                          </li>
+                          <li>
+                            <strong>Private network guard:</strong> Studio refuses to fetch anything
+                            on your computer, home network or cloud metadata addresses (for example{' '}
+                            <code>127.0.0.1</code>, <code>192.168.x.x</code>,{' '}
+                            <code>169.254.169.254</code>), so a peer can't use your Studio to probe
+                            devices behind your firewall. This is checked on every connection,
+                            including redirects.
                           </li>
                           <li>
                             <strong>XSS & Script-Breakout Neutralization:</strong> Escapes embedded
-                            JSON payloads in <code>index.html</code>, enforces strict URL scheme
-                            whitelisting (blocking <code>javascript:</code> and <code>data:</code>{' '}
-                            URIs), and requires explicit user confirmation before executing incoming{' '}
-                            <code>webring://</code> deep links.
+                            JSON payloads in <code>index.html</code> and blocks{' '}
+                            <code>javascript:</code> and <code>data:</code> links.
+                            Incoming <code>webring://</code> deep links only pre-fill a form; nothing is
+                            saved until you submit it.
+                          </li>
+                        </ul>
+                      </div>
+
+                      <div className="p-4 rounded-xl bg-slate-950 border border-slate-800 space-y-1.5">
+                        <h4 className="font-bold text-sm text-rose-400">
+                          Q: What's the difference between Mute and Block?
+                        </h4>
+                        <ul className="text-xs text-slate-400 list-disc list-inside space-y-1 pl-2">
+                          <li>
+                            <strong>Mute</strong> hides a site's posts from your Neighborhood Feed.
+                            It's a personal reading preference and doesn't change your published site.
+                          </li>
+                          <li>
+                            <strong>Block</strong> also stops Studio from crawling that site and keeps
+                            their likes and comments off your published site.
+                          </li>
+                          <li>
+                            Either way, the site is told nothing. Undo both from the{' '}
+                            <strong>Muted &amp; Blocked Sites</strong> list in the Feed tab.
+                          </li>
+                          <li>
+                            Separately, endorsements whose signature can't be verified are never
+                            published, whatever your settings.
+                          </li>
+                        </ul>
+                      </div>
+
+                      <div className="p-4 rounded-xl bg-slate-950 border border-slate-800 space-y-1.5">
+                        <h4 className="font-bold text-sm text-emerald-400">
+                          Q: Where are my signing key and publishing passwords stored?
+                        </h4>
+                        <p className="text-xs text-slate-300 leading-relaxed">
+                          Each persona's Ed25519 private key is stored{' '}
+                          <strong>encrypted at rest</strong> using your operating system's keychain
+                          (Keychain on macOS, DPAPI on Windows, libsecret on Linux). It's never
+                          exported or uploaded. Only the running Studio app can unlock it, which is
+                          why publishing needs Studio open. If the keychain entry is deleted, the key
+                          can't be recovered: you'd need a new key, and friends would see a Key
+                          Changed warning.
+                        </p>
+                        <p className="text-xs text-slate-300 leading-relaxed">
+                          Your SFTP/FTP password and GitHub token are encrypted the same way. Studio
+                          shows them as <code>••••••••</code> once saved and only unlocks them at the
+                          moment it connects to publish, including for scheduled publishes. If the
+                          keychain entry is lost, just enter them again.
+                        </p>
+                      </div>
+
+                      <div className="p-4 rounded-xl bg-slate-950 border border-slate-800 space-y-1.5">
+                        <h4 className="font-bold text-sm text-cyan-400">
+                          Q: Can a website I visit control Studio through the MCP endpoint?
+                        </h4>
+                        <p className="text-xs text-slate-300 leading-relaxed">
+                          <strong>No.</strong> The endpoint only listens on <code>127.0.0.1</code>,
+                          and because web pages also run on your machine, it refuses browser-style
+                          requests:
+                        </p>
+                        <ul className="text-xs text-slate-400 list-disc list-inside space-y-1 pl-2">
+                          <li>
+                            Requests with an <code>Origin</code> header (sent by web pages and app
+                            windows) are refused unless they carry your access token.
+                          </li>
+                          <li>
+                            The <code>Host</code> must be <code>127.0.0.1</code> or{' '}
+                            <code>localhost</code>, which blocks DNS-rebinding tricks.
+                          </li>
+                          <li>
+                            Commands must be sent as JSON, which pages can't do without permission.
                           </li>
                         </ul>
                       </div>
