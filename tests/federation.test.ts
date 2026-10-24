@@ -2,6 +2,7 @@ import { describe, it, expect, beforeEach, afterEach } from 'vitest';
 import * as fs from 'fs';
 import * as path from 'path';
 import * as os from 'os';
+import * as http from 'http';
 import {
   buildCanonicalUrl,
   buildDidDocument,
@@ -13,10 +14,16 @@ import {
   verifyDocumentSignature,
   WebringManifestSchema,
 } from '../src/shared/schema';
-import { StudioDatabase } from '../electron/db/database';
+import { STORED_SECRET_PLACEHOLDER, StudioDatabase } from '../electron/db/database';
 import { StaticSiteGenerator } from '../electron/services/siteGenerator';
-import { RingCrawler } from '../electron/services/ringCrawler';
+import { defaultJsonFetcher, RingCrawler } from '../electron/services/ringCrawler';
+import { RingService } from '../electron/services/ringService';
+import { jobNextRunAt, nextRunAt, Scheduler } from '../electron/services/scheduler';
+import { runScheduledPublish } from '../electron/services/jobs';
+import { isPrivateNetworkAddress } from '../electron/security/networkGuard';
 import { PersonaManager } from '../electron/services/personaManager';
+import { SitePublisher } from '../electron/services/publisher';
+import { KeyCipher, KeyVaultUnavailableError } from '../electron/security/keyVault';
 import { LocalPreviewServer } from '../electron/services/localPreviewServer';
 import { WebringMcpServer } from '../electron/mcp/mcpServer';
 import { McpHttpServer } from '../electron/mcp/mcpHttpServer';
@@ -373,9 +380,9 @@ describe('Two-Peer Pull Federation, Static Site Generation & Endorsement Discove
         },
       });
       expect(switchedBackCtx.db.getProfile().publishSettings.host).toBe('sftp.primary-host.example');
-      expect(switchedBackCtx.db.getProfile().publishSettings.password).toBe(
-        'super-secret-sftp-password'
-      );
+      // The profile only shows a placeholder; the real value is for the publisher
+      expect(switchedBackCtx.db.getProfile().publishSettings.password).toBe(STORED_SECRET_PLACEHOLDER);
+      expect(switchedBackCtx.db.getPublishCredentials().password).toBe('super-secret-sftp-password');
 
       // Persona 2's SFTP settings remain completely blank/isolated
       manager.switchPersona(secondSummary.id);
@@ -769,6 +776,71 @@ describe('Two-Peer Pull Federation, Static Site Generation & Endorsement Discove
       const bundleFromResource = JSON.parse(httpRpcJson.result.contents[0].text);
       expect(bundleFromResource.profile.displayName).toBe('AutoBot Indie');
       expect(bundleFromResource.items.items).toHaveLength(2); // 1 wall post + 1 comment
+      expect(httpRpcResp.headers.get('access-control-allow-origin')).toBeNull();
+
+      // Browser-style requests are refused before any tool runs
+      const rawPost = (headers: Record<string, string>) =>
+        new Promise<number>((resolve, reject) => {
+          const body = JSON.stringify({
+            jsonrpc: '2.0',
+            id: 100,
+            method: 'tools/call',
+            params: { name: 'webring_create_post', arguments: { commentary: 'Injected by a web page' } },
+          });
+          const req = http.request(
+            { host: '127.0.0.1', port: httpStatus.port, path: '/mcp', method: 'POST', headers },
+            (res) => {
+              res.resume();
+              resolve(res.statusCode || 0);
+            }
+          );
+          req.on('error', reject);
+          req.end(body);
+        });
+      const loopbackHost = `127.0.0.1:${httpStatus.port}`;
+      expect(
+        await rawPost({ Host: loopbackHost, 'Content-Type': 'application/json', Origin: 'https://evil.example' })
+      ).toBe(403);
+      expect(await rawPost({ Host: loopbackHost, 'Content-Type': 'text/plain' })).toBe(415);
+      expect(await rawPost({ Host: 'evil.example', 'Content-Type': 'application/json' })).toBe(403);
+      expect(manager.getActiveContext().db.getItems()).toHaveLength(2);
+
+      // An Electron-style client holding the token is allowed, with CORS for its origin
+      const electronOrigin = 'app://mcp-client';
+      const tokenUrl = httpStatus.authorizedEndpointUrl!;
+      const preflight = await fetch(tokenUrl, {
+        method: 'OPTIONS',
+        headers: { Origin: electronOrigin },
+      });
+      expect(preflight.status).toBe(204);
+      expect(preflight.headers.get('access-control-allow-origin')).toBe(electronOrigin);
+      const tokenResp = await fetch(tokenUrl, {
+        method: 'POST',
+        headers: { 'Content-Type': 'application/json', Origin: electronOrigin },
+        body: JSON.stringify({ jsonrpc: '2.0', id: 101, method: 'tools/list' }),
+      });
+      expect(tokenResp.status).toBe(200);
+      expect(tokenResp.headers.get('access-control-allow-origin')).toBe(electronOrigin);
+      const wrongToken = await fetch(tokenUrl.replace(/token=[0-9a-f]+/, 'token=nope'), {
+        method: 'POST',
+        headers: { 'Content-Type': 'application/json', Origin: electronOrigin },
+        body: JSON.stringify({ jsonrpc: '2.0', id: 102, method: 'tools/list' }),
+      });
+      expect(wrongToken.status).toBe(403);
+
+      // The SSE handshake hands token-holding clients a message URL that keeps the token
+      const sseController = new AbortController();
+      const sseResp = await fetch(httpStatus.authorizedSseUrl!, {
+        headers: { Origin: electronOrigin },
+        signal: sseController.signal,
+      });
+      const firstChunk = new TextDecoder().decode((await sseResp.body!.getReader().read()).value);
+      sseController.abort();
+      expect(firstChunk).toContain('/mcp/message?token=');
+
+      // The unauthenticated health check never reveals the token
+      const health = await (await fetch(`http://127.0.0.1:${httpStatus.port}/mcp/health`)).text();
+      expect(health).not.toContain('token');
     } finally {
       await httpServer.stop();
       peerDb.close();
@@ -884,4 +956,897 @@ describe('Two-Peer Pull Federation, Static Site Generation & Endorsement Discove
   });
 });
 
+describe('Feed Integrity, Moderation & Publish Snapshot', () => {
+  let tempRoot: string;
 
+  beforeEach(() => {
+    tempRoot = fs.mkdtempSync(path.join(os.tmpdir(), 'webring-curation-'));
+  });
+
+  afterEach(() => {
+    fs.rmSync(tempRoot, { recursive: true, force: true });
+  });
+
+  const makeSite = (name: string) => {
+    const dir = path.join(tempRoot, name);
+    const db = new StudioDatabase(dir, `${name}.sqlite`, { seedStarterData: false });
+    const siteUrl = `https://${name}.ring.test`;
+    db.updateProfile({ siteUrl, handle: `${name}.ring.test`, displayName: name });
+    const outDir = path.join(dir, 'public_html');
+    const publish = () => new StaticSiteGenerator(db).generateToDirectory(outDir);
+    return { db, siteUrl, outDir, publish };
+  };
+
+  it('rejects entries whose canonical URL points at another friend’s site', async () => {
+    const alice = makeSite('alice');
+    const carol = makeSite('carol');
+    const mallory = makeSite('mallory');
+    try {
+      const carolPost = carol.db.createItem({ type: 'post', title: 'Carol original', commentary: 'real' });
+      carol.publish();
+      await new RingCrawler(alice.db).crawlFriendSite(carol.siteUrl, carol.outDir);
+
+      // Mallory publishes a validly signed items.json claiming Carol's canonical URL
+      mallory.db.createItem({ type: 'post', title: 'Spoofed', commentary: 'fake' });
+      mallory.publish();
+      const itemsPath = path.join(mallory.outDir, 'api/items.json');
+      const { proof: _proof, ...itemsDoc } = JSON.parse(fs.readFileSync(itemsPath, 'utf8'));
+      itemsDoc.items[0].canonicalUrl = carolPost.canonicalUrl;
+      const resigned = signDocument(
+        itemsDoc,
+        siteUrlToDidWeb(mallory.siteUrl),
+        mallory.db.getKeys().privateKeyPem
+      );
+      fs.writeFileSync(itemsPath, JSON.stringify(resigned));
+
+      const res = await new RingCrawler(alice.db).crawlFriendSite(mallory.siteUrl, mallory.outDir);
+      expect(res.success).toBe(true);
+      expect(res.entriesRejected).toBe(1);
+
+      const carolEntry = alice.db.getNetworkFeed().find((e) => e.canonicalUrl === carolPost.canonicalUrl);
+      expect(carolEntry?.title).toBe('Carol original');
+      expect(carolEntry?.friendSiteUrl).toBe(carol.siteUrl);
+    } finally {
+      alice.db.close();
+      carol.db.close();
+      mallory.db.close();
+    }
+  });
+
+  it('prunes items a friend deleted, but never on a failed or unverified fetch', async () => {
+    const alice = makeSite('alice');
+    const bob = makeSite('bob');
+    try {
+      const keep = bob.db.createItem({ type: 'post', title: 'Keep me', commentary: '' });
+      const drop = bob.db.createItem({ type: 'post', title: 'Delete me', commentary: '' });
+      bob.publish();
+      const crawler = new RingCrawler(alice.db);
+      await crawler.crawlFriendSite(bob.siteUrl, bob.outDir);
+      expect(alice.db.getNetworkFeed()).toHaveLength(2);
+
+      bob.db.deleteItem(drop.id);
+      bob.publish();
+
+      // Tampered (unverified) items.json must not delete anything
+      const itemsPath = path.join(bob.outDir, 'api/items.json');
+      const original = fs.readFileSync(itemsPath, 'utf8');
+      const tampered = JSON.parse(original);
+      tampered.items = [];
+      fs.writeFileSync(itemsPath, JSON.stringify(tampered));
+      const tamperedRes = await crawler.crawlFriendSite(bob.siteUrl, bob.outDir);
+      expect(tamperedRes.entriesPruned).toBe(0);
+      expect(alice.db.getNetworkFeed()).toHaveLength(2);
+
+      // Missing items.json must not delete anything either
+      fs.rmSync(itemsPath);
+      await crawler.crawlFriendSite(bob.siteUrl, bob.outDir);
+      expect(alice.db.getNetworkFeed()).toHaveLength(2);
+
+      fs.writeFileSync(itemsPath, original);
+      const res = await crawler.crawlFriendSite(bob.siteUrl, bob.outDir);
+      expect(res.entriesPruned).toBe(1);
+      expect(alice.db.getNetworkFeed().map((e) => e.canonicalUrl)).toEqual([keep.canonicalUrl]);
+    } finally {
+      alice.db.close();
+      bob.db.close();
+    }
+  });
+
+  it('deleting a friend removes their feed entries and endorsements', async () => {
+    const alice = makeSite('alice');
+    const bob = makeSite('bob');
+    try {
+      const alicePost = alice.db.createItem({ type: 'post', title: 'Hello', commentary: '' });
+      bob.db.createItem({ type: 'like', title: 'Nice', targetUrl: alicePost.canonicalUrl, commentary: '' });
+      bob.publish();
+      await new RingCrawler(alice.db).crawlFriendSite(bob.siteUrl, bob.outDir);
+      expect(alice.db.getNetworkFeed().length).toBeGreaterThan(0);
+      expect(alice.db.getEndorsements()).toHaveLength(1);
+
+      const bobFriend = alice.db.getFriends().find((f) => f.siteUrl === bob.siteUrl)!;
+      expect(bobFriend.lastCrawledAt).toBeTruthy();
+      alice.db.deleteFriend(bobFriend.id);
+
+      expect(alice.db.getNetworkFeed()).toHaveLength(0);
+      expect(alice.db.getEndorsements()).toHaveLength(0);
+    } finally {
+      alice.db.close();
+      bob.db.close();
+    }
+  });
+
+  it('mute hides from the feed only; block also drops endorsements from the export and skips crawling', async () => {
+    const alice = makeSite('alice');
+    const bob = makeSite('bob');
+    try {
+      alice.db.updateProfile({ publishSettings: { publishEndorsements: true } });
+      const alicePost = alice.db.createItem({ type: 'post', title: 'Hello', commentary: '' });
+      bob.db.createItem({ type: 'like', title: 'Nice', targetUrl: alicePost.canonicalUrl, commentary: '' });
+      bob.publish();
+      const crawler = new RingCrawler(alice.db);
+      await crawler.crawlFriendSite(bob.siteUrl, bob.outDir);
+
+      alice.db.setModeration(bob.siteUrl, 'mute');
+      const mutedFeed = alice.db.getCuratedNetworkFeed();
+      expect(mutedFeed.entries).toHaveLength(0);
+      expect(mutedFeed.excluded.muted).toBeGreaterThan(0);
+      expect(alice.db.buildSignedSiteBundle().connections.endorsements).toHaveLength(1);
+
+      alice.db.setModeration(bob.siteUrl, 'block');
+      expect(alice.db.getCuratedNetworkFeed().excluded.blocked).toBeGreaterThan(0);
+      expect(alice.db.buildSignedSiteBundle().connections.endorsements).toHaveLength(0);
+      const blockedCrawl = await crawler.crawlFriendSite(bob.siteUrl, bob.outDir);
+      expect(blockedCrawl.blocked).toBe(true);
+      expect(blockedCrawl.success).toBe(false);
+
+      alice.db.setModeration(bob.siteUrl, null);
+      expect(alice.db.getModeration()).toHaveLength(0);
+      expect(alice.db.buildSignedSiteBundle().connections.endorsements).toHaveLength(1);
+    } finally {
+      alice.db.close();
+      bob.db.close();
+    }
+  });
+
+  it('never publishes unverified endorsements', () => {
+    const alice = makeSite('alice');
+    try {
+      alice.db.updateProfile({ publishSettings: { publishEndorsements: true } });
+      const alicePost = alice.db.createItem({ type: 'post', title: 'Hello', commentary: '' });
+      alice.db.upsertEndorsement({
+        targetCanonicalUrl: alicePost.canonicalUrl,
+        authorSiteUrl: 'https://unknown.ring.test',
+        authorName: 'Unknown',
+        authorAvatarUrl: '',
+        type: 'like',
+        commentary: '',
+        sourceItemUrl: 'https://unknown.ring.test/api/items.json#item-1',
+        createdAt: new Date().toISOString(),
+        verifiedSignature: false,
+      });
+      expect(alice.db.getCuratedEndorsements().entries).toHaveLength(1);
+      expect(alice.db.getCuratedEndorsements({ forExport: true }).excluded.unverified).toBe(1);
+      expect(alice.db.buildSignedSiteBundle().connections.endorsements).toHaveLength(0);
+    } finally {
+      alice.db.close();
+    }
+  });
+
+  it('records when the site was last published and counts changes since', async () => {
+    const alice = makeSite('alice');
+    try {
+      expect(alice.db.getProfile().publishSettings.lastPublishedAt).toBeUndefined();
+      const res = new SitePublisher(new StaticSiteGenerator(alice.db)).publishToLocalDirectory(alice.outDir);
+      expect(res.success).toBe(true);
+
+      const settings = alice.db.getProfile().publishSettings;
+      expect(settings.lastPublishedAt).toBeTruthy();
+      expect(settings.lastPublishedCounts?.endorsementCount).toBe(0);
+      expect(alice.db.countChangesSince(settings.lastPublishedAt)).toBe(0);
+
+      await new Promise((r) => setTimeout(r, 5));
+      alice.db.createItem({ type: 'post', title: 'After publish', commentary: '' });
+      expect(alice.db.countChangesSince(settings.lastPublishedAt)).toBe(1);
+    } finally {
+      alice.db.close();
+    }
+  });
+});
+
+describe('Private Key Encryption at Rest', () => {
+  let tempRoot: string;
+
+  beforeEach(() => {
+    tempRoot = fs.mkdtempSync(path.join(os.tmpdir(), 'webring-keyvault-'));
+  });
+
+  afterEach(() => {
+    fs.rmSync(tempRoot, { recursive: true, force: true });
+  });
+
+  // Stand-in for Electron safeStorage: reversible, and obviously not plaintext
+  const fakeCipher: KeyCipher = {
+    isAvailable: () => true,
+    encrypt: (plainText) => Buffer.from(plainText, 'utf8').reverse(),
+    decrypt: (cipherText) => Buffer.from(cipherText).reverse().toString('utf8'),
+  };
+
+  const readStoredKey = (dbFile: string): string => {
+    // eslint-disable-next-line @typescript-eslint/no-require-imports
+    const { DatabaseSync } = require('node:sqlite');
+    const raw = new DatabaseSync(dbFile);
+    const row = raw.prepare('SELECT private_key_pem FROM profile WHERE id = 1').get() as {
+      private_key_pem: string;
+    };
+    raw.close();
+    return row.private_key_pem;
+  };
+
+  it('migrates a plaintext key to encrypted storage and still signs', () => {
+    const plainDb = new StudioDatabase(tempRoot, 'p.sqlite', { seedStarterData: false });
+    const originalKey = plainDb.getKeys().privateKeyPem;
+    plainDb.close();
+    expect(readStoredKey(path.join(tempRoot, 'p.sqlite'))).toContain('BEGIN PRIVATE KEY');
+
+    const sealedDb = new StudioDatabase(tempRoot, 'p.sqlite', { keyCipher: fakeCipher });
+    expect(readStoredKey(path.join(tempRoot, 'p.sqlite'))).toMatch(/^enc:v1:/);
+    expect(sealedDb.getKeys().privateKeyPem).toBe(originalKey);
+    const bundle = sealedDb.buildSignedSiteBundle();
+    expect(verifyDocumentSignature(bundle.profile, sealedDb.getKeys().publicKeyPem)).toBe(true);
+    sealedDb.close();
+  });
+
+  it('seals publishing credentials, never returns them from getProfile, and keeps them through the form', () => {
+    // An older install stored them in plaintext
+    const legacy = new StudioDatabase(tempRoot, 'creds.sqlite', { seedStarterData: false });
+    legacy.updateProfile({ publishSettings: { password: 'sftp-secret', githubToken: 'ghp_legacy' } });
+    legacy.close();
+    // eslint-disable-next-line @typescript-eslint/no-require-imports
+    const { DatabaseSync } = require('node:sqlite');
+    const readStored = () => {
+      const raw = new DatabaseSync(path.join(tempRoot, 'creds.sqlite'));
+      const row = raw.prepare('SELECT publish_settings_json FROM profile WHERE id = 1').get() as {
+        publish_settings_json: string;
+      };
+      raw.close();
+      return JSON.parse(row.publish_settings_json);
+    };
+    expect(readStored().password).toBe('sftp-secret');
+
+    const db = new StudioDatabase(tempRoot, 'creds.sqlite', { keyCipher: fakeCipher });
+    try {
+      // Sealed on open, masked on read, readable only via getPublishCredentials
+      expect(readStored().password).toMatch(/^enc:v1:/);
+      expect(readStored().githubToken).toMatch(/^enc:v1:/);
+      const shown = db.getProfile().publishSettings;
+      expect(shown.password).toBe(STORED_SECRET_PLACEHOLDER);
+      expect(shown.githubToken).toBe(STORED_SECRET_PLACEHOLDER);
+      expect(db.getPublishCredentials()).toEqual({ password: 'sftp-secret', githubToken: 'ghp_legacy' });
+
+      // Saving the form as shown (placeholders) keeps the stored values
+      db.updateProfile({ publishSettings: { ...shown, host: 'example.org' } });
+      expect(db.getPublishCredentials()).toEqual({ password: 'sftp-secret', githubToken: 'ghp_legacy' });
+      expect(db.withStoredCredentials(db.getProfile().publishSettings).password).toBe('sftp-secret');
+
+      // A new value replaces (sealed); '' clears
+      db.updateProfile({ publishSettings: { githubToken: 'ghp_new' } });
+      expect(readStored().githubToken).toMatch(/^enc:v1:/);
+      expect(db.getPublishCredentials().githubToken).toBe('ghp_new');
+      db.updateProfile({ publishSettings: { password: '' } });
+      expect(db.getPublishCredentials().password).toBe('');
+      expect(db.getProfile().publishSettings.password).toBe('');
+
+      // Nothing secret reaches the published site
+      const out = path.join(tempRoot, 'creds-out');
+      new StaticSiteGenerator(db).generateToDirectory(out);
+      const published = fs
+        .readdirSync(path.join(out, 'api'))
+        .map((f) => fs.readFileSync(path.join(out, 'api', f), 'utf8'))
+        .join('\n');
+      expect(published).not.toContain('ghp_new');
+    } finally {
+      db.close();
+    }
+
+    // Outside the app the profile still reads fine, but the credentials can't be opened
+    const cli = new StudioDatabase(tempRoot, 'creds.sqlite');
+    try {
+      expect(cli.getProfile().publishSettings.githubToken).toBe(STORED_SECRET_PLACEHOLDER);
+      expect(() => cli.getPublishCredentials()).toThrow(KeyVaultUnavailableError);
+    } finally {
+      cli.close();
+    }
+  });
+
+  it('fails cleanly when signing without the keychain (stdio MCP CLI)', () => {
+    new StudioDatabase(tempRoot, 'c.sqlite', { keyCipher: fakeCipher }).close();
+
+    const cliDb = new StudioDatabase(tempRoot, 'c.sqlite');
+    expect(cliDb.getProfile().displayName).toBeTruthy();
+    expect(() => cliDb.buildSignedSiteBundle()).toThrow(KeyVaultUnavailableError);
+    const res = new SitePublisher(new StaticSiteGenerator(cliDb)).publishToLocalDirectory(
+      path.join(tempRoot, 'out')
+    );
+    expect(res.success).toBe(false);
+    expect(res.message).toContain('Open Webring Studio to publish');
+    cliDb.close();
+  });
+});
+
+describe('Loopback MCP HTTP Settings', () => {
+  it('keeps the same port and access token across restarts', async () => {
+    const tempRoot = fs.mkdtempSync(path.join(os.tmpdir(), 'webring-mcp-http-'));
+    const manager = new PersonaManager(tempRoot);
+    const settingsPath = path.join(tempRoot, 'mcp-http.json');
+    try {
+      const first = new McpHttpServer(new WebringMcpServer(manager, tempRoot), { settingsPath });
+      const firstStatus = await first.start(0);
+      await first.stop();
+
+      const second = new McpHttpServer(new WebringMcpServer(manager, tempRoot), { settingsPath });
+      const secondStatus = await second.start(0);
+      await second.stop();
+
+      expect(secondStatus.port).toBe(firstStatus.port);
+      expect(secondStatus.authorizedSseUrl).toBe(firstStatus.authorizedSseUrl);
+      expect((fs.statSync(settingsPath).mode & 0o777).toString(8)).toBe('600');
+    } finally {
+      manager.closeAll();
+      fs.rmSync(tempRoot, { recursive: true, force: true });
+    }
+  });
+});
+
+describe('SSRF Guard for Peer Crawling', () => {
+  let server: http.Server;
+  let port: number;
+
+  beforeEach(async () => {
+    server = http.createServer((_req, res) => {
+      res.writeHead(200, { 'Content-Type': 'application/json' });
+      res.end(JSON.stringify({ secret: 'internal-only' }));
+    });
+    await new Promise<void>((resolve) => server.listen(0, '127.0.0.1', resolve));
+    port = (server.address() as { port: number }).port;
+  });
+
+  afterEach(async () => {
+    delete process.env.WEBRING_ALLOW_PRIVATE_PEERS;
+    server.closeAllConnections();
+    await new Promise<void>((resolve) => server.close(() => resolve()));
+  });
+
+  it('classifies private, local and metadata addresses', () => {
+    for (const ip of [
+      '127.0.0.1',
+      '10.1.2.3',
+      '172.16.0.1',
+      '192.168.1.1',
+      '169.254.169.254',
+      '100.64.0.1',
+      '0.0.0.0',
+      '::1',
+      'fd00::1',
+      'fe80::1',
+      '::ffff:127.0.0.1',
+    ]) {
+      expect(isPrivateNetworkAddress(ip), ip).toBe(true);
+    }
+    for (const ip of ['8.8.8.8', '1.1.1.1', '2606:4700:4700::1111', '172.32.0.1']) {
+      expect(isPrivateNetworkAddress(ip), ip).toBe(false);
+    }
+  });
+
+  it('refuses to fetch loopback addresses by IP or hostname', async () => {
+    await expect(defaultJsonFetcher(`http://127.0.0.1:${port}/api/manifest.json`)).rejects.toThrow(
+      /private or local network address/
+    );
+    await expect(defaultJsonFetcher(`http://localhost:${port}/api/manifest.json`)).rejects.toThrow(
+      /private or local network address/
+    );
+    await expect(defaultJsonFetcher(`http://[::1]:${port}/x`)).rejects.toThrow(
+      /private or local network address/
+    );
+  });
+
+  it('reports a blocked peer as a failed crawl, and allows it when explicitly enabled', async () => {
+    const dir = fs.mkdtempSync(path.join(os.tmpdir(), 'webring-ssrf-'));
+    const db = new StudioDatabase(dir, 'ssrf.sqlite', { seedStarterData: false });
+    try {
+      const res = await new RingCrawler(db).crawlFriendSite(`http://127.0.0.1:${port}`);
+      expect(res.success).toBe(false);
+      expect(res.error).toMatch(/private or local network address/);
+
+      process.env.WEBRING_ALLOW_PRIVATE_PEERS = '1';
+      await expect(defaultJsonFetcher(`http://127.0.0.1:${port}/x`)).resolves.toEqual({
+        secret: 'internal-only',
+      });
+    } finally {
+      db.close();
+      fs.rmSync(dir, { recursive: true, force: true });
+    }
+  });
+});
+
+describe('Curated Webrings (hosted rings, signed requests, sync)', () => {
+  let tempRoot: string;
+  const sites = new Map<string, { db: StudioDatabase; outDir: string }>();
+
+  // Serves https://<name>.ring.test/... from each site's published folder
+  const fetcher = async (url: string): Promise<unknown> => {
+    const parsed = new URL(url);
+    const site = sites.get(parsed.origin);
+    if (!site) throw new Error(`HTTP 404 fetching ${url}`);
+    const file = path.join(site.outDir, decodeURIComponent(parsed.pathname));
+    if (!fs.existsSync(file)) throw new Error(`HTTP 404 fetching ${url}`);
+    return JSON.parse(fs.readFileSync(file, 'utf8'));
+  };
+
+  const makeSite = (name: string) => {
+    const siteUrl = `https://${name}.ring.test`;
+    const dir = path.join(tempRoot, name);
+    const db = new StudioDatabase(dir, `${name}.sqlite`, { seedStarterData: false });
+    db.updateProfile({ siteUrl, handle: `${name}.ring.test`, displayName: name });
+    const outDir = path.join(dir, 'public_html');
+    sites.set(siteUrl, { db, outDir });
+    return {
+      db,
+      siteUrl,
+      outDir,
+      rings: new RingService(db, fetcher),
+      publish: () => new StaticSiteGenerator(db).generateToDirectory(outDir),
+    };
+  };
+
+  const tick = () => new Promise((r) => setTimeout(r, 5));
+
+  beforeEach(() => {
+    tempRoot = fs.mkdtempSync(path.join(os.tmpdir(), 'webring-rings-'));
+    sites.clear();
+  });
+
+  afterEach(() => {
+    for (const { db } of sites.values()) db.close();
+    fs.rmSync(tempRoot, { recursive: true, force: true });
+  });
+
+  it('joins a ring end to end: signed request, approval, membership on both sides', async () => {
+    const maya = makeSite('maya');
+    const bob = makeSite('bob');
+    const carol = makeSite('carol');
+    const ring = maya.db.createHostedRing({ name: 'Photo Ring', description: 'Film photographers' });
+    maya.publish();
+    bob.publish();
+    carol.publish();
+
+    const { ring: bobRing, requestLink } = await bob.rings.requestToJoin(ring.hubUrl);
+    expect(bobRing.status).toBe('requested');
+    expect(requestLink).toMatch(/^webring:\/\/ring-request\?token=/);
+    // Requests are private: nothing about the request is published
+    bob.publish();
+    expect(bob.db.buildSignedSiteBundle().connections.webrings).toHaveLength(0);
+
+    const review = await maya.rings.reviewRequest(requestLink);
+    expect(review.state).toBe('new');
+    expect(review.applicant.siteUrl).toBe(bob.siteUrl);
+    await maya.rings.decideRequest(requestLink, 'approve');
+    const { requestLink: carolLink } = await carol.rings.requestToJoin(ring.hubUrl);
+    await maya.rings.decideRequest(carolLink, 'approve');
+    await tick();
+    maya.publish();
+
+    const [bobSync] = await bob.rings.syncJoinedRings();
+    expect(bobSync.outcome).toBe('member');
+    const joined = bob.db.getJoinedRings()[0];
+    expect(joined.status).toBe('member');
+    expect(joined.memberCount).toBe(3);
+    // Order is maya, bob, carol
+    expect(joined.prevSiteUrl).toBe(maya.siteUrl);
+    expect(joined.nextSiteUrl).toBe(carol.siteUrl);
+    bob.publish();
+    expect(bob.db.buildSignedSiteBundle().connections.webrings[0].hubUrl).toBe(ring.hubUrl);
+
+    const [hostedSync] = await maya.rings.syncHostedRings();
+    expect(hostedSync.confirmed).toEqual([bob.siteUrl]);
+    expect(hostedSync.autoRemoved).toEqual([]);
+    // Carol hasn't published the ring yet but is inside the grace period
+    expect(maya.db.getHostedRing(ring.id).members.map((m) => m.siteUrl)).toContain(carol.siteUrl);
+  });
+
+  it('removes a confirmed member who leaves, and propagates removal and bans to the member', async () => {
+    const maya = makeSite('maya');
+    const bob = makeSite('bob');
+    const ring = maya.db.createHostedRing({ name: 'Ring' });
+    maya.publish();
+    bob.publish();
+    const { requestLink } = await bob.rings.requestToJoin(ring.hubUrl);
+    await maya.rings.decideRequest(requestLink, 'approve');
+    await tick();
+    maya.publish();
+    await bob.rings.syncJoinedRings();
+    bob.publish();
+    await maya.rings.syncHostedRings();
+
+    // Bob leaves; Maya's sync removes him because he had confirmed before
+    bob.db.deleteWebring(bob.db.getJoinedRings()[0].id);
+    bob.publish();
+    const [afterLeave] = await maya.rings.syncHostedRings();
+    expect(afterLeave.autoRemoved).toEqual([bob.siteUrl]);
+
+    // Bob re-joins, then Maya bans him
+    const again = await bob.rings.requestToJoin(ring.hubUrl);
+    await maya.rings.decideRequest(again.requestLink, 'approve');
+    await tick();
+    maya.publish();
+    await bob.rings.syncJoinedRings();
+    expect(bob.db.getJoinedRings()[0].status).toBe('member');
+    await maya.rings.decideRequest(again.requestLink, 'ban', 'spam');
+    await tick();
+    maya.publish();
+    const [removed] = await bob.rings.syncJoinedRings();
+    expect(removed.outcome).toBe('removed');
+    expect(bob.db.buildSignedSiteBundle().connections.webrings).toHaveLength(0);
+
+    // A fresh request from a banned site is recognised and can't be approved
+    const third = await bob.rings.requestToJoin(ring.hubUrl);
+    expect((await maya.rings.reviewRequest(third.requestLink)).state).toBe('banned');
+    await expect(maya.rings.decideRequest(third.requestLink, 'approve')).rejects.toThrow(/banned/);
+  });
+
+  it('ignores stale hub copies, and never removes anyone on a changed key or unsigned hub', async () => {
+    const maya = makeSite('maya');
+    const bob = makeSite('bob');
+    const ring = maya.db.createHostedRing({ name: 'Ring' });
+    maya.publish();
+    bob.publish();
+    const hubFile = path.join(maya.outDir, ring.hubPath);
+    const beforeBob = fs.readFileSync(hubFile, 'utf8');
+    const { requestLink } = await bob.rings.requestToJoin(ring.hubUrl);
+    await maya.rings.decideRequest(requestLink, 'approve');
+    await tick();
+    maya.publish();
+    await bob.rings.syncJoinedRings();
+    expect(bob.db.getJoinedRings()[0].status).toBe('member');
+
+    // An older (signed, valid) copy that doesn't list Bob is ignored
+    const current = fs.readFileSync(hubFile, 'utf8');
+    fs.writeFileSync(hubFile, beforeBob);
+    expect((await bob.rings.syncJoinedRings())[0].outcome).toBe('unchanged');
+    expect(bob.db.getJoinedRings()[0].status).toBe('member');
+
+    // An unsigned hub that drops Bob can't remove him
+    const unsigned = JSON.parse(current);
+    delete unsigned.proof;
+    unsigned.members = unsigned.members.filter((m: { siteUrl: string }) => m.siteUrl !== bob.siteUrl);
+    unsigned.updatedAt = new Date(Date.now() + 60000).toISOString();
+    fs.writeFileSync(hubFile, JSON.stringify(unsigned));
+    expect((await bob.rings.syncJoinedRings())[0].outcome).toBe('unchanged');
+    expect(bob.db.getJoinedRings()[0].status).toBe('member');
+
+    // A changed maintainer key freezes the ring instead of removing anyone
+    fs.writeFileSync(hubFile, current);
+    const didFile = path.join(maya.outDir, '.well-known/did.json');
+    const didDoc = JSON.parse(fs.readFileSync(didFile, 'utf8'));
+    didDoc.verificationMethod[0].publicKeyPem = generateIdentityKeyPair().publicKeyPem;
+    fs.writeFileSync(didFile, JSON.stringify(didDoc));
+    const [frozen] = await bob.rings.syncJoinedRings();
+    expect(frozen.outcome).toBe('unchanged');
+    expect(frozen.warning).toMatch(/key changed/);
+    expect(bob.db.getJoinedRings()[0].status).toBe('member');
+  });
+
+  it('refuses re-hosted hubs and non-https hub URLs, and propagates a closed ring', async () => {
+    const maya = makeSite('maya');
+    const mallory = makeSite('mallory');
+    const bob = makeSite('bob');
+    const ring = maya.db.createHostedRing({ name: 'Ring' });
+    maya.publish();
+    mallory.publish();
+    bob.publish();
+
+    // Mallory re-hosts Maya's signed hub on her own site
+    const copyPath = path.join(mallory.outDir, 'api/rings/copied.json');
+    fs.mkdirSync(path.dirname(copyPath), { recursive: true });
+    fs.copyFileSync(path.join(maya.outDir, ring.hubPath), copyPath);
+    await expect(bob.rings.requestToJoin(`${mallory.siteUrl}/api/rings/copied.json`)).rejects.toThrow(
+      /lives at/
+    );
+    await expect(bob.rings.requestToJoin(`file://${path.join(maya.outDir, ring.hubPath)}`)).rejects.toThrow(
+      /https/
+    );
+    await expect(bob.rings.requestToJoin(ring.hubUrl.replace('https:', 'http:'))).rejects.toThrow(/https/);
+
+    const { requestLink } = await bob.rings.requestToJoin(ring.hubUrl);
+    await maya.rings.decideRequest(requestLink, 'approve');
+    await tick();
+    maya.publish();
+    await bob.rings.syncJoinedRings();
+    maya.db.updateHostedRing(ring.id, { status: 'closed' });
+    await tick();
+    maya.publish();
+    expect((await bob.rings.syncJoinedRings())[0].outcome).toBe('closed');
+    expect(bob.db.buildSignedSiteBundle().connections.webrings).toHaveLength(0);
+    // The closed hub is still published, with no members
+    const closedDoc = JSON.parse(fs.readFileSync(path.join(maya.outDir, ring.hubPath), 'utf8'));
+    expect(closedDoc.status).toBe('closed');
+    expect(closedDoc.members).toEqual([]);
+  });
+
+  it('rejects tampered, expired or misdirected requests', async () => {
+    const maya = makeSite('maya');
+    const bob = makeSite('bob');
+    const other = makeSite('other');
+    const ring = maya.db.createHostedRing({ name: 'Ring' });
+    other.db.createHostedRing({ name: 'Other Ring' });
+    maya.publish();
+    bob.publish();
+    other.publish();
+    const { requestLink } = await bob.rings.requestToJoin(ring.hubUrl);
+
+    const token = requestLink.split('token=')[1];
+    const decoded = JSON.parse(Buffer.from(decodeURIComponent(token), 'base64url').toString('utf8'));
+    decoded.displayName = 'Impostor';
+    const tampered = Buffer.from(JSON.stringify(decoded)).toString('base64url');
+    await expect(maya.rings.reviewRequest(tampered)).rejects.toThrow(/signature/);
+
+    await expect(other.rings.reviewRequest(requestLink)).rejects.toThrow(/doesn’t host/);
+    await expect(maya.rings.reviewRequest('webring://ring-request?token=garbage')).rejects.toThrow(/damaged/);
+  });
+
+  it('publishes small rings sensibly and converts the old hub in place', async () => {
+    const maya = makeSite('maya');
+    maya.db.createHostedRing({ name: 'Solo' });
+    const solo = maya.db.getWebrings()[0];
+    expect(solo.memberCount).toBe(1);
+    expect(solo.prevSiteUrl).toBeUndefined();
+    expect(solo.nextSiteUrl).toBeUndefined();
+
+    // Old install: hub setting on, one public friend, plus the seeded demo ring
+    const legacyDir = path.join(tempRoot, 'legacy');
+    const legacy = new StudioDatabase(legacyDir, 'legacy.sqlite');
+    legacy.updateProfile({ siteUrl: 'https://legacy.ring.test', publishSettings: { publishWebringHub: true } });
+    legacy.addOrUpdateFriend({ siteUrl: 'https://pal.ring.test', displayName: 'Pal', visibility: 'public' });
+    legacy.close();
+
+    const reopened = new StudioDatabase(legacyDir, 'legacy.sqlite');
+    try {
+      const [hosted] = reopened.getHostedRings();
+      expect(hosted.hubPath).toBe('api/webring-hub.json');
+      expect(hosted.members.map((m) => m.siteUrl)).toContain('https://pal.ring.test');
+      expect(reopened.getProfile().publishSettings.publishWebringHub).toBe(false);
+      expect(reopened.getJoinedRings().every((r) => r.status === 'legacy')).toBe(true);
+      const out = path.join(legacyDir, 'out');
+      new StaticSiteGenerator(reopened).generateToDirectory(out);
+      const hub = JSON.parse(fs.readFileSync(path.join(out, 'api/webring-hub.json'), 'utf8'));
+      expect(hub.hubUrl).toBe('https://legacy.ring.test/api/webring-hub.json');
+      expect(hub.proof).toBeDefined();
+    } finally {
+      reopened.close();
+    }
+  });
+});
+
+describe('Scheduled Sync & Publish', () => {
+  let tempRoot: string;
+
+  beforeEach(() => {
+    tempRoot = fs.mkdtempSync(path.join(os.tmpdir(), 'webring-schedule-'));
+  });
+
+  afterEach(() => {
+    fs.rmSync(tempRoot, { recursive: true, force: true });
+  });
+
+  const local = (y: number, mo: number, d: number, h: number, mi: number) => new Date(y, mo - 1, d, h, mi, 0, 0);
+
+  it('computes the next run for each preset, catching up once after a gap', () => {
+    // Interval: one interval after the anchor
+    expect(nextRunAt({ kind: 'interval', minutes: 60 }, local(2026, 3, 2, 10, 15))).toEqual(local(2026, 3, 2, 11, 15));
+    // Daily: later today, or tomorrow once the time has passed
+    expect(nextRunAt({ kind: 'daily', time: '09:30' }, local(2026, 3, 2, 8, 0))).toEqual(local(2026, 3, 2, 9, 30));
+    expect(nextRunAt({ kind: 'daily', time: '09:30' }, local(2026, 3, 2, 9, 30))).toEqual(local(2026, 3, 3, 9, 30));
+    // Weekly (2026-03-02 is a Monday): Friday this week; Monday at the same time moves a week on
+    expect(nextRunAt({ kind: 'weekly', weekday: 5, time: '18:00' }, local(2026, 3, 2, 12, 0))).toEqual(
+      local(2026, 3, 6, 18, 0)
+    );
+    expect(nextRunAt({ kind: 'weekly', weekday: 1, time: '12:00' }, local(2026, 3, 2, 12, 0))).toEqual(
+      local(2026, 3, 9, 12, 0)
+    );
+    // Daily slots keep local wall-clock time across a month of days (incl. any DST change)
+    const later = nextRunAt({ kind: 'daily', time: '07:00' }, local(2026, 3, 28, 23, 0));
+    expect([later.getHours(), later.getMinutes()]).toEqual([7, 0]);
+    // After a long gap the job is due once; running moves the anchor to "now"
+    const job = { enabled: true, preset: { kind: 'daily' as const, time: '09:00' }, since: local(2026, 3, 1, 8, 0).toISOString() };
+    expect(jobNextRunAt(job) <= local(2026, 3, 20, 12, 0)).toBe(true);
+    const afterRun = { ...job, lastRunAt: local(2026, 3, 20, 12, 0).toISOString() };
+    expect(jobNextRunAt(afterRun)).toEqual(local(2026, 3, 21, 9, 0));
+  });
+
+  it('queues due jobs in order, one at a time, and respects pause and disabled schedules', async () => {
+    let now = local(2026, 3, 2, 8, 0);
+    const calls: string[] = [];
+    let concurrent = 0;
+    let maxConcurrent = 0;
+    const slow = async (label: string) => {
+      concurrent++;
+      maxConcurrent = Math.max(maxConcurrent, concurrent);
+      calls.push(label);
+      await new Promise((r) => setTimeout(r, 5));
+      concurrent--;
+      return { at: now.toISOString(), status: 'ok' as const, message: label };
+    };
+    const scheduler = new Scheduler({
+      configPath: path.join(tempRoot, 'scheduler.json'),
+      listPersonaIds: () => ['a', 'b'],
+      now: () => now,
+      runner: {
+        sync: (id) => slow(`sync:${id}`),
+        publish: (id, destination) => slow(`publish:${id}:${destination}`),
+      },
+    });
+    scheduler.setPersonaSchedule('a', {
+      sync: { enabled: true, preset: { kind: 'interval', minutes: 15 } },
+      publish: { enabled: true, preset: { kind: 'interval', minutes: 60 }, destination: 'github' },
+    });
+    scheduler.setPersonaSchedule('b', { sync: { enabled: true, preset: { kind: 'interval', minutes: 60 } } });
+
+    await scheduler.tick();
+    expect(calls).toEqual([]);
+
+    now = local(2026, 3, 2, 9, 5);
+    await scheduler.tick();
+    expect(calls).toEqual(['sync:a', 'publish:a:github', 'sync:b']);
+    expect(maxConcurrent).toBe(1);
+    const config = scheduler.loadConfig();
+    expect(config.personas.a.sync.lastResult?.message).toBe('sync:a');
+    expect(config.history).toHaveLength(3);
+
+    // Ran at 09:05, so nothing is due a minute later; paused stops everything
+    now = local(2026, 3, 2, 9, 6);
+    await scheduler.tick();
+    expect(calls).toHaveLength(3);
+    scheduler.setAppSettings({ paused: true });
+    now = local(2026, 3, 2, 12, 0);
+    await scheduler.tick();
+    expect(calls).toHaveLength(3);
+
+    // Edits written by another process (e.g. the MCP CLI) are picked up on the next tick
+    const raw = JSON.parse(fs.readFileSync(path.join(tempRoot, 'scheduler.json'), 'utf8'));
+    raw.paused = false;
+    raw.personas.b.sync.enabled = false;
+    fs.writeFileSync(path.join(tempRoot, 'scheduler.json'), JSON.stringify(raw));
+    await scheduler.tick();
+    expect(calls.slice(3)).toEqual(['sync:a', 'publish:a:github']);
+
+    // Schedules for deleted personas are dropped
+    const pruned = new Scheduler({
+      configPath: path.join(tempRoot, 'scheduler.json'),
+      listPersonaIds: () => ['a'],
+      runner: { sync: () => slow('x'), publish: () => slow('y') },
+    });
+    expect(Object.keys(pruned.loadConfig().personas)).toEqual(['a']);
+  });
+
+  it('records a failed job as a run so it waits for its next slot, and serialises with manual work', async () => {
+    let now = local(2026, 3, 2, 10, 0);
+    const scheduler = new Scheduler({
+      configPath: path.join(tempRoot, 'scheduler.json'),
+      listPersonaIds: () => ['a'],
+      now: () => now,
+      runner: {
+        sync: () => Promise.reject(new Error('host unreachable')),
+        publish: () => Promise.reject(new Error('unused')),
+      },
+    });
+    scheduler.setPersonaSchedule('a', { sync: { enabled: true, preset: { kind: 'interval', minutes: 15 } } });
+    now = local(2026, 3, 2, 10, 20);
+    await scheduler.tick();
+    const first = scheduler.loadConfig().personas.a.sync;
+    expect(first.lastResult?.status).toBe('failed');
+    expect(first.lastResult?.message).toBe('host unreachable');
+    now = local(2026, 3, 2, 10, 21);
+    await scheduler.tick();
+    expect(scheduler.loadConfig().history).toHaveLength(1);
+
+    const order: string[] = [];
+    const manual = scheduler.runExclusive('a', async () => {
+      await new Promise((r) => setTimeout(r, 10));
+      order.push('manual');
+    });
+    const second = scheduler.runExclusive('a', async () => {
+      order.push('second');
+    });
+    await Promise.all([manual, second]);
+    expect(order).toEqual(['manual', 'second']);
+  });
+
+  it('fingerprints site content, ignoring timestamps and signatures', async () => {
+    const dir = path.join(tempRoot, 'fp');
+    const mediaDir = path.join(dir, 'media');
+    const db = new StudioDatabase(dir, 'fp.sqlite', { seedStarterData: false });
+    try {
+      db.updateProfile({ siteUrl: 'https://fp.ring.test' });
+      const generator = new StaticSiteGenerator(db, mediaDir);
+      const base = generator.contentFingerprint();
+      await new Promise((r) => setTimeout(r, 5));
+      expect(generator.contentFingerprint()).toBe(base);
+
+      db.createItem({ type: 'post', title: 'New', commentary: '' });
+      const afterPost = generator.contentFingerprint();
+      expect(afterPost).not.toBe(base);
+
+      db.updateProfile({ publishSettings: { publishEndorsements: true } });
+      db.upsertEndorsement({
+        targetCanonicalUrl: 'https://fp.ring.test/api/items.json#item-x',
+        authorSiteUrl: 'https://pal.ring.test',
+        authorName: 'Pal',
+        authorAvatarUrl: '',
+        type: 'like',
+        commentary: '',
+        sourceItemUrl: 'https://pal.ring.test/api/items.json#item-1',
+        createdAt: new Date().toISOString(),
+        verifiedSignature: true,
+      });
+      const afterEndorsement = generator.contentFingerprint();
+      expect(afterEndorsement).not.toBe(afterPost);
+
+      const ring = db.createHostedRing({ name: 'FP Ring' });
+      const afterRing = generator.contentFingerprint();
+      expect(afterRing).not.toBe(afterEndorsement);
+      db.addRingMember(ring.id, { siteUrl: 'https://pal.ring.test', displayName: 'Pal', did: '', keyFingerprint: '' });
+      const afterMember = generator.contentFingerprint();
+      expect(afterMember).not.toBe(afterRing);
+
+      fs.mkdirSync(mediaDir, { recursive: true });
+      fs.writeFileSync(path.join(mediaDir, 'photo.jpg'), 'pixels');
+      expect(generator.contentFingerprint()).not.toBe(afterMember);
+    } finally {
+      db.close();
+    }
+  });
+
+  it('runs a scheduled publish for a non-active persona with its own key, skipping when unchanged', async () => {
+    const manager = new PersonaManager(path.join(tempRoot, 'studio'));
+    try {
+      const created = manager.createPersona({
+        label: 'Second',
+        displayName: 'Second Self',
+        siteUrl: 'https://second.ring.test',
+      });
+      const secondId = created.created.id;
+      manager.switchPersona('default');
+      const activeBefore = manager.getActiveContext().db.getProfile().siteUrl;
+      const exportDir = path.join(tempRoot, 'second-export');
+      const paths = { userDataDir: path.join(tempRoot, 'studio'), tempDir: tempRoot };
+
+      const first = await manager.withPersonaContext(secondId, async (ctx) => {
+        ctx.db.updateProfile({ publishSettings: { exportPath: exportDir } });
+        return runScheduledPublish(ctx, 'local', false, paths);
+      });
+      expect(first.status).toBe('ok');
+      const didDoc = JSON.parse(fs.readFileSync(path.join(exportDir, '.well-known/did.json'), 'utf8'));
+      expect(didDoc.id).toBe('did:web:second.ring.test');
+      const profileDoc = JSON.parse(fs.readFileSync(path.join(exportDir, 'api/profile.json'), 'utf8'));
+      expect(verifyDocumentSignature(profileDoc, didDoc.verificationMethod[0].publicKeyPem)).toBe(true);
+
+      const second = await manager.withPersonaContext(secondId, (ctx) =>
+        runScheduledPublish(ctx, 'local', false, paths)
+      );
+      expect(second.status).toBe('skipped');
+
+      // The active persona is untouched and still usable
+      expect(manager.getActivePersonaId()).toBe('default');
+      expect(manager.getActiveContext().db.getProfile().siteUrl).toBe(activeBefore);
+
+      // A destination that isn't set up fails without publishing anything
+      const remote = await manager.withPersonaContext(secondId, async (ctx) => {
+        ctx.db.createItem({ type: 'post', title: 'Changed', commentary: '' });
+        return runScheduledPublish(ctx, 'remote', false, paths);
+      });
+      expect(remote.status).toBe('failed');
+      expect(remote.message).toMatch(/host and username/);
+    } finally {
+      manager.closeAll();
+    }
+  });
+});

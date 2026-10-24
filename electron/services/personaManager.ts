@@ -1,11 +1,13 @@
 import * as fs from 'fs';
 import * as path from 'path';
 import * as crypto from 'crypto';
+import { KeyCipher } from '../security/keyVault';
 import { StudioDatabase } from '../db/database';
 import { MediaProcessor } from './mediaProcessor';
 import { StaticSiteGenerator } from './siteGenerator';
 import { SitePublisher } from './publisher';
 import { RingCrawler } from './ringCrawler';
+import { RingService } from './ringService';
 import { CreatePersonaInput, PersonaSummary } from '../../src/shared/schema';
 
 interface StoredPersonaRecord {
@@ -28,6 +30,7 @@ export interface ActivePersonaContext {
   siteGenerator: StaticSiteGenerator;
   sitePublisher: SitePublisher;
   ringCrawler: RingCrawler;
+  ringService: RingService;
 }
 
 /**
@@ -40,7 +43,10 @@ export class PersonaManager {
   private registry: StoredPersonaRegistry;
   private activeContext: ActivePersonaContext | null = null;
 
-  constructor(private userDataDir: string) {
+  constructor(
+    private userDataDir: string,
+    private options: { keyCipher?: KeyCipher } = {}
+  ) {
     if (!fs.existsSync(userDataDir)) {
       fs.mkdirSync(userDataDir, { recursive: true });
     }
@@ -120,6 +126,7 @@ export class PersonaManager {
 
     const tempDb = new StudioDatabase(this.userDataDir, record.dbFileName, {
       seedStarterData: record.id === 'default',
+      keyCipher: this.options.keyCipher,
     });
     const summary = computeSummary(tempDb);
     tempDb.close();
@@ -140,6 +147,17 @@ export class PersonaManager {
       this.activeContext = null;
     }
 
+    this.registry.activePersonaId = record.id;
+    this.saveRegistry();
+    this.activeContext = this.buildContext(record);
+    return this.activeContext;
+  }
+
+  /**
+   * Opens a persona's own database, media folder and services. Used for the active persona and
+   * for background jobs on other personas, so both see exactly the same setup.
+   */
+  private buildContext(record: StoredPersonaRecord): ActivePersonaContext {
     const mediaStoreDir = path.join(this.userDataDir, record.mediaDirName);
     const defaultExportPath =
       record.id === 'default'
@@ -149,25 +167,44 @@ export class PersonaManager {
     const db = new StudioDatabase(this.userDataDir, record.dbFileName, {
       seedStarterData: record.id === 'default',
       defaultExportPath,
+      keyCipher: this.options.keyCipher,
     });
-    const mediaProcessor = new MediaProcessor(mediaStoreDir);
     const siteGenerator = new StaticSiteGenerator(db, mediaStoreDir);
-    const sitePublisher = new SitePublisher(siteGenerator);
-    const ringCrawler = new RingCrawler(db);
-
-    this.registry.activePersonaId = record.id;
-    this.saveRegistry();
-
-    this.activeContext = {
+    return {
       persona: this.hydratePersonaSummary(record, db),
       db,
-      mediaProcessor,
+      mediaProcessor: new MediaProcessor(mediaStoreDir),
       siteGenerator,
-      sitePublisher,
-      ringCrawler,
+      sitePublisher: new SitePublisher(siteGenerator),
+      ringCrawler: new RingCrawler(db),
+      ringService: new RingService(db),
     };
+  }
 
-    return this.activeContext;
+  /**
+   * Runs `fn` with its own short-lived context for a persona (its own database connection and
+   * key), closed afterwards. Background jobs use this even for the active persona, so switching
+   * personas mid-job can't close the database out from under them, and personas never share data.
+   */
+  public async withPersonaContext<T>(
+    personaId: string,
+    fn: (ctx: ActivePersonaContext) => Promise<T>
+  ): Promise<T> {
+    const record = this.registry.personas.find((p) => p.id === personaId);
+    if (!record) {
+      throw new Error(`Persona "${personaId}" not found`);
+    }
+    const ctx = this.buildContext(record);
+    try {
+      return await fn(ctx);
+    } finally {
+      ctx.db.close();
+    }
+  }
+
+  /** Persona ids and labels without opening any database. */
+  public listPersonaRecords(): Array<{ id: string; label: string }> {
+    return this.registry.personas.map((p) => ({ id: p.id, label: p.label }));
   }
 
   public getActiveContext(): ActivePersonaContext {
@@ -231,6 +268,7 @@ export class PersonaManager {
     const newDb = new StudioDatabase(this.userDataDir, dbFileName, {
       seedStarterData: Boolean(input.seedStarterData),
       defaultExportPath,
+      keyCipher: this.options.keyCipher,
       initialProfile: {
         siteUrl: input.siteUrl,
         handle: input.handle,

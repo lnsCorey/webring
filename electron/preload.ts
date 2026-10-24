@@ -22,14 +22,28 @@ contextBridge.exposeInMainWorld('studioApi', {
   setFriendVisibility: (friendId: string, visibility: 'private' | 'public') =>
     ipcRenderer.invoke('studio:set-friend-visibility', friendId, visibility),
   deleteFriend: (friendId: string) => ipcRenderer.invoke('studio:delete-friend', friendId),
-  addWebring: (input: unknown) => ipcRenderer.invoke('studio:add-webring', input),
+  setModeration: (siteUrl: string, action: 'mute' | 'block' | null) =>
+    ipcRenderer.invoke('studio:set-moderation', siteUrl, action),
   updateWebring: (ringId: string, updates: unknown) =>
     ipcRenderer.invoke('studio:update-webring', ringId, updates),
   deleteWebring: (ringId: string) => ipcRenderer.invoke('studio:delete-webring', ringId),
   crawlFriend: (siteUrl: string, localDirOverride?: string) =>
     ipcRenderer.invoke('studio:crawl-friend', siteUrl, localDirOverride),
   crawlAllFriends: () => ipcRenderer.invoke('studio:crawl-all-friends'),
-  syncWebringHub: (hubUrl: string) => ipcRenderer.invoke('studio:sync-webring-hub', hubUrl),
+  requestToJoinRing: (hubUrl: string) => ipcRenderer.invoke('studio:ring-request-join', hubUrl),
+  reviewRingRequest: (link: string) => ipcRenderer.invoke('studio:ring-review-request', link),
+  decideRingRequest: (link: string, decision: 'approve' | 'decline' | 'ban', reason?: string) =>
+    ipcRenderer.invoke('studio:ring-decide-request', link, decision, reason),
+  syncRings: () => ipcRenderer.invoke('studio:ring-sync-all'),
+  createHostedRing: (input: { name: string; description?: string }) =>
+    ipcRenderer.invoke('studio:hosted-ring-create', input),
+  updateHostedRing: (ringId: string, updates: unknown) =>
+    ipcRenderer.invoke('studio:hosted-ring-update', ringId, updates),
+  updateRingMember: (
+    ringId: string,
+    siteUrl: string,
+    change: { action: 'remove' | 'ban' | 'unban' | 'hide' | 'show' | 'up' | 'down'; reason?: string }
+  ) => ipcRenderer.invoke('studio:hosted-ring-member', ringId, siteUrl, change),
   chooseExportFolder: () => ipcRenderer.invoke('studio:choose-export-folder'),
   exportLocal: (targetDir?: string) => ipcRenderer.invoke('studio:export-local', targetDir),
   testExportPreview: (openInBrowser?: boolean) =>
@@ -47,6 +61,20 @@ contextBridge.exposeInMainWorld('studioApi', {
     const listener = (_event: unknown, entry: unknown) => callback(entry);
     ipcRenderer.on('studio:mcp-activity', listener);
     return () => ipcRenderer.removeListener('studio:mcp-activity', listener);
+  },
+  getSchedule: () => ipcRenderer.invoke('studio:get-schedule'),
+  setSchedule: (change: unknown) => ipcRenderer.invoke('studio:set-schedule', change),
+  runJobNow: (personaId: string, job: 'sync' | 'publish') =>
+    ipcRenderer.invoke('studio:run-job-now', personaId, job),
+  onScheduleUpdated: (callback: () => void) => {
+    const listener = () => callback();
+    ipcRenderer.on('studio:schedule-updated', listener);
+    return () => ipcRenderer.removeListener('studio:schedule-updated', listener);
+  },
+  onRingRequestLink: (callback: (link: string) => void) => {
+    const listener = (_event: unknown, link: string) => callback(link);
+    ipcRenderer.on('webring:ring-request', listener);
+    return () => ipcRenderer.removeListener('webring:ring-request', listener);
   },
   onDeepLink: (callback: (action: WebringDeepLinkAction) => void) => {
     const listener = (_event: unknown, action: WebringDeepLinkAction) => callback(action);
