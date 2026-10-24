@@ -184,16 +184,51 @@ export const ProfileSiteApp: React.FC<ProfileSiteAppProps> = ({
                 )}
               </div>
               <div className="flex items-center gap-3 font-medium">
-                {ring.prevSiteUrl && (
-                  <a
-                    href={safeHref(ring.prevSiteUrl)}
-                    target="_blank"
-                    rel="noreferrer"
-                    className="hover:underline opacity-85 hover:opacity-100"
-                  >
-                    ← Prev Site
-                  </a>
-                )}
+                {/* Matches the published bar: 1 member shows no links, 2 show one neighbour */}
+                {(ring.memberCount ?? 3) > 1 &&
+                  (ring.prevSiteUrl && ring.prevSiteUrl === ring.nextSiteUrl ? (
+                    <a
+                      href={safeHref(ring.nextSiteUrl)}
+                      target="_blank"
+                      rel="noreferrer"
+                      className="hover:underline opacity-85 hover:opacity-100"
+                    >
+                      Neighbour →
+                    </a>
+                  ) : (
+                    <>
+                      {ring.prevSiteUrl && (
+                        <a
+                          href={safeHref(ring.prevSiteUrl)}
+                          target="_blank"
+                          rel="noreferrer"
+                          className="hover:underline opacity-85 hover:opacity-100"
+                        >
+                          ← Prev Site
+                        </a>
+                      )}
+                      {(ring.memberCount ?? 3) > 2 && (
+                        <a
+                          href={safeHref(ring.directoryUrl || ring.hubUrl)}
+                          target="_blank"
+                          rel="noreferrer"
+                          className="hover:underline opacity-85 hover:opacity-100"
+                        >
+                          Random
+                        </a>
+                      )}
+                      {ring.nextSiteUrl && (
+                        <a
+                          href={safeHref(ring.nextSiteUrl)}
+                          target="_blank"
+                          rel="noreferrer"
+                          className="hover:underline opacity-85 hover:opacity-100"
+                        >
+                          Next Site →
+                        </a>
+                      )}
+                    </>
+                  ))}
                 <a
                   href={joinUri}
                   onClick={(e) => triggerWebringUri(joinUri, e)}
@@ -201,16 +236,6 @@ export const ProfileSiteApp: React.FC<ProfileSiteAppProps> = ({
                 >
                   + Join Ring
                 </a>
-                {ring.nextSiteUrl && (
-                  <a
-                    href={safeHref(ring.nextSiteUrl)}
-                    target="_blank"
-                    rel="noreferrer"
-                    className="hover:underline opacity-85 hover:opacity-100"
-                  >
-                    Next Site →
-                  </a>
-                )}
               </div>
             </div>
           );

@@ -1,4 +1,6 @@
 import * as http from 'http';
+import * as fs from 'fs';
+import * as crypto from 'crypto';
 import { WebringMcpServer, JsonRpcRequest } from './mcpServer';
 
 export interface McpHttpServerStatus {
@@ -9,6 +11,19 @@ export interface McpHttpServerStatus {
   toolCount: number;
   resourceCount: number;
   promptCount: number;
+  /** URLs carrying the access token, for MCP clients that send an Origin header (e.g. Electron apps). */
+  authorizedEndpointUrl?: string;
+  authorizedSseUrl?: string;
+}
+
+export interface McpHttpServerOptions {
+  /** JSON file that keeps the port and access token stable across restarts. */
+  settingsPath?: string;
+}
+
+interface StoredHttpSettings {
+  port?: number;
+  token: string;
 }
 
 /**
@@ -20,33 +35,92 @@ export class McpHttpServer {
   private server: http.Server | null = null;
   private port = 0;
   private sseClients = new Set<http.ServerResponse>();
+  private settings: StoredHttpSettings;
 
-  constructor(private mcpServer: WebringMcpServer) {}
+  constructor(private mcpServer: WebringMcpServer, private options: McpHttpServerOptions = {}) {
+    this.settings = this.loadSettings();
+  }
 
+  private loadSettings(): StoredHttpSettings {
+    const { settingsPath } = this.options;
+    if (settingsPath && fs.existsSync(settingsPath)) {
+      try {
+        const stored = JSON.parse(fs.readFileSync(settingsPath, 'utf8')) as Partial<StoredHttpSettings>;
+        if (typeof stored.token === 'string' && stored.token.length >= 32) {
+          return { token: stored.token, port: typeof stored.port === 'number' ? stored.port : undefined };
+        }
+      } catch {
+        // Regenerate below
+      }
+    }
+    return { token: crypto.randomBytes(32).toString('hex') };
+  }
+
+  private saveSettings(): void {
+    if (!this.options.settingsPath) return;
+    fs.writeFileSync(this.options.settingsPath, JSON.stringify(this.settings, null, 2), {
+      encoding: 'utf8',
+      mode: 0o600,
+    });
+  }
+
+  /**
+   * Starts on `preferredPort`, or else the port used last time (so agent configs keep working
+   * across restarts), falling back to a random free port if that one is taken.
+   */
   public async start(preferredPort = 0): Promise<McpHttpServerStatus> {
     if (this.server && this.port > 0) {
       return this.getStatus();
     }
 
-    await new Promise<void>((resolve, reject) => {
-      const srv = http.createServer(async (req, res) => {
-        // Strict loopback CORS headers for local agent tooling
-        res.setHeader('Access-Control-Allow-Origin', '*');
-        res.setHeader('Access-Control-Allow-Methods', 'GET, POST, OPTIONS');
-        res.setHeader('Access-Control-Allow-Headers', 'Content-Type, Accept, Authorization');
+    const firstChoice = preferredPort || this.settings.port || 0;
+    try {
+      await this.listen(firstChoice);
+    } catch (err) {
+      if (firstChoice === 0) throw err;
+      await this.listen(0);
+    }
+    this.settings.port = this.port;
+    this.saveSettings();
+    return this.getStatus();
+  }
 
-        if (req.method === 'OPTIONS') {
-          res.writeHead(204);
-          res.end();
+  private listen(port: number): Promise<void> {
+    return new Promise<void>((resolve, reject) => {
+      const srv = http.createServer(async (req, res) => {
+        const urlObj = new URL(req.url || '/', `http://127.0.0.1:${this.port || 80}`);
+        const origin = req.headers.origin;
+        const hasToken = this.hasValidToken(req, urlObj);
+
+        // Loopback alone doesn't stop web pages open in the user's browser, so browser-style
+        // traffic is refused unless it carries the access token (which pages can't know):
+        // no Origin, a loopback Host (blocks DNS rebinding), and JSON-only POSTs (blocks
+        // preflight-free "simple" requests).
+        const rejection = this.rejectNonAgentRequest(req, hasToken);
+        if (rejection) {
+          res.writeHead(rejection.status, { 'Content-Type': 'application/json; charset=utf-8' });
+          res.end(JSON.stringify({ error: rejection.message }));
           return;
         }
 
-        const urlObj = new URL(req.url || '/', `http://127.0.0.1:${this.port || 80}`);
+        // Token-holding clients that run in a browser context (e.g. Electron renderers) need CORS
+        if (hasToken && origin !== undefined) {
+          res.setHeader('Access-Control-Allow-Origin', origin);
+          res.setHeader('Vary', 'Origin');
+          res.setHeader('Access-Control-Allow-Methods', 'GET, POST, OPTIONS');
+          res.setHeader('Access-Control-Allow-Headers', 'Content-Type, Accept, Authorization');
+          if (req.method === 'OPTIONS') {
+            res.writeHead(204);
+            res.end();
+            return;
+          }
+        }
 
         // 1. Health & Metadata Check
         if (req.method === 'GET' && urlObj.pathname === '/mcp/health') {
+          const { authorizedEndpointUrl: _e, authorizedSseUrl: _s, ...publicStatus } = this.getStatus();
           res.writeHead(200, { 'Content-Type': 'application/json; charset=utf-8' });
-          res.end(JSON.stringify(this.getStatus(), null, 2));
+          res.end(JSON.stringify(publicStatus, null, 2));
           return;
         }
 
@@ -57,7 +131,10 @@ export class McpHttpServer {
             'Cache-Control': 'no-cache',
             Connection: 'keep-alive',
           });
-          res.write(`event: endpoint\ndata: http://127.0.0.1:${this.port}/mcp/message\n\n`);
+          const messageUrl = `http://127.0.0.1:${this.port}/mcp/message${
+            hasToken ? `?token=${this.settings.token}` : ''
+          }`;
+          res.write(`event: endpoint\ndata: ${messageUrl}\n\n`);
           this.sseClients.add(res);
           req.on('close', () => {
             this.sseClients.delete(res);
@@ -125,7 +202,7 @@ export class McpHttpServer {
       });
 
       srv.on('error', reject);
-      srv.listen(preferredPort, '127.0.0.1', () => {
+      srv.listen(port, '127.0.0.1', () => {
         const addr = srv.address();
         if (addr && typeof addr === 'object') {
           this.port = addr.port;
@@ -134,8 +211,38 @@ export class McpHttpServer {
         resolve();
       });
     });
+  }
 
-    return this.getStatus();
+  /**
+   * Accepts the token as `?token=` (works for SSE URLs and CORS preflights) or `Authorization: Bearer`.
+   */
+  private hasValidToken(req: http.IncomingMessage, urlObj: URL): boolean {
+    const bearer = /^Bearer\s+(.+)$/i.exec(req.headers.authorization || '')?.[1];
+    const supplied = urlObj.searchParams.get('token') || bearer || '';
+    const expected = Buffer.from(this.settings.token);
+    const given = Buffer.from(supplied);
+    return given.length === expected.length && crypto.timingSafeEqual(given, expected);
+  }
+
+  private rejectNonAgentRequest(
+    req: http.IncomingMessage,
+    hasToken: boolean
+  ): { status: number; message: string } | null {
+    if (req.headers.origin !== undefined && !hasToken) {
+      return {
+        status: 403,
+        message: 'Requests with an Origin header need the access token (see the MCP tab in Webring Studio).',
+      };
+    }
+    const host = (req.headers.host || '').toLowerCase();
+    if (host !== `127.0.0.1:${this.port}` && host !== `localhost:${this.port}`) {
+      return { status: 403, message: 'Host must be 127.0.0.1 or localhost.' };
+    }
+    const contentType = (req.headers['content-type'] || '').split(';')[0].trim().toLowerCase();
+    if (req.method === 'POST' && contentType !== 'application/json') {
+      return { status: 415, message: 'Content-Type must be application/json.' };
+    }
+    return null;
   }
 
   private readRequestBody(req: http.IncomingMessage): Promise<string> {
@@ -164,6 +271,12 @@ export class McpHttpServer {
       port: this.port,
       endpointUrl: running ? `http://127.0.0.1:${this.port}/mcp` : '',
       sseUrl: running ? `http://127.0.0.1:${this.port}/mcp/sse` : '',
+      authorizedEndpointUrl: running
+        ? `http://127.0.0.1:${this.port}/mcp?token=${this.settings.token}`
+        : '',
+      authorizedSseUrl: running
+        ? `http://127.0.0.1:${this.port}/mcp/sse?token=${this.settings.token}`
+        : '',
       toolCount: this.mcpServer.getTools().length,
       resourceCount: this.mcpServer.getResources().length,
       promptCount: this.mcpServer.getPrompts().length,
@@ -182,6 +295,8 @@ export class McpHttpServer {
     if (!this.server) return;
     await new Promise<void>((resolve) => {
       this.server!.close(() => resolve());
+      // Don't wait for idle keep-alive sockets to time out
+      this.server!.closeAllConnections();
     });
     this.server = null;
     this.port = 0;
