@@ -50,9 +50,3 @@
 ### Known state
 
 - Both type checks are clean (`npx tsc -p tsconfig.json --noEmit` and `npx tsc -p tsconfig.electron.json --noEmit`); keep them at zero errors.
-
----
-
-The mission and goals above are also kept as an intent file: `.agents/enforce-static-site-and-local-first-architecture.md`.
-
----
