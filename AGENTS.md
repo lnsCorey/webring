@@ -20,35 +20,6 @@ The goal is user sovereignty and decentralization, achieved by strictly separati
 
 ---
 
-# Agentic Asset Inventory
+# Project reference
 
-The following assets define this agent's behavior.
-The harness should load them in the order listed.
-
-## 1. Intent Files
-
-Each file defines an agentic intent (mission, goals, constraints, KPIs).
-
-- `.agents/enforce-static-site-and-local-first-architecture.md` — Enforce Static-Site and Local-First Architecture
-
----
-
-# Assembly Instructions for the Harness
-
-1. Load this file as the root system prompt.
-2. Load all assets in the order listed above.
-3. Merge them into a single instruction context.
-4. Expose tools to the agent according to their schemas.
-5. Apply roles and rules as top-priority behavioral constraints.
-6. Apply context blocks as secondary background knowledge.
-7. Apply memory objects last as optional reference material.
-8. Load SPEC.md as project reference material.
-
----
-
-# Runtime Behavior
-
-- The agent must follow the Intent, Goals, Constraints, and KPIs.
-- The agent must use tools when appropriate.
-- The agent must cite which role or rule governs a decision when relevant.
-- The agent must maintain internal consistency across all loaded assets.
+Read `SPEC.md` before changing code: it has the commands, project layout, conventions and known state. `docs/architecture/federation.md` explains federation, signing and webrings.
