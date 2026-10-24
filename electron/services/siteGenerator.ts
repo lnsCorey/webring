@@ -1,5 +1,6 @@
 import * as fs from 'fs';
 import * as path from 'path';
+import * as crypto from 'crypto';
 import { StudioDatabase } from '../db/database';
 import {
   CompleteSiteBundle,
@@ -24,11 +25,66 @@ export interface GeneratedSiteResult {
  * - /api/albums.json
  * - /api/items.json
  * - /api/connections.json
- * - /api/webring-hub.json (optional community ring directory)
+ * - /api/rings/<slug>.json + /rings/<slug>/index.html (signed hub and directory page per hosted ring)
  * - /index.html (Standalone interactive profile site powered by the JSON files)
  */
 export class StaticSiteGenerator {
   constructor(private db: StudioDatabase, private mediaStoreDir?: string) {}
+
+  /**
+   * Remembers that this bundle actually went live (local export or upload), so the studio can
+   * show when the public snapshot was taken. Test previews don't call this.
+   */
+  public recordPublished(bundle: CompleteSiteBundle): void {
+    this.db.recordPublished(
+      bundle.manifest.updatedAt,
+      {
+        ...bundle.manifest.stats,
+        endorsementCount: bundle.connections.endorsements.length,
+      },
+      this.contentFingerprint(bundle)
+    );
+  }
+
+  /**
+   * A hash of what the published site would contain, ignoring things that change on every build
+   * (timestamps and signatures). Equal fingerprints mean publishing again would change nothing,
+   * which lets scheduled publishes skip. Covers the bundle, hosted ring hubs and media files.
+   */
+  public contentFingerprint(bundle: CompleteSiteBundle = this.db.buildSignedSiteBundle()): string {
+    const stripVolatile = (value: unknown): unknown => {
+      if (Array.isArray(value)) return value.map(stripVolatile);
+      if (value && typeof value === 'object') {
+        const out: Record<string, unknown> = {};
+        for (const key of Object.keys(value as Record<string, unknown>).sort()) {
+          if (key === 'updatedAt' || key === 'proof') continue;
+          out[key] = stripVolatile((value as Record<string, unknown>)[key]);
+        }
+        return out;
+      }
+      return value;
+    };
+    const media: string[] = [];
+    const walk = (dir: string, rel: string) => {
+      if (!fs.existsSync(dir)) return;
+      for (const entry of fs.readdirSync(dir, { withFileTypes: true }).sort((a, b) => a.name.localeCompare(b.name))) {
+        const full = path.join(dir, entry.name);
+        const relPath = rel ? `${rel}/${entry.name}` : entry.name;
+        if (entry.isDirectory()) {
+          walk(full, relPath);
+        } else {
+          const stat = fs.statSync(full);
+          media.push(`${relPath}:${stat.size}:${Math.floor(stat.mtimeMs)}`);
+        }
+      }
+    };
+    if (this.mediaStoreDir) walk(this.mediaStoreDir, '');
+    const hubs = this.db.buildSignedHubDocuments().map(({ ring, doc }) => ({ path: ring.hubPath, doc }));
+    return crypto
+      .createHash('sha256')
+      .update(JSON.stringify(stripVolatile({ bundle, hubs, media })))
+      .digest('hex');
+  }
 
   public generateToDirectory(outputDir: string, compiledProfileHtml?: string): GeneratedSiteResult {
     const bundle = this.db.buildSignedSiteBundle();
@@ -58,35 +114,20 @@ export class StaticSiteGenerator {
     writeJson('api/items.json', bundle.items);
     writeJson('api/connections.json', bundle.connections);
 
-    // 2. Only generate a public webring-hub.json if explicitly enabled in privacy/publish settings
-    const rawProfile = this.db.getProfile();
-    const hubFilePath = path.join(outputDir, 'api/webring-hub.json');
-    if (rawProfile.publishSettings?.publishWebringHub) {
-      const hubDoc: WebringHubDocument = {
-        schemaVersion: WEBRING_SCHEMA_VERSION,
-        name: `${bundle.profile.displayName}'s Webring Circle`,
-        description: `Federated friend ring maintained by ${bundle.profile.displayName}`,
-        hubUrl: `${bundle.profile.siteUrl}/api/webring-hub.json`,
-        maintainerUrl: bundle.profile.siteUrl,
-        updatedAt: bundle.manifest.updatedAt,
-        members: [
-          {
-            siteUrl: bundle.profile.siteUrl,
-            displayName: bundle.profile.displayName,
-            did: bundle.profile.did,
-            joinedAt: bundle.manifest.updatedAt,
-          },
-          ...bundle.connections.friends.map((f) => ({
-            siteUrl: f.siteUrl,
-            displayName: f.displayName,
-            did: f.did,
-            joinedAt: f.addedAt,
-          })),
-        ],
-      };
-      writeJson('api/webring-hub.json', hubDoc);
-    } else if (fs.existsSync(hubFilePath)) {
-      fs.rmSync(hubFilePath, { force: true });
+    // 2. Hosted rings: a signed hub JSON (what members' Studios and visitors' Prev/Next read) and a
+    // script-free directory page. Closed rings are still written so members learn they closed.
+    const hubDocs = this.db.buildSignedHubDocuments();
+    for (const { ring, doc } of hubDocs) {
+      writeJson(ring.hubPath, doc);
+      const directoryFile = path.join(outputDir, ring.directoryPath);
+      fs.mkdirSync(path.dirname(directoryFile), { recursive: true });
+      fs.writeFileSync(directoryFile, buildRingDirectoryHtml(doc), 'utf8');
+      filesWritten.push(ring.directoryPath);
+    }
+    // The pre-redesign hub lived here; drop a stale local copy unless a hosted ring now owns the path
+    const legacyHubPath = path.join(outputDir, 'api/webring-hub.json');
+    if (!hubDocs.some(({ ring }) => ring.hubPath === 'api/webring-hub.json') && fs.existsSync(legacyHubPath)) {
+      fs.rmSync(legacyHubPath, { force: true });
     }
 
     // 3. Copy local media files if mediaStoreDir exists
@@ -383,20 +424,95 @@ export class StaticSiteGenerator {
         }
       };
 
-      const webringBars = (connections.webrings || []).map(ring => \`
+      // Ring bars. Prev / Next / Random are baked in at publish; on click they re-read the ring's
+      // hub so removed or hidden sites are skipped, falling back to the baked link on any failure.
+      const webringBars = (connections.webrings || []).map((ring, ringIndex) => {
+        const count = typeof ring.memberCount === 'number' ? ring.memberCount : 3;
+        const homeHref = safeUrl(ring.directoryUrl || ring.hubUrl);
+        const single = ring.prevSiteUrl && ring.prevSiteUrl === ring.nextSiteUrl;
+        const navLink = (nav, href, label) =>
+          '<a href="' + safeUrl(href) + '" data-ring-nav="' + nav + '" data-ring-index="' + ringIndex + '" rel="noopener noreferrer" class="hover:underline">' + label + '</a>';
+        const links = count <= 1
+          ? ''
+          : single
+            ? navLink('next', ring.nextSiteUrl, 'Neighbour →')
+            : (ring.prevSiteUrl ? navLink('prev', ring.prevSiteUrl, '← Prev Site') : '') +
+              (count > 2 ? navLink('random', ring.directoryUrl || ring.hubUrl, 'Random') : '') +
+              (ring.nextSiteUrl ? navLink('next', ring.nextSiteUrl, 'Next Site →') : '');
+        return \`
         <div class="card-surface rounded-xl px-4 py-2.5 mb-3 flex flex-wrap items-center justify-between gap-2 text-xs">
           <div class="flex items-center gap-2">
             <span class="px-2 py-0.5 rounded-full bg-indigo-500/20 text-indigo-300 font-semibold">WEBRING</span>
-            <a href="\${safeUrl(ring.hubUrl)}" target="_blank" rel="noopener noreferrer" class="font-bold hover:underline">\${esc(ring.name)}</a>
+            <a href="\${homeHref}" target="_blank" rel="noopener noreferrer" class="font-bold hover:underline">\${esc(ring.name)}</a>
             <span class="opacity-70 hidden sm:inline">— \${esc(ring.description || '')}</span>
           </div>
           <div class="flex items-center gap-3 font-medium">
-            \${ring.prevSiteUrl ? \`<a href="\${safeUrl(ring.prevSiteUrl)}" target="_blank" rel="noopener noreferrer" class="hover:underline">← Prev Site</a>\` : ''}
+            \${links}
             <a href="\${buildDeepLink('join-ring', ring.hubUrl, ring.name)}" class="px-2 py-0.5 rounded bg-emerald-500/20 text-emerald-300 hover:bg-emerald-500/30">Join Ring</a>
-            \${ring.nextSiteUrl ? \`<a href="\${safeUrl(ring.nextSiteUrl)}" target="_blank" rel="noopener noreferrer" class="hover:underline">Next Site →</a>\` : ''}
           </div>
         </div>
-      \`).join('');
+      \`;
+      }).join('');
+
+      // Hub-supplied addresses are untrusted: absolute https only, no credentials
+      function ringSiteUrl(value) {
+        try {
+          const u = new URL(String(value || ''));
+          if (u.protocol !== 'https:' || u.username || u.password) return null;
+          return u.origin + u.pathname.replace(/\\/+$/, '');
+        } catch (e) {
+          return null;
+        }
+      }
+
+      async function fetchRingHub(hubUrl) {
+        const controller = new AbortController();
+        const timer = setTimeout(function() { controller.abort(); }, 2000);
+        try {
+          const res = await fetch(hubUrl, { credentials: 'omit', referrerPolicy: 'no-referrer', cache: 'no-store', signal: controller.signal });
+          if (!res.ok) return null;
+          const text = await res.text();
+          if (text.length > 1000000) return null;
+          const doc = JSON.parse(text);
+          if (!doc || !Array.isArray(doc.members) || doc.status === 'closed') return null;
+          return doc;
+        } catch (e) {
+          return null;
+        } finally {
+          clearTimeout(timer);
+        }
+      }
+
+      root.addEventListener('click', async function(ev) {
+        const anchor = ev.target && ev.target.closest ? ev.target.closest('a[data-ring-nav]') : null;
+        if (!anchor) return;
+        const ring = (connections.webrings || [])[Number(anchor.getAttribute('data-ring-index'))];
+        const hubUrl = ring ? ringSiteUrl(ring.hubUrl) : null;
+        if (!hubUrl) return;
+        ev.preventDefault();
+        const nav = anchor.getAttribute('data-ring-nav');
+        const fallback = anchor.getAttribute('href');
+        let target = null;
+        const doc = await fetchRingHub(ring.hubUrl);
+        if (doc) {
+          const me = ringSiteUrl(profile.siteUrl);
+          const rotation = [];
+          doc.members.forEach(function(m) {
+            const url = m ? ringSiteUrl(m.siteUrl) : null;
+            if (url && (m.inRotation !== false || url === me) && rotation.indexOf(url) === -1) rotation.push(url);
+          });
+          const others = rotation.filter(function(u) { return u !== me; });
+          const idx = rotation.indexOf(me);
+          if (nav === 'random') {
+            target = others.length ? others[Math.floor(Math.random() * others.length)] : null;
+          } else if (idx !== -1 && rotation.length > 1) {
+            const step = nav === 'prev' ? -1 : 1;
+            target = rotation[(idx + step + rotation.length) % rotation.length];
+          }
+        }
+        const destination = target || fallback;
+        if (destination && destination.charAt(0) !== '#') window.location.assign(destination);
+      });
 
       const albumsHtml = (albums.albums || []).map(album => {
         const photosHtml = (album.photos || []).map(photo => {
@@ -653,3 +769,72 @@ export class StaticSiteGenerator {
   }
 }
 
+
+function escapeHtml(value: string): string {
+  return value
+    .replace(/&/g, '&amp;')
+    .replace(/</g, '&lt;')
+    .replace(/>/g, '&gt;')
+    .replace(/"/g, '&quot;')
+    .replace(/'/g, '&#39;');
+}
+
+/** Only absolute http(s) URLs make it into links; anything else is dropped. */
+function safeExternalUrl(value: string): string | null {
+  try {
+    const url = new URL(value);
+    return url.protocol === 'https:' || url.protocol === 'http:' ? url.toString() : null;
+  } catch {
+    return null;
+  }
+}
+
+/**
+ * A plain, script-free page listing a hosted ring's members, so the ring is browsable without
+ * JavaScript and "Random" has somewhere to land when scripts are off.
+ */
+export function buildRingDirectoryHtml(doc: WebringHubDocument): string {
+  const closed = doc.status === 'closed';
+  const members = doc.members
+    .map((m) => {
+      const href = safeExternalUrl(m.siteUrl);
+      const name = escapeHtml(m.displayName.slice(0, 120));
+      return href
+        ? `<li><a href="${escapeHtml(href)}" rel="noopener">${name}</a> <span>${escapeHtml(new URL(href).host)}</span></li>`
+        : '';
+    })
+    .join('\n      ');
+  const joinLink = `webring://interact?action=join-ring&targetUrl=${encodeURIComponent(doc.hubUrl)}&title=${encodeURIComponent(doc.name)}`;
+  const maintainer = safeExternalUrl(doc.maintainerUrl);
+  return `<!doctype html>
+<html lang="en">
+<head>
+  <meta charset="utf-8" />
+  <meta name="viewport" content="width=device-width, initial-scale=1" />
+  <meta http-equiv="Content-Security-Policy" content="default-src 'none'; style-src 'unsafe-inline'; img-src 'self' https: data:;" />
+  <title>${escapeHtml(doc.name)} · Webring</title>
+  <style>
+    body { font-family: system-ui, sans-serif; max-width: 42rem; margin: 2rem auto; padding: 0 1rem; line-height: 1.5; color: #1e293b; background: #f8fafc; }
+    @media (prefers-color-scheme: dark) { body { color: #e2e8f0; background: #0f172a; } a { color: #a5b4fc; } }
+    li { margin: 0.35rem 0; } li span { opacity: 0.6; font-size: 0.85em; }
+    .note { opacity: 0.75; font-size: 0.9em; }
+  </style>
+</head>
+<body>
+  <h1>${escapeHtml(doc.name)}</h1>
+  <p>${escapeHtml(doc.description)}</p>
+  ${
+    closed
+      ? '<p><strong>This ring has closed.</strong></p>'
+      : `<h2>Members (${doc.members.length})</h2>
+  <ol>
+      ${members}
+  </ol>
+  <h2>Join this ring</h2>
+  <p>Membership is curated${maintainer ? ` by <a href="${escapeHtml(maintainer)}" rel="noopener">the maintainer</a>` : ''}. In Webring Studio, <a href="${escapeHtml(joinLink)}">open this ring</a> (or paste the hub address below into Friends &amp; Webrings → Join a ring), then send the maintainer the request link Studio gives you.</p>
+  <p class="note">Hub: <code>${escapeHtml(doc.hubUrl)}</code></p>`
+  }
+</body>
+</html>
+`;
+}

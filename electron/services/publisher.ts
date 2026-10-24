@@ -34,6 +34,7 @@ export class SitePublisher {
   public publishToLocalDirectory(targetDir: string): PublishResult {
     try {
       const result = this.generator.generateToDirectory(targetDir);
+      this.generator.recordPublished(result.bundle);
       return {
         success: true,
         mode: 'local',
@@ -73,6 +74,7 @@ export class SitePublisher {
         await sftp.uploadDir(stagingDir, settings.remotePath);
         await this.ensureRemoteSftpPermissions(sftp, stagingDir, settings.remotePath);
         await sftp.end();
+        this.generator.recordPublished(genResult.bundle);
         return {
           success: true,
           mode: 'sftp',
@@ -107,6 +109,7 @@ export class SitePublisher {
         await client.ensureDir(settings.remotePath);
         await client.uploadFromDir(stagingDir, settings.remotePath);
         client.close();
+        this.generator.recordPublished(genResult.bundle);
         return {
           success: true,
           mode: 'ftp',
@@ -283,6 +286,7 @@ export class SitePublisher {
         pagesNote = ' (Could not confirm GitHub Pages site settings — check them in the repo settings.)';
       }
 
+      this.generator.recordPublished(genResult.bundle);
       return {
         success: true,
         mode: 'github-pages',

@@ -1,18 +1,27 @@
 import * as fs from 'fs';
 import * as path from 'path';
+import * as http from 'http';
+import * as https from 'https';
+import * as net from 'net';
 import { StudioDatabase } from '../db/database';
 import {
   AlbumsDocumentSchema,
   ConnectionsDocumentSchema,
   DidDocumentSchema,
   FriendKeyStatus,
+  isUrlWithinSite,
   ItemsDocumentSchema,
   normalizeSiteUrl,
   ProfileDocumentSchema,
   verifyDocumentSignature,
-  WebringHubDocumentSchema,
   WebringManifestSchema,
 } from '../../src/shared/schema';
+import {
+  guardedLookup,
+  isPrivateNetworkAddress,
+  PrivateNetworkAddressError,
+  privatePeersAllowed,
+} from '../security/networkGuard';
 
 export interface CrawlSiteResult {
   siteUrl: string;
@@ -21,8 +30,14 @@ export interface CrawlSiteResult {
   itemsIndexed: number;
   photosIndexed: number;
   endorsementsFound: number;
+  /** Entries whose canonical URL pointed outside this friend's site (spoofing attempts). */
+  entriesRejected: number;
+  /** Feed rows and endorsements removed because the friend no longer publishes them. */
+  entriesPruned: number;
   verifiedSignature: boolean;
   keyChangedWarning?: boolean;
+  /** Set when the crawl was skipped because the site is blocked. */
+  blocked?: boolean;
   error?: string;
 }
 
@@ -52,18 +67,87 @@ export async function defaultJsonFetcher(urlOrPath: string): Promise<unknown> {
     const raw = fs.readFileSync(urlOrPath, 'utf8');
     return JSON.parse(raw);
   }
-  const response = await fetch(urlOrPath, {
-    headers: { Accept: 'application/json' },
-    signal: AbortSignal.timeout(10000),
+  return JSON.parse(await fetchPublicText(urlOrPath));
+}
+
+const MAX_REDIRECTS = 3;
+const FETCH_TIMEOUT_MS = 10000;
+
+/**
+ * GETs a URL on the public internet only (see `electron/security/networkGuard.ts`). Every hop,
+ * including redirects, is checked against the address actually connected to.
+ */
+function fetchPublicText(rawUrl: string, redirectsLeft = MAX_REDIRECTS): Promise<string> {
+  return new Promise((resolve, reject) => {
+    let url: URL;
+    try {
+      url = new URL(rawUrl);
+    } catch {
+      reject(new Error(`Invalid URL: ${rawUrl}`));
+      return;
+    }
+    if (url.protocol !== 'http:' && url.protocol !== 'https:') {
+      reject(new Error(`Unsupported protocol in ${rawUrl}`));
+      return;
+    }
+    // Node skips the DNS lookup for IP literals, so check those here
+    const literalHost = url.hostname.replace(/^\[|\]$/g, '');
+    if (net.isIP(literalHost) && !privatePeersAllowed() && isPrivateNetworkAddress(literalHost)) {
+      reject(new PrivateNetworkAddressError(url.hostname, literalHost));
+      return;
+    }
+
+    const client = url.protocol === 'https:' ? https : http;
+    const req = client.get(
+      url,
+      {
+        // Some hosts (including api.github.com) refuse requests without a User-Agent
+        headers: { Accept: 'application/json', 'User-Agent': 'WebringStudio/1.0 (+ring crawler)' },
+        lookup: guardedLookup,
+        timeout: FETCH_TIMEOUT_MS,
+      },
+      (res) => {
+        const status = res.statusCode || 0;
+        if (status >= 300 && status < 400 && res.headers.location) {
+          res.resume();
+          if (redirectsLeft <= 0) {
+            reject(new Error(`Too many redirects fetching ${rawUrl}`));
+            return;
+          }
+          fetchPublicText(new URL(res.headers.location, url).toString(), redirectsLeft - 1).then(
+            resolve,
+            reject
+          );
+          return;
+        }
+        if (status < 200 || status >= 300) {
+          res.resume();
+          reject(new Error(`HTTP ${status} fetching ${rawUrl}`));
+          return;
+        }
+        const chunks: Buffer[] = [];
+        let total = 0;
+        res.on('data', (chunk: Buffer) => {
+          total += chunk.length;
+          if (total > MAX_JSON_BYTES) {
+            req.destroy(new Error(`Response from ${rawUrl} exceeds 5MB safety limit`));
+            return;
+          }
+          chunks.push(chunk);
+        });
+        res.on('end', () => resolve(Buffer.concat(chunks).toString('utf8')));
+        res.on('error', reject);
+      }
+    );
+    // `timeout` only covers idle sockets; also cap the whole request
+    const deadline = setTimeout(
+      () => req.destroy(new Error(`Timed out fetching ${rawUrl}`)),
+      FETCH_TIMEOUT_MS
+    );
+    req.on('close', () => clearTimeout(deadline));
+    req.on('timeout', () => req.destroy(new Error(`Timed out fetching ${rawUrl}`)));
+    req.on('error', reject);
   });
-  if (!response.ok) {
-    throw new Error(`HTTP ${response.status} fetching ${urlOrPath}`);
-  }
-  const rawText = await response.text();
-  if (rawText.length > MAX_JSON_BYTES) {
-    throw new Error(`Response from ${urlOrPath} exceeds 5MB safety limit`);
-  }
-  return JSON.parse(rawText);
 }
 
 export class RingCrawler {
@@ -84,6 +168,20 @@ export class RingCrawler {
     localDirOverride?: string
   ): Promise<CrawlSiteResult> {
     const normalizedFriendUrl = normalizeSiteUrl(friendSiteUrl);
+    if (this.db.getModerationAction(normalizedFriendUrl) === 'block') {
+      return {
+        siteUrl: normalizedFriendUrl,
+        success: false,
+        itemsIndexed: 0,
+        photosIndexed: 0,
+        endorsementsFound: 0,
+        entriesRejected: 0,
+        entriesPruned: 0,
+        verifiedSignature: false,
+        blocked: true,
+        error: 'Site is blocked; skipped crawl.',
+      };
+    }
     const myProfile = this.db.getProfile();
     const mySiteUrl = normalizeSiteUrl(myProfile.siteUrl);
 
@@ -125,7 +223,13 @@ export class RingCrawler {
       const existingFriend = this.db
         .getFriends()
         .find((f) => normalizeSiteUrl(f.siteUrl) === normalizedFriendUrl);
-      const existingPinnedKey = existingFriend?.pinnedPublicKeyPem || '';
+      // One pinned key per site, shared with ring hubs and members (site_keys)
+      const existingPinnedKey =
+        this.db.getSiteKey(normalizedFriendUrl)?.publicKeyPem || existingFriend?.pinnedPublicKeyPem || '';
+      if (fetchedPublicKeyPem) {
+        // Pins on first sight; marks the site 'changed' if the key differs from the pinned one
+        this.db.pinSiteKey(normalizedFriendUrl, manifest.did, fetchedPublicKeyPem);
+      }
 
       let keyChangedWarning = false;
       let keyStatus: FriendKeyStatus = existingFriend?.keyStatus || 'unverified';
@@ -177,11 +281,14 @@ export class RingCrawler {
         did: profile.did,
         pinnedPublicKeyPem: pinnedKeyToSave || undefined,
         keyStatus,
+        lastCrawledAt: new Date().toISOString(),
       });
 
       let photosIndexed = 0;
       let itemsIndexed = 0;
       let endorsementsFound = 0;
+      let entriesRejected = 0;
+      let entriesPruned = 0;
       let isAlbumsVerified = true;
       let isItemsVerified = true;
 
@@ -198,9 +305,15 @@ export class RingCrawler {
             : false;
 
         const photoVerified = isManifestVerified && isProfileVerified && isAlbumsVerified;
+        const seenPhotoUrls: string[] = [];
 
         for (const album of albumsDoc.albums) {
           for (const photo of album.photos) {
+            if (!isUrlWithinSite(photo.canonicalUrl, normalizedFriendUrl)) {
+              entriesRejected++;
+              continue;
+            }
+            seenPhotoUrls.push(photo.canonicalUrl);
             const fullPhotoUrl = photo.url.startsWith('http')
               ? photo.url
               : `${normalizedFriendUrl}/${photo.url.replace(/^\/+/, '')}`;
@@ -222,6 +335,11 @@ export class RingCrawler {
             photosIndexed++;
           }
         }
+
+        // Only a verified document may delete rows, so a hijacked or tampered site can't wipe the feed
+        if (photoVerified) {
+          entriesPruned += this.db.pruneFriendFeed(normalizedFriendUrl, 'photos', seenPhotoUrls);
+        }
       } catch {
         // Continue if albums.json is missing
       }
@@ -239,8 +357,14 @@ export class RingCrawler {
             : false;
 
         const itemVerified = isManifestVerified && isProfileVerified && isItemsVerified;
+        const seenItemUrls: string[] = [];
 
         for (const item of itemsDoc.items) {
+          if (!isUrlWithinSite(item.canonicalUrl, normalizedFriendUrl)) {
+            entriesRejected++;
+            continue;
+          }
+          seenItemUrls.push(item.canonicalUrl);
           this.db.upsertNetworkFeedEntry({
             friendSiteUrl: normalizedFriendUrl,
             friendName: profile.displayName,
@@ -274,6 +398,11 @@ export class RingCrawler {
             endorsementsFound++;
           }
         }
+
+        if (itemVerified) {
+          entriesPruned += this.db.pruneFriendFeed(normalizedFriendUrl, 'items', seenItemUrls);
+          entriesPruned += this.db.pruneEndorsementsFrom(normalizedFriendUrl, seenItemUrls);
+        }
       } catch {
         // Continue if items.json is missing
       }
@@ -300,6 +429,8 @@ export class RingCrawler {
         itemsIndexed,
         photosIndexed,
         endorsementsFound,
+        entriesRejected,
+        entriesPruned,
         verifiedSignature: allVerified,
         keyChangedWarning,
       };
@@ -310,6 +441,8 @@ export class RingCrawler {
         itemsIndexed: 0,
         photosIndexed: 0,
         endorsementsFound: 0,
+        entriesRejected: 0,
+        entriesPruned: 0,
         verifiedSignature: false,
         error: err instanceof Error ? err.message : String(err),
       };
@@ -328,50 +461,4 @@ export class RingCrawler {
     }
     return results;
   }
-
-  /**
-   * Fetches a remote Webring Hub JSON (`webring-hub.json`), computes our `prevSiteUrl` and `nextSiteUrl`
-   * neighbors in the ring, and updates the local webring record.
-   */
-  public async syncWebringHub(hubUrl: string): Promise<{
-    name: string;
-    memberCount: number;
-    prevSiteUrl?: string;
-    nextSiteUrl?: string;
-  }> {
-    const rawHub = await this.fetcher(hubUrl);
-    const hub = WebringHubDocumentSchema.parse(rawHub);
-    const mySiteUrl = normalizeSiteUrl(this.db.getProfile().siteUrl);
-
-    const members = hub.members.map((m) => normalizeSiteUrl(m.siteUrl));
-    let prevSiteUrl: string | undefined;
-    let nextSiteUrl: string | undefined;
-
-    if (members.length > 0) {
-      const myIdx = members.indexOf(mySiteUrl);
-      if (myIdx !== -1 && members.length > 1) {
-        prevSiteUrl = members[(myIdx - 1 + members.length) % members.length];
-        nextSiteUrl = members[(myIdx + 1) % members.length];
-      } else {
-        prevSiteUrl = members[members.length - 1];
-        nextSiteUrl = members[0];
-      }
-    }
-
-    this.db.addWebring({
-      name: hub.name,
-      hubUrl,
-      description: hub.description,
-      prevSiteUrl,
-      nextSiteUrl,
-    });
-
-    return {
-      name: hub.name,
-      memberCount: members.length,
-      prevSiteUrl,
-      nextSiteUrl,
-    };
-  }
 }
-

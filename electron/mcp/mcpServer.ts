@@ -2,6 +2,7 @@ import * as path from 'path';
 import * as fs from 'fs';
 import { PersonaManager, ActivePersonaContext } from '../services/personaManager';
 import { LocalPreviewServer } from '../services/localPreviewServer';
+import { jobNextRunAt, Scheduler, SchedulePreset } from '../services/scheduler';
 import {
   FriendVisibility,
   isValidAdSlotId,
@@ -79,6 +80,27 @@ export class WebringMcpServer {
     private onActivity?: (entry: McpActivityLogEntry) => void
   ) {
     this.previewServer = previewServer || new LocalPreviewServer();
+  }
+
+  private attachedScheduler: Scheduler | null = null;
+
+  /** The running app attaches its scheduler; the stdio CLI only edits the schedule file. */
+  public attachScheduler(scheduler: Scheduler): void {
+    this.attachedScheduler = scheduler;
+  }
+
+  private getScheduler(): Scheduler {
+    return (
+      this.attachedScheduler ||
+      new Scheduler({
+        configPath: path.join(this.userDataDir, 'scheduler.json'),
+        listPersonaIds: () => this.personaManager.listPersonaRecords().map((p) => p.id),
+        runner: {
+          sync: () => Promise.reject(new Error('Open Webring Studio to run scheduled jobs.')),
+          publish: () => Promise.reject(new Error('Open Webring Studio to run scheduled jobs.')),
+        },
+      })
+    );
   }
 
   public getActivityLog(): McpActivityLogEntry[] {
@@ -474,8 +496,22 @@ export class WebringMcpServer {
         },
       },
       {
+        name: 'webring_set_moderation',
+        description:
+          'Mute or block a site (or clear it with action "none"). Mute hides it from the local feed; block also drops its endorsements from the published site and stops crawling it.',
+        inputSchema: {
+          type: 'object',
+          properties: {
+            personaId: personaIdProp,
+            siteUrl: { type: 'string' },
+            action: { type: 'string', enum: ['mute', 'block', 'none'] },
+          },
+          required: ['siteUrl', 'action'],
+        },
+      },
+      {
         name: 'webring_delete_friend',
-        description: 'Remove a friend from the persona’s local ring.',
+        description: 'Remove a friend from the persona’s local ring, along with their crawled posts and endorsements.',
         inputSchema: {
           type: 'object',
           properties: {
@@ -556,16 +592,118 @@ export class WebringMcpServer {
         },
       },
       {
-        name: 'webring_sync_webring_hub',
+        name: 'webring_list_rings',
         description:
-          'Fetch a remote webring-hub.json directory URL and update our prevSiteUrl / nextSiteUrl ring navigation links.',
+          'List the rings this persona has joined (with status: requested, member, removed, closed, legacy) and the rings it hosts as maintainer (with members and bans).',
+        inputSchema: { type: 'object', properties: { personaId: personaIdProp } },
+      },
+      {
+        name: 'webring_join_ring',
+        description:
+          'Verify a ring hub (https URL of its signed hub JSON) and create a private signed join request. Returns a webring://ring-request link the user must send to the ring maintainer. The persona’s site must already be published.',
         inputSchema: {
           type: 'object',
           properties: {
             personaId: personaIdProp,
-            hubUrl: { type: 'string', description: 'URL or path to webring-hub.json.' },
+            hubUrl: { type: 'string', description: 'https URL of the ring’s hub JSON.' },
           },
           required: ['hubUrl'],
+        },
+      },
+      {
+        name: 'webring_leave_ring',
+        description:
+          'Leave a joined ring (or cancel a request). The ring stops appearing on the site at the next publish; the maintainer’s Studio notices on its next sync.',
+        inputSchema: {
+          type: 'object',
+          properties: { personaId: personaIdProp, ringId: { type: 'string' } },
+          required: ['ringId'],
+        },
+      },
+      {
+        name: 'webring_sync_rings',
+        description:
+          'Refresh joined rings from their hubs (membership, neighbours, removals) and check hosted rings’ members (leavers are removed after a grace period).',
+        inputSchema: { type: 'object', properties: { personaId: personaIdProp } },
+      },
+      {
+        name: 'webring_create_hosted_ring',
+        description: 'Create a new ring this persona maintains. It is published as a signed hub at the next publish.',
+        inputSchema: {
+          type: 'object',
+          properties: {
+            personaId: personaIdProp,
+            name: { type: 'string' },
+            description: { type: 'string' },
+          },
+          required: ['name'],
+        },
+      },
+      {
+        name: 'webring_review_ring_request',
+        description:
+          'Check a webring://ring-request link sent by an applicant, and optionally approve, decline or ban. Without a decision nothing changes. Approvals go live at the next publish.',
+        inputSchema: {
+          type: 'object',
+          properties: {
+            personaId: personaIdProp,
+            requestLink: { type: 'string' },
+            decision: { type: 'string', enum: ['approve', 'decline', 'ban'] },
+            reason: { type: 'string', description: 'Private note kept with a ban.' },
+          },
+          required: ['requestLink'],
+        },
+      },
+      {
+        name: 'webring_get_schedule',
+        description:
+          'Show the persona’s sync and publish schedules (preset, next run, last result) and the app-level background settings.',
+        inputSchema: { type: 'object', properties: { personaId: personaIdProp } },
+      },
+      {
+        name: 'webring_set_schedule',
+        description:
+          'Set the persona’s schedules. Presets: {"kind":"interval","minutes":15|60|360|720}, {"kind":"daily","time":"HH:MM"}, {"kind":"weekly","weekday":0-6,"time":"HH:MM"}. Publish destinations: local, remote (SFTP/FTP), github. Scheduled publishes skip when nothing changed. Jobs run while Webring Studio is open or in the menu bar.',
+        inputSchema: {
+          type: 'object',
+          properties: {
+            personaId: personaIdProp,
+            syncEnabled: { type: 'boolean' },
+            syncPreset: { type: 'object' },
+            publishEnabled: { type: 'boolean' },
+            publishPreset: { type: 'object' },
+            publishDestination: { type: 'string', enum: ['local', 'remote', 'github'] },
+            syncBeforePublish: { type: 'boolean' },
+          },
+        },
+      },
+      {
+        name: 'webring_run_scheduled_job',
+        description:
+          'Run the persona’s scheduled sync or publish right now (publish skips if nothing changed). Needs the Webring Studio app; the stdio server can only edit schedules.',
+        inputSchema: {
+          type: 'object',
+          properties: {
+            personaId: personaIdProp,
+            job: { type: 'string', enum: ['sync', 'publish'] },
+          },
+          required: ['job'],
+        },
+      },
+      {
+        name: 'webring_set_ring_member',
+        description:
+          'Manage a member of a hosted ring: remove, ban, unban, hide or show in rotation, or move up/down.',
+        inputSchema: {
+          type: 'object',
+          properties: {
+            personaId: personaIdProp,
+            ringId: { type: 'string' },
+            siteUrl: { type: 'string' },
+            action: { type: 'string', enum: ['remove', 'ban', 'unban', 'hide', 'show', 'up', 'down'] },
+            reason: { type: 'string' },
+          },
+          required: ['ringId', 'siteUrl', 'action'],
         },
       },
 
@@ -824,7 +962,6 @@ export class WebringMcpServer {
             'publishFriendsList',
             'stripRelationshipTags',
             'publishEndorsements',
-            'publishWebringHub',
             'redactItemSourceAuthors',
             'commentProvider',
             'giscusRepo',
@@ -1036,6 +1173,16 @@ export class WebringMcpServer {
           break;
         }
 
+        case 'webring_set_moderation': {
+          const ctx = this.resolveContext(args);
+          const siteUrl = String(args.siteUrl || '');
+          const action =
+            args.action === 'mute' || args.action === 'block' ? args.action : null;
+          resultData = { moderation: ctx.db.setModeration(siteUrl, action) };
+          summary = `Set moderation for ${siteUrl} to ${action || 'none'}`;
+          break;
+        }
+
         case 'webring_delete_friend': {
           const ctx = this.resolveContext(args);
           const friendId = String(args.friendId || '');
@@ -1063,8 +1210,8 @@ export class WebringMcpServer {
           resultData = {
             crawledCount: results.length,
             results,
-            totalEndorsements: ctx.db.getEndorsements().length,
-            totalFeedEntries: ctx.db.getNetworkFeed().length,
+            totalEndorsements: ctx.db.getCuratedEndorsements().entries.length,
+            totalFeedEntries: ctx.db.getCuratedNetworkFeed().entries.length,
           };
           summary = `Crawled all ${results.length} friend(s) in ring`;
           break;
@@ -1072,7 +1219,8 @@ export class WebringMcpServer {
 
         case 'webring_get_neighborhood_feed': {
           const ctx = this.resolveContext(args);
-          let feed = ctx.db.getNetworkFeed();
+          const curated = ctx.db.getCuratedNetworkFeed();
+          let feed = curated.entries;
           if (typeof args.entryType === 'string' && args.entryType) {
             feed = feed.filter((e) => e.entryType === args.entryType);
           }
@@ -1086,25 +1234,182 @@ export class WebringMcpServer {
           }
           const limit = typeof args.limit === 'number' && args.limit > 0 ? args.limit : 50;
           feed = feed.slice(0, limit);
-          resultData = { count: feed.length, entries: feed };
+          resultData = { count: feed.length, entries: feed, excluded: curated.excluded };
           summary = `Retrieved ${feed.length} Neighborhood Feed entries`;
           break;
         }
 
         case 'webring_get_endorsements': {
           const ctx = this.resolveContext(args);
-          const endorsements = ctx.db.getEndorsements();
-          resultData = { count: endorsements.length, endorsements };
+          const curated = ctx.db.getCuratedEndorsements();
+          const endorsements = curated.entries;
+          resultData = { count: endorsements.length, endorsements, excluded: curated.excluded };
           summary = `Retrieved ${endorsements.length} peer endorsement(s)/comment(s)`;
           break;
         }
 
-        case 'webring_sync_webring_hub': {
+        case 'webring_list_rings': {
           const ctx = this.resolveContext(args);
-          const hubUrl = String(args.hubUrl || '');
-          const synced = await ctx.ringCrawler.syncWebringHub(hubUrl);
-          resultData = synced;
-          summary = `Synced webring hub "${synced.name}" (${synced.memberCount} members)`;
+          resultData = {
+            joined: ctx.db.getJoinedRings().map(({ requestToken: _t, ...ring }) => ring),
+            hosted: ctx.db.getHostedRings(),
+          };
+          summary = 'Listed joined and hosted rings';
+          break;
+        }
+
+        case 'webring_join_ring': {
+          const ctx = this.resolveContext(args);
+          const res = await ctx.ringService.requestToJoin(String(args.hubUrl || ''));
+          resultData = res;
+          summary = `Created a join request for "${res.ring.name}"`;
+          break;
+        }
+
+        case 'webring_leave_ring': {
+          const ctx = this.resolveContext(args);
+          const ringId = String(args.ringId || '');
+          ctx.db.deleteWebring(ringId);
+          resultData = { left: true, ringId };
+          summary = `Left ring ${ringId}`;
+          break;
+        }
+
+        case 'webring_sync_rings': {
+          const ctx = this.resolveContext(args);
+          resultData = {
+            joined: await ctx.ringService.syncJoinedRings(),
+            hosted: await ctx.ringService.syncHostedRings(),
+          };
+          summary = 'Synced joined and hosted rings';
+          break;
+        }
+
+        case 'webring_create_hosted_ring': {
+          const ctx = this.resolveContext(args);
+          const ring = ctx.db.createHostedRing({
+            name: String(args.name || ''),
+            description: args.description ? String(args.description) : undefined,
+          });
+          resultData = ring;
+          summary = `Created hosted ring "${ring.name}"`;
+          break;
+        }
+
+        case 'webring_review_ring_request': {
+          const ctx = this.resolveContext(args);
+          const link = String(args.requestLink || '');
+          const decision =
+            args.decision === 'approve' || args.decision === 'decline' || args.decision === 'ban'
+              ? args.decision
+              : undefined;
+          const review = decision
+            ? await ctx.ringService.decideRequest(link, decision, args.reason ? String(args.reason) : undefined)
+            : await ctx.ringService.reviewRequest(link);
+          const { token: _token, ...publicReview } = review;
+          resultData = { ...publicReview, decision: decision || 'none' };
+          summary = decision
+            ? `${decision} ${review.applicant.siteUrl} for "${review.ring.name}"`
+            : `Reviewed request from ${review.applicant.siteUrl}`;
+          break;
+        }
+
+        case 'webring_get_schedule': {
+          const ctx = this.resolveContext(args);
+          const scheduler = this.getScheduler();
+          const config = scheduler.loadConfig();
+          const schedule = scheduler.getPersonaSchedule(ctx.persona.id);
+          resultData = {
+            personaId: ctx.persona.id,
+            schedule,
+            nextSyncAt: schedule.sync.enabled ? jobNextRunAt(schedule.sync).toISOString() : null,
+            nextPublishAt: schedule.publish.enabled ? jobNextRunAt(schedule.publish).toISOString() : null,
+            app: {
+              runInBackground: config.runInBackground,
+              startAtLogin: config.startAtLogin,
+              paused: config.paused,
+            },
+            appRunning: Boolean(this.attachedScheduler),
+          };
+          summary = `Read schedules for ${ctx.persona.label}`;
+          break;
+        }
+
+        case 'webring_set_schedule': {
+          const ctx = this.resolveContext(args);
+          const isPreset = (value: unknown): value is SchedulePreset => {
+            const v = value as Record<string, unknown> | null;
+            if (!v || typeof v !== 'object') return false;
+            if (v.kind === 'interval') return [15, 60, 360, 720].includes(Number(v.minutes));
+            const timeOk = typeof v.time === 'string' && /^\d{1,2}:\d{2}$/.test(v.time);
+            if (v.kind === 'daily') return timeOk;
+            return v.kind === 'weekly' && timeOk && Number.isInteger(v.weekday) && Number(v.weekday) >= 0 && Number(v.weekday) <= 6;
+          };
+          for (const key of ['syncPreset', 'publishPreset']) {
+            if (args[key] !== undefined && !isPreset(args[key])) {
+              throw new Error(`${key} isn't a valid preset`);
+            }
+          }
+          const destination = args.publishDestination;
+          if (destination !== undefined && !['local', 'remote', 'github'].includes(String(destination))) {
+            throw new Error('publishDestination must be local, remote or github');
+          }
+          const updated = this.getScheduler().setPersonaSchedule(ctx.persona.id, {
+            sync: {
+              ...(typeof args.syncEnabled === 'boolean' ? { enabled: args.syncEnabled } : {}),
+              ...(args.syncPreset ? { preset: args.syncPreset as SchedulePreset } : {}),
+            },
+            publish: {
+              ...(typeof args.publishEnabled === 'boolean' ? { enabled: args.publishEnabled } : {}),
+              ...(args.publishPreset ? { preset: args.publishPreset as SchedulePreset } : {}),
+              ...(destination ? { destination: destination as 'local' | 'remote' | 'github' } : {}),
+              ...(typeof args.syncBeforePublish === 'boolean' ? { syncFirst: args.syncBeforePublish } : {}),
+            },
+          });
+          resultData = { personaId: ctx.persona.id, schedule: updated };
+          summary = `Updated schedules for ${ctx.persona.label}`;
+          break;
+        }
+
+        case 'webring_run_scheduled_job': {
+          const ctx = this.resolveContext(args);
+          if (!this.attachedScheduler) {
+            throw new Error('Open Webring Studio to run scheduled jobs (the stdio server can only edit schedules).');
+          }
+          const job = args.job === 'publish' ? 'publish' : 'sync';
+          const result = await this.attachedScheduler.runNow(ctx.persona.id, job);
+          resultData = result;
+          summary = `Ran ${job} for ${ctx.persona.label}: ${result.status}`;
+          break;
+        }
+
+        case 'webring_set_ring_member': {
+          const ctx = this.resolveContext(args);
+          const ringId = String(args.ringId || '');
+          const siteUrl = String(args.siteUrl || '');
+          const reason = args.reason ? String(args.reason) : undefined;
+          switch (args.action) {
+            case 'remove':
+              resultData = ctx.db.removeRingMember(ringId, siteUrl);
+              break;
+            case 'ban':
+              resultData = ctx.db.banRingMember(ringId, { siteUrl, reason });
+              break;
+            case 'unban':
+              resultData = ctx.db.unbanRingMember(ringId, siteUrl);
+              break;
+            case 'hide':
+            case 'show':
+              resultData = ctx.db.setRingMemberHidden(ringId, siteUrl, args.action === 'hide');
+              break;
+            case 'up':
+            case 'down':
+              resultData = ctx.db.moveRingMember(ringId, siteUrl, args.action);
+              break;
+            default:
+              throw new Error(`Unknown action ${String(args.action)}`);
+          }
+          summary = `${String(args.action)} ${siteUrl} in ring ${ringId}`;
           break;
         }
 
@@ -1375,10 +1680,10 @@ export class WebringMcpServer {
         payload = ctx.db.buildSignedSiteBundle();
         break;
       case 'webring://active/feed':
-        payload = ctx.db.getNetworkFeed();
+        payload = ctx.db.getCuratedNetworkFeed();
         break;
       case 'webring://active/endorsements':
-        payload = ctx.db.getEndorsements();
+        payload = ctx.db.getCuratedEndorsements();
         break;
       case 'webring://active/addons': {
         const p = ctx.db.getProfile();
