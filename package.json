@@ -11,10 +11,11 @@
     "build:vite": "vite build",
     "build:electron": "tsc -p tsconfig.electron.json",
     "build": "npm run build:vite && npm run build:electron",
-    "dev": "npm run build && electron .",
-    "start": "npm run build && electron .",
+    "dev": "npm run build && node scripts/brand-dev-electron.mjs && electron .",
+    "start": "npm run build && node scripts/brand-dev-electron.mjs && electron .",
     "mcp": "npm run build:electron && ELECTRON_RUN_AS_NODE=1 electron dist-electron/electron/mcp/cli.js",
-    "test": "vitest run"
+    "test": "vitest run",
+    "postinstall": "node scripts/brand-dev-electron.mjs"
   },
   "dependencies": {
     "basic-ftp": "^6.2.3",

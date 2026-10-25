@@ -166,6 +166,7 @@ Then configure your MCP client to run:
 | `npx tsc -p tsconfig.json --noEmit` | Type-check the UI |
 | `npx tsc -p tsconfig.electron.json --noEmit` | Type-check the Electron code |
 | `npm run mcp` | Build and start the stdio MCP server |
+| `node scripts/brand-dev-electron.mjs` | macOS: show "Webring Studio" and its icon in the Dock and app menu when running from source (runs automatically after `npm install` and before `npm run dev`) |
 | `python3 scripts/generate-icons.py` | Regenerate every app icon and branded image from `images/logo-icon.png` (macOS) |
 
 **No native modules.** Storage uses Node's built-in `node:sqlite`, available in Node 22.13+ (tests, stdio MCP server) and in Electron 45's bundled Node 24 (the app), so nothing is compiled during install. If `ELECTRON_RUN_AS_NODE=1` is set in your shell (some editors set it), `npm run dev` will fail to open a window; unset it first.
