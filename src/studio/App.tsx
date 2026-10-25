@@ -5,6 +5,7 @@ import {
   EndorsementItem,
   FriendConnection,
   FriendVisibility,
+  isPlaceholderSiteUrl,
   parseWebringUri,
   PersonaSummary,
   ProfileDocument,
@@ -412,15 +413,6 @@ declare global {
         message: string;
       }>;
       openPath: (targetPath: string) => Promise<unknown>;
-      simulatePeerSite: () => Promise<{
-        siteUrl: string;
-        success: boolean;
-        displayName?: string;
-        itemsIndexed: number;
-        photosIndexed: number;
-        endorsementsFound: number;
-        verifiedSignature: boolean;
-      }>;
       getMcpInfo?: () => Promise<{
         status: {
           running: boolean;
@@ -524,9 +516,9 @@ export const App: React.FC = () => {
   const [editingPersonaLabel, setEditingPersonaLabel] = useState('');
 
   // Profile form state
-  const [siteUrl, setSiteUrl] = useState('https://alex.indiering.social');
-  const [handle, setHandle] = useState('alex.indiering.social');
-  const [displayName, setDisplayName] = useState('Alex Rivera');
+  const [siteUrl, setSiteUrl] = useState('');
+  const [handle, setHandle] = useState('');
+  const [displayName, setDisplayName] = useState('');
   const [tagline, setTagline] = useState('');
   const [bio, setBio] = useState('');
   const [location, setLocation] = useState('');
@@ -1218,21 +1210,10 @@ export const App: React.FC = () => {
     notify(`Left Webring "${ring.name}".`);
   };
 
-  const handleSimulatePeerSync = async () => {
-    if (!window.studioApi) return;
-    const res = await window.studioApi.simulatePeerSite();
-    await refreshStudioData();
-    if (res.success) {
-      notify(
-        `Synced ${res.displayName}'s site! Indexed ${res.itemsIndexed} items, ${res.photosIndexed} photos, and discovered ${res.endorsementsFound} verified endorsement(s) of your content!`
-      );
-    }
-  };
-
   const handleSyncAllFriends = async () => {
     if (!window.studioApi || isSyncingFriends) return;
     if (allFriends.length === 0 && joinedRings.length === 0 && hostedRings.length === 0) {
-      notify('Nothing to sync yet. Add a friend or join a ring, or use "Add Demo Peer" in the Feed tab.');
+      notify('Nothing to sync yet. Add a friend or join a ring in Friends & Webrings.');
       return;
     }
     setIsSyncingFriends(true);
@@ -1788,6 +1769,24 @@ export const App: React.FC = () => {
 
         {/* Scrollable Workspace */}
         <div className="flex-1 overflow-y-auto p-6">
+          {isPlaceholderSiteUrl(bundle.profile.siteUrl) && activeTab !== 'profile' && (
+            <div className="max-w-5xl mx-auto mb-5 p-4 rounded-2xl bg-amber-500/10 border border-amber-500/30 flex flex-wrap items-center justify-between gap-3 text-sm">
+              <div>
+                <strong className="text-amber-200">Set up your profile first.</strong>{' '}
+                <span className="text-slate-300">
+                  Add your site's public address (for example <code>https://yourname.github.io</code>)
+                  and your name. Your identity and everything you publish are based on that address.
+                </span>
+              </div>
+              <button
+                type="button"
+                onClick={() => setActiveTab('profile')}
+                className="px-3 py-1.5 rounded-lg bg-amber-500/20 hover:bg-amber-500/30 text-amber-200 text-xs font-semibold"
+              >
+                Open Profile →
+              </button>
+            </div>
+          )}
           {/* TAB 1: PROFILE & IDENTITY */}
           {activeTab === 'profile' && (
             <div className="max-w-4xl mx-auto space-y-6">
@@ -2447,7 +2446,7 @@ export const App: React.FC = () => {
                           type="text"
                           value={itemAuthorName}
                           onChange={(e) => setItemAuthorName(e.target.value)}
-                          placeholder="e.g., Maya Lin"
+                          placeholder="e.g., Sam Okafor"
                           className="w-full px-3 py-2 rounded-xl bg-slate-950 border border-slate-800 text-sm"
                         />
                       </div>
@@ -2459,7 +2458,7 @@ export const App: React.FC = () => {
                           type="text"
                           value={itemAuthorUrl}
                           onChange={(e) => setItemAuthorUrl(e.target.value)}
-                          placeholder="https://maya.indiering.social"
+                          placeholder="https://author.example"
                           className="w-full px-3 py-2 rounded-xl bg-slate-950 border border-slate-800 text-sm"
                         />
                       </div>
@@ -2753,7 +2752,7 @@ export const App: React.FC = () => {
                         required
                         value={friendSiteUrl}
                         onChange={(e) => setFriendSiteUrl(e.target.value)}
-                        placeholder="https://friend.indiering.social"
+                        placeholder="https://friend.example"
                         className="w-full px-3 py-2 rounded-xl bg-slate-950 border border-slate-800 text-sm"
                       />
                     </div>
@@ -3538,13 +3537,6 @@ export const App: React.FC = () => {
                 </div>
                 <div className="flex flex-wrap items-center gap-2">
                   <button
-                    onClick={handleSimulatePeerSync}
-                    className="px-3 py-2 rounded-xl bg-slate-800 hover:bg-slate-700 text-xs font-medium"
-                    title="Generates a simulated peer site (Maya Lin) on disk and crawls it, for trying out the feed"
-                  >
-                    Add Demo Peer (Maya)
-                  </button>
-                  <button
                     onClick={handleSyncAllFriends}
                     disabled={isSyncingFriends}
                     className="px-4 py-2 rounded-xl bg-indigo-600 hover:bg-indigo-500 disabled:opacity-60 text-white font-semibold text-xs flex items-center gap-2 shadow"
@@ -3601,9 +3593,9 @@ export const App: React.FC = () => {
                   <Radio className="w-10 h-10 text-indigo-400 mx-auto" />
                   <h3 className="font-bold text-base">Your Neighborhood Feed is Ready</h3>
                   <p className="text-xs text-slate-400 max-w-md mx-auto">
-                    Click <strong>"Sync All Friends Now"</strong> above to crawl your friends'
-                    signed JSON endpoints, or <strong>"Add Demo Peer (Maya)"</strong> to try it with
-                    a simulated peer site.
+                    Add friends in <strong>Friends &amp; Webrings</strong>, then click{' '}
+                    <strong>"Sync All Friends Now"</strong> above to pull their signed posts and
+                    photos into your feed.
                   </p>
                 </div>
               ) : (
@@ -5407,8 +5399,8 @@ export const App: React.FC = () => {
                               JSON.stringify(
                                 {
                                   type: 'comment',
-                                  targetUrl: 'https://maya.indiering.social/api/items.json#item-1',
-                                  commentary: 'Awesome synth session!',
+                                  targetUrl: 'https://friend.example/api/items.json#item-1',
+                                  commentary: 'Love this!',
                                 },
                                 null,
                                 2
@@ -5528,8 +5520,8 @@ export const App: React.FC = () => {
                       </span>
                       <p className="text-slate-200 italic">
                         "Crawl all my friends in Webring Studio, summarize any new wall posts or
-                        photos in my Neighborhood Feed, and post a friendly comment on Maya's latest
-                        synth post."
+                        photos in my Neighborhood Feed, and post a friendly comment on the most
+                        interesting one."
                       </p>
                     </div>
                     <div className="p-3 rounded-xl bg-slate-950 border border-slate-800 space-y-1">
@@ -5771,10 +5763,6 @@ export const App: React.FC = () => {
                           <li>
                             <strong>Sync All Friends</strong> (top bar or Feed tab) crawls every
                             friend's signed JSON. Each friend card shows when it was last synced.
-                          </li>
-                          <li>
-                            New here? <strong>Add Demo Peer (Maya)</strong> in the Feed tab builds a
-                            simulated friend site so you can try the feed.
                           </li>
                           <li>
                             Use <strong>Mute</strong> or <strong>Block</strong> on a friend or feed
