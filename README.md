@@ -66,7 +66,7 @@ The first launch creates an empty primary persona. Start by setting your site's 
 2. **Add content.** Write wall posts, create albums and add photos.
 3. **Preview.** **Test Export & Preview** builds the site into a scratch folder and serves it on `127.0.0.1`, so you can check it in a browser before publishing.
 4. **Publish.** In **Publish & SFTP**, export to a folder, upload over SFTP/FTP, or push to GitHub Pages. The Publish tab shows when you last published and whether anything has changed since.
-5. **Add friends.** In **Friends & Webrings**, add a friend's site URL, then **Sync All Friends**. Their posts appear in your **Neighborhood Feed**.
+5. **Add friends.** In **Friends & Webrings**, add a friend's site URL, then **Sync All Friends**. Their posts appear in your **Neighborhood Feed**. The feed shows **Friends only** by default; switch to **Everyone** to see your own posts and photos in the same timeline (with friends' replies threaded under them), or **Just me**.
 6. **Join or start a webring** (see below), and **set a schedule** so syncing and publishing happen on their own.
 
 The in-app **Help & Deploy Guide** tab has step-by-step guides for GitHub Pages, SFTP/FTP hosting, add-ons, webrings and MCP.

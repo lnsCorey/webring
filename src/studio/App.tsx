@@ -247,6 +247,18 @@ function formatRelativeTime(iso: string): string {
   return `${days} day${days === 1 ? '' : 's'} ago`;
 }
 
+type FeedScope = 'friends' | 'everyone' | 'me';
+const FEED_SCOPE_KEY = 'webring-studio.feedScope';
+
+function loadFeedScope(): FeedScope {
+  try {
+    const stored = window.localStorage.getItem(FEED_SCOPE_KEY);
+    return stored === 'everyone' || stored === 'me' ? stored : 'friends';
+  } catch {
+    return 'friends';
+  }
+}
+
 interface NetworkFeedEntry {
   id: string;
   friendSiteUrl: string;
@@ -262,6 +274,8 @@ interface NetworkFeedEntry {
   tags: string[];
   createdAt: string;
   verifiedSignature: boolean;
+  /** Your own post or photo, shown in the feed (never stored with friends' entries). */
+  isMine?: boolean;
 }
 
 interface TestExportPreviewState {
@@ -514,6 +528,15 @@ export const App: React.FC = () => {
   const [allFriends, setAllFriends] = useState<FriendConnection[]>([]);
   const [allEndorsements, setAllEndorsements] = useState<EndorsementItem[]>([]);
   const [networkFeed, setNetworkFeed] = useState<NetworkFeedEntry[]>([]);
+  const [feedScope, setFeedScopeState] = useState<FeedScope>(loadFeedScope);
+  const setFeedScope = (scope: FeedScope) => {
+    setFeedScopeState(scope);
+    try {
+      window.localStorage.setItem(FEED_SCOPE_KEY, scope);
+    } catch {
+      // Not remembered this time; the default still works
+    }
+  };
   const [feedExclusions, setFeedExclusions] = useState<FeedExclusions>({
     muted: 0,
     blocked: 0,
@@ -1655,6 +1678,63 @@ export const App: React.FC = () => {
       </div>
     );
   }
+
+  // Your own posts and photos, in the feed's shape. Built for display only: friends' entries come
+  // from crawled, verified data, and yours are never mixed into that store.
+  const myFeedEntries: NetworkFeedEntry[] = [
+    ...bundle.items.items
+      .filter((item) => item.type !== 'comment')
+      .map((item) => ({
+        id: `mine-${item.id}`,
+        friendSiteUrl: bundle.profile.siteUrl,
+        friendName: bundle.profile.displayName,
+        friendAvatarUrl: bundle.profile.avatarUrl,
+        friendDid: bundle.profile.did,
+        entryType: item.type,
+        title: item.title,
+        canonicalUrl: item.canonicalUrl,
+        targetUrl: item.targetUrl,
+        commentary: item.commentary || '',
+        mediaUrl: item.mediaUrl || '',
+        tags: item.tags,
+        createdAt: item.createdAt,
+        verifiedSignature: true,
+        isMine: true,
+      })),
+    ...bundle.albums.albums.flatMap((album) =>
+      album.photos.map((photo) => ({
+        id: `mine-${photo.id}`,
+        friendSiteUrl: bundle.profile.siteUrl,
+        friendName: bundle.profile.displayName,
+        friendAvatarUrl: bundle.profile.avatarUrl,
+        friendDid: bundle.profile.did,
+        entryType: 'photo' as const,
+        title: photo.caption || `${album.title} Photo`,
+        canonicalUrl: photo.canonicalUrl,
+        targetUrl: photo.url,
+        commentary: `Published in album "${album.title}"`,
+        mediaUrl: photo.thumbUrl || photo.url,
+        tags: photo.tags,
+        createdAt: photo.createdAt,
+        verifiedSignature: true,
+        isMine: true,
+      }))
+    ),
+  ];
+  const visibleFeed = (
+    feedScope === 'friends' ? networkFeed : feedScope === 'me' ? myFeedEntries : [...networkFeed, ...myFeedEntries]
+  )
+    .filter((entry) => entry.entryType !== 'comment')
+    .sort((a, b) => b.createdAt.localeCompare(a.createdAt));
+
+  const handleDeleteMyFeedEntry = async (entry: NetworkFeedEntry) => {
+    if (!window.studioApi) return;
+    if (!window.confirm(`Delete "${entry.title}"? It's removed from your site at the next publish.`)) return;
+    const id = entry.id.replace(/^mine-/, '');
+    if (entry.entryType === 'photo') await window.studioApi.deletePhoto(id);
+    else await window.studioApi.deleteItem(id);
+    await refreshStudioData();
+  };
 
   const navItems: Array<{ id: StudioTab; label: string; icon: React.ReactNode; badge?: number }> = [
     { id: 'profile', label: 'Profile & Identity', icon: <UserCheck className="w-4 h-4" /> },
@@ -3734,6 +3814,28 @@ export const App: React.FC = () => {
                   </p>
                 </div>
                 <div className="flex flex-wrap items-center gap-2">
+                  <div className="flex rounded-xl bg-slate-900 border border-slate-800 p-1 text-xs" role="tablist" aria-label="Show posts from">
+                    {(
+                      [
+                        ['friends', 'Friends only'],
+                        ['everyone', 'Everyone'],
+                        ['me', 'Just me'],
+                      ] as const
+                    ).map(([scope, label]) => (
+                      <button
+                        key={scope}
+                        type="button"
+                        role="tab"
+                        aria-selected={feedScope === scope}
+                        onClick={() => setFeedScope(scope)}
+                        className={`px-3 py-1.5 rounded-lg font-medium transition ${
+                          feedScope === scope ? 'bg-indigo-600 text-white' : 'text-slate-400 hover:text-white'
+                        }`}
+                      >
+                        {label}
+                      </button>
+                    ))}
+                  </div>
                   <button
                     onClick={handleSyncAllFriends}
                     disabled={isSyncingFriends}
@@ -3746,8 +3848,8 @@ export const App: React.FC = () => {
               </div>
 
               <p className="text-xs text-slate-400">
-                Showing {networkFeed.length} entr{networkFeed.length === 1 ? 'y' : 'ies'} from{' '}
-                {new Set(networkFeed.map((e) => e.friendSiteUrl)).size} site(s)
+                Showing {visibleFeed.length} entr{visibleFeed.length === 1 ? 'y' : 'ies'} from{' '}
+                {new Set(visibleFeed.map((e) => e.friendSiteUrl)).size} site(s)
                 {feedExclusions.muted + feedExclusions.blocked > 0 &&
                   ` · ${feedExclusions.muted + feedExclusions.blocked} hidden (muted ${feedExclusions.muted}, blocked ${feedExclusions.blocked})`}
                 {feedExclusions.unverified > 0 &&
@@ -3786,20 +3888,30 @@ export const App: React.FC = () => {
                 </div>
               )}
 
-              {networkFeed.length === 0 ? (
+              {visibleFeed.length === 0 ? (
                 <div className="bg-slate-900 border border-slate-800 rounded-2xl p-10 text-center space-y-3">
                   <Radio className="w-10 h-10 text-indigo-400 mx-auto" />
-                  <h3 className="font-bold text-base">Your Neighborhood Feed is Ready</h3>
-                  <p className="text-xs text-slate-400 max-w-md mx-auto">
-                    Add friends in <strong>Friends &amp; Webrings</strong>, then click{' '}
-                    <strong>"Sync All Friends Now"</strong> above to pull their signed posts and
-                    photos into your feed.
-                  </p>
+                  {feedScope === 'me' ? (
+                    <>
+                      <h3 className="font-bold text-base">You haven't posted yet</h3>
+                      <p className="text-xs text-slate-400 max-w-md mx-auto">
+                        Your wall posts, likes, shares and photos appear here once you add them.
+                      </p>
+                    </>
+                  ) : (
+                    <>
+                      <h3 className="font-bold text-base">Your Neighborhood Feed is Ready</h3>
+                      <p className="text-xs text-slate-400 max-w-md mx-auto">
+                        Add friends in <strong>Friends &amp; Webrings</strong>, then click{' '}
+                        <strong>"Sync All Friends Now"</strong> above to pull their signed posts and
+                        photos into your feed.
+                      </p>
+                    </>
+                  )}
                 </div>
               ) : (
                 <div className="space-y-4">
-                  {networkFeed
-                    .filter((entry) => entry.entryType !== 'comment')
+                  {visibleFeed
                     .map((entry) => {
                       const peerComments = networkFeed.filter(
                         (c) => c.entryType === 'comment' && c.targetUrl === entry.canonicalUrl
@@ -3829,15 +3941,22 @@ export const App: React.FC = () => {
                                 <div className="min-w-0">
                                   <div className="flex items-center gap-2 flex-wrap">
                                     <span className="font-bold text-sm">{entry.friendName}</span>
-                                    {entry.verifiedSignature && (
-                                      <span className="text-[10px] px-2 py-0.5 rounded-full bg-emerald-500/20 text-emerald-400 font-mono">
-                                        ✓ Verified DID Signature
+                                    {entry.isMine ? (
+                                      <span className="text-[10px] px-2 py-0.5 rounded-full bg-indigo-500/20 text-indigo-300 font-semibold">
+                                        You
                                       </span>
+                                    ) : (
+                                      entry.verifiedSignature && (
+                                        <span className="text-[10px] px-2 py-0.5 rounded-full bg-emerald-500/20 text-emerald-400 font-mono">
+                                          ✓ Verified DID Signature
+                                        </span>
+                                      )
                                     )}
                                   </div>
                                   <p className="text-[11px] text-slate-400 font-mono truncate">
                                     {entry.friendSiteUrl}
                                   </p>
+                                  {!entry.isMine && (
                                   <div className="flex gap-2 mt-0.5 text-[10px]">
                                     <button
                                       onClick={() =>
@@ -3856,6 +3975,7 @@ export const App: React.FC = () => {
                                       Block
                                     </button>
                                   </div>
+                                  )}
                                 </div>
                               </div>
 
@@ -3886,6 +4006,23 @@ export const App: React.FC = () => {
                               Indexed Target: {entry.targetUrl}
                             </p>
 
+                            {entry.isMine ? (
+                              <div className="flex flex-wrap gap-2 pt-1">
+                                <button
+                                  onClick={() => window.studioApi?.openExternal(entry.friendSiteUrl)}
+                                  className="px-3 py-1.5 rounded-lg bg-slate-800 hover:bg-slate-700 text-xs font-medium flex items-center gap-1"
+                                  title="Opens your published site (as of your last publish)"
+                                >
+                                  <ExternalLink className="w-3.5 h-3.5" /> View my site
+                                </button>
+                                <button
+                                  onClick={() => handleDeleteMyFeedEntry(entry)}
+                                  className="px-3 py-1.5 rounded-lg bg-rose-950/40 hover:bg-rose-900/50 border border-rose-500/30 text-rose-300 text-xs font-medium flex items-center gap-1"
+                                >
+                                  <Trash2 className="w-3.5 h-3.5" /> Delete
+                                </button>
+                              </div>
+                            ) : (
                             <div className="flex flex-wrap gap-2 pt-1">
                               <button
                                 onClick={() =>
@@ -3932,6 +4069,7 @@ export const App: React.FC = () => {
                                 <Repeat2 className="w-3.5 h-3.5" /> Re-share
                               </button>
                             </div>
+                            )}
                           </div>
 
                           {/* Threaded Comments Under This Feed Post */}
@@ -5970,6 +6108,11 @@ export const App: React.FC = () => {
                           <li>
                             Removing a friend also deletes the posts and endorsements crawled from
                             their site.
+                          </li>
+                          <li>
+                            The feed shows <strong>Friends only</strong> by default. Choose{' '}
+                            <strong>Everyone</strong> to see your own posts and photos alongside
+                            theirs, with replies threaded under each, or <strong>Just me</strong>.
                           </li>
                         </ul>
                         <div className="flex gap-3 pt-1">
