@@ -87,6 +87,15 @@ A persona is a separate online identity: its own SQLite database, Ed25519 key, `
 
 If the keychain entry is lost, your signing key can't be recovered: you'd need a new key, and friends would see a key-changed warning.
 
+### Media Library
+
+The **Media Library** tab holds your photo albums. Add JPEG or PNG photos with **Add Photos** or by dropping them on an album, then caption them, add alt text, reorder them, pick a cover, or replace and delete photos.
+
+- **What gets published:** a web copy of each photo (longest side up to 2048 px) and a 480 px thumbnail, rotated upright, with all camera metadata, including GPS location, removed. Your originals stay on your computer.
+- **Signed album manifests:** each album is published with `media/albums/<album>/manifest.json`, signed with your key, listing every photo and the exact file behind it (URL, SHA-256 hash, size, dimensions). File names are based on the content, so a replaced photo gets a new URL and nobody sees a stale copy.
+- **Publishing only sends changes:** to a local folder, SFTP/FTP or GitHub Pages, Studio uploads only new or changed files and removes photos you deleted. It only ever removes files it published itself; anything else on your server or in your repo is left alone. If files there were changed by hand, use **Re-upload everything at next publish**.
+- **Friends see changes on their next sync:** replaced photos update, and removed ones disappear from their feed.
+
 ### Webrings
 
 A webring is a circle of sites linked by **← Prev**, **Next →** and **Random**. Each ring has a **maintainer** who decides who's in it. Everything still runs on static files:

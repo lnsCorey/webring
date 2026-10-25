@@ -25,6 +25,12 @@ friend's /api/*.json ──crawl+verify──▶ SQLite (internal state) ──c
 - **Exchange format** is the set of signed documents that `buildSignedSiteBundle()` produces (`did.json`, `manifest`, `profile`, `albums`, `items`, `connections`). Everything that gets published goes through this one function. The network feed itself is never published; only endorsements of the user's own content and (optionally) the public friends list are.
 - **The published site is a snapshot.** Each successful publish records `lastPublishedAt` and what it contained, and the Publish tab shows it with a count of changes made since. Anything that arrives after a publish shows up publicly only after the next one.
 
+## Media Library and album manifests
+
+- **Published files.** Each album's photos are content-addressed web copies and thumbnails under `media/albums/<albumId>/` (metadata stripped), described by a signed `media/albums/<albumId>/manifest.json` (type `webring-album-manifest`: album details, and per photo the image and thumbnail URL, SHA-256, size, MIME type and dimensions). `api/albums.json` links each album's `manifestUrl`, and photo entries carry the same hashes.
+- **Changes propagate by URL.** A replaced photo keeps its id and canonical URL but gets a new file name, so friends' Studios update the feed entry on the next sync. A removed photo disappears from `albums.json` and is pruned from friends' feeds after a verified fetch (the same rule as other entries).
+- **Incremental publishing.** A per-destination ledger records what Studio last published. Publishing uploads only changed files and deletes only Studio's own files that are no longer part of the site, so stale photos don't stay reachable on hosts or in the repo.
+
 ## Webrings
 
 Rings are curated by a maintainer and run entirely on static files (`electron/services/ringService.ts`).

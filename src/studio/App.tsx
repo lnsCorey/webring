@@ -224,6 +224,18 @@ interface CrawlSiteResult {
   error?: string;
 }
 
+/** Media Library files (media/...) are served to the Studio window by the studio-media protocol. */
+function mediaSrc(url: string): string {
+  return url.startsWith('media/') ? `studio-media://local/${url.slice('media/'.length)}` : url;
+}
+
+function formatBytes(bytes: number): string {
+  if (bytes < 1024) return `${bytes} B`;
+  if (bytes < 1024 * 1024) return `${(bytes / 1024).toFixed(0)} KB`;
+  if (bytes < 1024 * 1024 * 1024) return `${(bytes / 1024 / 1024).toFixed(1)} MB`;
+  return `${(bytes / 1024 / 1024 / 1024).toFixed(2)} GB`;
+}
+
 function formatRelativeTime(iso: string): string {
   const seconds = Math.round((Date.now() - new Date(iso).getTime()) / 1000);
   if (seconds < 60) return 'just now';
@@ -327,12 +339,21 @@ declare global {
       createAlbum: (input: unknown) => Promise<unknown>;
       deleteAlbum: (albumId: string) => Promise<unknown>;
       addPhoto: (input: unknown) => Promise<unknown>;
-      pickAndImportPhoto: (albumId: string) => Promise<{
-        relativeUrl: string;
-        thumbRelativeUrl: string;
-        localFullPath: string;
-        fileName: string;
-      } | null>;
+      importPhotos: (
+        albumId: string,
+        filePaths?: string[]
+      ) => Promise<{ added: string[]; failed: Array<{ file: string; error: string }> }>;
+      importImage: () => Promise<{ url: string; fileName: string } | null>;
+      replacePhoto: (photoId: string) => Promise<{ replaced: boolean }>;
+      updatePhoto: (photoId: string, updates: { caption?: string; altText?: string; tags?: string[] }) => Promise<unknown>;
+      movePhoto: (photoId: string, direction: 'up' | 'down') => Promise<unknown>;
+      updateAlbum: (
+        albumId: string,
+        updates: { title?: string; description?: string; tags?: string[]; coverUrl?: string }
+      ) => Promise<unknown>;
+      getMediaUsage: () => Promise<{ files: number; bytes: number }>;
+      forgetPublishHistory: () => Promise<unknown>;
+      getPathForFile: (file: File) => string;
       deletePhoto: (photoId: string) => Promise<unknown>;
       createItem: (input: unknown) => Promise<unknown>;
       deleteItem: (itemId: string) => Promise<unknown>;
@@ -575,6 +596,11 @@ export const App: React.FC = () => {
   const [newPhotoUrl, setNewPhotoUrl] = useState('');
   const [newPhotoCaption, setNewPhotoCaption] = useState('');
   const [newPhotoTags, setNewPhotoTags] = useState('');
+  const [mediaUsage, setMediaUsage] = useState<{ files: number; bytes: number } | null>(null);
+  const [isImportingPhotos, setIsImportingPhotos] = useState(false);
+  const [isDraggingPhotos, setIsDraggingPhotos] = useState(false);
+  const [albumDraft, setAlbumDraft] = useState<{ title: string; description: string; tags: string } | null>(null);
+  const [photoDrafts, setPhotoDrafts] = useState<Record<string, { caption: string; altText: string }>>({});
 
   // New Item (Wall Post / Like / Share / Recommendation / Comment) state
   const [itemType, setItemType] = useState<SharedItemType>('post');
@@ -957,21 +983,131 @@ export const App: React.FC = () => {
     notify('Added photo and indexed canonical URI in albums.json!');
   };
 
-  const handlePickLocalPhoto = async () => {
-    if (!selectedAlbumId || !window.studioApi) return;
-    const imported = await window.studioApi.pickAndImportPhoto(selectedAlbumId);
-    if (imported) {
-      setNewPhotoUrl(imported.relativeUrl);
-      notify(`Imported ${imported.fileName} into local studio media store!`);
+  const refreshMediaUsage = async () => {
+    if (!window.studioApi?.getMediaUsage) return;
+    setMediaUsage(await window.studioApi.getMediaUsage());
+  };
+
+  const handleImportPhotos = async (filePaths?: string[]) => {
+    if (!selectedAlbumId || !window.studioApi || isImportingPhotos) return;
+    setIsImportingPhotos(true);
+    notify('Importing photos...');
+    try {
+      const report = await window.studioApi.importPhotos(selectedAlbumId, filePaths);
+      await refreshStudioData();
+      await refreshMediaUsage();
+      if (report.added.length || report.failed.length) {
+        notify(
+          `Added ${report.added.length} photo(s).` +
+            (report.failed.length
+              ? ` Couldn't import ${report.failed.map((f) => `${f.file} (${f.error})`).join(', ')}`
+              : '')
+        );
+      }
+    } finally {
+      setIsImportingPhotos(false);
     }
+  };
+
+  const handleDropPhotos = async (e: React.DragEvent) => {
+    e.preventDefault();
+    setIsDraggingPhotos(false);
+    if (!window.studioApi) return;
+    const paths = Array.from(e.dataTransfer.files)
+      .map((file) => window.studioApi!.getPathForFile(file))
+      .filter((p) => /\.(jpe?g|png)$/i.test(p));
+    if (paths.length === 0) {
+      notify('Drop JPEG or PNG photos.');
+      return;
+    }
+    await handleImportPhotos(paths);
+  };
+
+  const handleSavePhotoDetails = async (photoId: string) => {
+    const draft = photoDrafts[photoId];
+    if (!draft || !window.studioApi) return;
+    await window.studioApi.updatePhoto(photoId, { caption: draft.caption, altText: draft.altText });
+    setPhotoDrafts((prev) => {
+      const next = { ...prev };
+      delete next[photoId];
+      return next;
+    });
+    await refreshStudioData();
+  };
+
+  const handlePhotoAction = async (
+    photo: { id: string; caption: string; thumbUrl: string },
+    action: 'up' | 'down' | 'cover' | 'replace' | 'delete'
+  ) => {
+    if (!window.studioApi) return;
+    if (action === 'up' || action === 'down') await window.studioApi.movePhoto(photo.id, action);
+    if (action === 'cover' && selectedAlbumId) {
+      await window.studioApi.updateAlbum(selectedAlbumId, { coverUrl: photo.thumbUrl });
+      notify('Set as album cover.');
+    }
+    if (action === 'replace') {
+      const res = await window.studioApi.replacePhoto(photo.id);
+      if (res.replaced) notify('Photo replaced. It goes live at your next publish.');
+    }
+    if (action === 'delete') {
+      if (!window.confirm(`Delete this photo${photo.caption ? ` ("${photo.caption}")` : ''}? It's removed from your site at the next publish.`)) {
+        return;
+      }
+      await window.studioApi.deletePhoto(photo.id);
+    }
+    await refreshStudioData();
+    await refreshMediaUsage();
+  };
+
+  const handleSaveAlbum = async () => {
+    if (!albumDraft || !selectedAlbumId || !window.studioApi) return;
+    await window.studioApi.updateAlbum(selectedAlbumId, {
+      title: albumDraft.title.trim(),
+      description: albumDraft.description.trim(),
+      tags: albumDraft.tags
+        .split(',')
+        .map((t) => t.trim())
+        .filter(Boolean),
+    });
+    setAlbumDraft(null);
+    await refreshStudioData();
+    notify('Album saved.');
+  };
+
+  const handleDeleteAlbum = async (album: { id: string; title: string; photos: unknown[] }) => {
+    if (!window.studioApi) return;
+    if (
+      !window.confirm(
+        `Delete the album "${album.title}" and its ${album.photos.length} photo(s)? They're removed from your site at the next publish.`
+      )
+    ) {
+      return;
+    }
+    await window.studioApi.deleteAlbum(album.id);
+    setSelectedAlbumId('');
+    await refreshStudioData();
+    await refreshMediaUsage();
+  };
+
+  const handleForgetPublishHistory = async () => {
+    if (!window.studioApi) return;
+    if (
+      !window.confirm(
+        'Forget what Studio has published? The next publish to each destination re-uploads every file. Use this if files on your server or repo were changed or deleted by hand.'
+      )
+    ) {
+      return;
+    }
+    await window.studioApi.forgetPublishHistory();
+    notify('Publish history cleared. The next publish uploads everything.');
   };
 
   const handlePickLocalPostImage = async () => {
     if (!window.studioApi) return;
-    const imported = await window.studioApi.pickAndImportPhoto('wall-posts');
+    const imported = await window.studioApi.importImage();
     if (imported) {
-      setItemMediaUrl(imported.relativeUrl);
-      notify(`Attached ${imported.fileName} to your post!`);
+      setItemMediaUrl(imported.url);
+      notify(`Attached ${imported.fileName} to your post (resized, location data removed).`);
     }
   };
 
@@ -1524,7 +1660,7 @@ export const App: React.FC = () => {
     { id: 'profile', label: 'Profile & Identity', icon: <UserCheck className="w-4 h-4" /> },
     {
       id: 'albums',
-      label: 'Photo Albums',
+      label: 'Media Library',
       icon: <Camera className="w-4 h-4" />,
       badge: bundle.manifest.stats.photoCount,
     },
@@ -2004,208 +2140,270 @@ export const App: React.FC = () => {
           )}
 
           {/* TAB 2: PHOTO ALBUMS */}
-          {activeTab === 'albums' && (
-            <div className="max-w-5xl mx-auto space-y-6">
-              <div>
-                <h2 className="text-2xl font-bold">Photo Albums Manager</h2>
-                <p className="text-sm text-slate-400 mt-1">
-                  Organize photo galleries stored locally and published to{' '}
-                  <code>/api/albums.json</code>. Each photo gets a canonical schema URI so friends
-                  can like or re-share individual shots.
-                </p>
+          {activeTab === 'albums' && (() => {
+            const albums = bundle.albums.albums;
+            const album = albums.find((a) => a.id === selectedAlbumId);
+            const draft = album
+              ? albumDraft || { title: album.title, description: album.description, tags: album.tags.join(', ') }
+              : null;
+            return (
+            <div className="max-w-6xl mx-auto space-y-6">
+              <div className="flex flex-wrap items-start justify-between gap-3">
+                <div>
+                  <h2 className="text-2xl font-bold">Media Library</h2>
+                  <p className="text-sm text-slate-400 mt-1">
+                    Albums of your own photos, kept on this computer and published with your site, by
+                    folder, SFTP/FTP or GitHub Pages. Each album gets a signed manifest listing every
+                    photo and its exact file.
+                  </p>
+                </div>
+                {mediaUsage && (
+                  <span className="text-xs text-slate-400 px-3 py-1.5 rounded-lg bg-slate-900 border border-slate-800">
+                    Library: {mediaUsage.files} files · {formatBytes(mediaUsage.bytes)}
+                  </span>
+                )}
               </div>
 
-              <div className="grid grid-cols-1 lg:grid-cols-2 gap-6">
-                {/* Create Album Card */}
-                <form
-                  onSubmit={handleCreateAlbum}
-                  className="bg-slate-900 border border-slate-800 rounded-2xl p-5 space-y-4"
-                >
-                  <h3 className="font-bold text-base flex items-center gap-2">
-                    <Plus className="w-4 h-4 text-indigo-400" /> Create New Photo Album
-                  </h3>
-                  <div>
-                    <label className="block text-xs text-slate-400 mb-1">Album Title</label>
+              <div className="grid grid-cols-1 lg:grid-cols-[18rem_1fr] gap-6">
+                {/* Album list */}
+                <div className="space-y-3">
+                  <form
+                    onSubmit={handleCreateAlbum}
+                    className="bg-slate-900 border border-slate-800 rounded-2xl p-4 space-y-2"
+                  >
+                    <h3 className="font-bold text-sm flex items-center gap-2">
+                      <Plus className="w-4 h-4 text-indigo-400" /> New Album
+                    </h3>
                     <input
                       type="text"
                       required
                       value={newAlbumTitle}
                       onChange={(e) => setNewAlbumTitle(e.target.value)}
-                      placeholder="e.g., Summer Roadtrip 35mm"
+                      placeholder="Album title"
                       className="w-full px-3 py-2 rounded-xl bg-slate-950 border border-slate-800 text-sm"
                     />
-                  </div>
-                  <div>
-                    <label className="block text-xs text-slate-400 mb-1">Description</label>
                     <input
                       type="text"
                       value={newAlbumDesc}
                       onChange={(e) => setNewAlbumDesc(e.target.value)}
-                      placeholder="Notes about this collection..."
+                      placeholder="Description (optional)"
                       className="w-full px-3 py-2 rounded-xl bg-slate-950 border border-slate-800 text-sm"
                     />
-                  </div>
-                  <div>
-                    <label className="block text-xs text-slate-400 mb-1">Tags (comma-separated)</label>
-                    <input
-                      type="text"
-                      value={newAlbumTags}
-                      onChange={(e) => setNewAlbumTags(e.target.value)}
-                      placeholder="analog, travel, landscape"
-                      className="w-full px-3 py-2 rounded-xl bg-slate-950 border border-slate-800 text-sm"
-                    />
-                  </div>
-                  <button
-                    type="submit"
-                    className="px-4 py-2 rounded-xl bg-indigo-600 hover:bg-indigo-500 text-white font-semibold text-xs"
-                  >
-                    + Create Album
-                  </button>
-                </form>
-
-                {/* Add Photo to Album Card */}
-                <form
-                  onSubmit={handleAddPhoto}
-                  className="bg-slate-900 border border-slate-800 rounded-2xl p-5 space-y-4"
-                >
-                  <h3 className="font-bold text-base flex items-center gap-2">
-                    <ImagePlus className="w-4 h-4 text-emerald-400" /> Add Photo to Album
-                  </h3>
-                  <div>
-                    <label className="block text-xs text-slate-400 mb-1">Target Album</label>
-                    <select
-                      value={selectedAlbumId}
-                      onChange={(e) => setSelectedAlbumId(e.target.value)}
-                      className="w-full px-3 py-2 rounded-xl bg-slate-950 border border-slate-800 text-sm"
+                    <button
+                      type="submit"
+                      className="w-full px-3 py-2 rounded-xl bg-indigo-600 hover:bg-indigo-500 text-white font-semibold text-xs"
                     >
-                      {bundle.albums.albums.map((a) => (
-                        <option key={a.id} value={a.id}>
-                          {a.title} ({a.photos.length} photos)
-                        </option>
-                      ))}
-                    </select>
+                      Create Album
+                    </button>
+                  </form>
+                  {albums.length === 0 && (
+                    <p className="text-xs text-slate-500 px-1">No albums yet.</p>
+                  )}
+                  {albums.map((a) => (
+                    <button
+                      key={a.id}
+                      type="button"
+                      onClick={() => {
+                        setSelectedAlbumId(a.id);
+                        setAlbumDraft(null);
+                        refreshMediaUsage();
+                      }}
+                      className={`w-full flex items-center gap-3 p-2.5 rounded-xl border text-left transition ${
+                        a.id === selectedAlbumId
+                          ? 'bg-indigo-950/40 border-indigo-500/50'
+                          : 'bg-slate-900 border-slate-800 hover:border-slate-700'
+                      }`}
+                    >
+                      {a.coverUrl ? (
+                        <img src={mediaSrc(a.coverUrl)} alt="" className="w-12 h-12 rounded-lg object-cover bg-slate-800" />
+                      ) : (
+                        <div className="w-12 h-12 rounded-lg bg-slate-800 flex items-center justify-center">
+                          <Camera className="w-5 h-5 text-slate-500" />
+                        </div>
+                      )}
+                      <div className="min-w-0">
+                        <div className="font-semibold text-sm truncate">{a.title}</div>
+                        <div className="text-[11px] text-slate-400">
+                          {a.photos.length} photo{a.photos.length === 1 ? '' : 's'} · updated {formatRelativeTime(a.updatedAt)}
+                        </div>
+                      </div>
+                    </button>
+                  ))}
+                </div>
+
+                {/* Selected album */}
+                {!album || !draft ? (
+                  <div className="bg-slate-900 border border-slate-800 rounded-2xl p-10 text-center text-sm text-slate-400">
+                    Create an album, or pick one on the left, to add photos.
                   </div>
-                  <div>
-                    <label className="block text-xs text-slate-400 mb-1">
-                      Photo Source (Import Local File or Image URL)
-                    </label>
-                    <div className="flex gap-2">
+                ) : (
+                  <div
+                    className={`bg-slate-900 border rounded-2xl p-5 space-y-5 transition ${
+                      isDraggingPhotos ? 'border-indigo-400 bg-indigo-950/20' : 'border-slate-800'
+                    }`}
+                    onDragOver={(e) => {
+                      e.preventDefault();
+                      setIsDraggingPhotos(true);
+                    }}
+                    onDragLeave={() => setIsDraggingPhotos(false)}
+                    onDrop={handleDropPhotos}
+                  >
+                    <div className="grid grid-cols-1 md:grid-cols-2 gap-3">
                       <input
                         type="text"
-                        required
-                        value={newPhotoUrl}
-                        onChange={(e) => setNewPhotoUrl(e.target.value)}
-                        placeholder="https://... or media/albums/..."
-                        className="flex-1 px-3 py-2 rounded-xl bg-slate-950 border border-slate-800 text-sm"
+                        value={draft.title}
+                        onChange={(e) => setAlbumDraft({ ...draft, title: e.target.value })}
+                        className="px-3 py-2 rounded-xl bg-slate-950 border border-slate-800 text-sm font-semibold"
                       />
+                      <input
+                        type="text"
+                        value={draft.tags}
+                        onChange={(e) => setAlbumDraft({ ...draft, tags: e.target.value })}
+                        placeholder="Tags, comma separated"
+                        className="px-3 py-2 rounded-xl bg-slate-950 border border-slate-800 text-sm"
+                      />
+                      <textarea
+                        value={draft.description}
+                        onChange={(e) => setAlbumDraft({ ...draft, description: e.target.value })}
+                        placeholder="Description"
+                        rows={2}
+                        className="md:col-span-2 px-3 py-2 rounded-xl bg-slate-950 border border-slate-800 text-sm"
+                      />
+                    </div>
+                    <div className="flex flex-wrap items-center gap-2">
+                      {albumDraft && (
+                        <button
+                          type="button"
+                          onClick={handleSaveAlbum}
+                          className="px-3 py-2 rounded-xl bg-emerald-600 hover:bg-emerald-500 text-white text-xs font-semibold"
+                        >
+                          Save Album
+                        </button>
+                      )}
                       <button
                         type="button"
-                        onClick={handlePickLocalPhoto}
-                        className="px-3 py-2 rounded-xl bg-slate-800 hover:bg-slate-700 text-xs font-medium shrink-0"
+                        disabled={isImportingPhotos}
+                        onClick={() => handleImportPhotos()}
+                        className="px-3 py-2 rounded-xl bg-indigo-600 hover:bg-indigo-500 disabled:opacity-60 text-white text-xs font-semibold flex items-center gap-1.5"
                       >
-                        Browse File...
+                        <Plus className="w-3.5 h-3.5" />
+                        {isImportingPhotos ? 'Importing...' : 'Add Photos'}
+                      </button>
+                      <span className="text-xs text-slate-500">or drop JPEG/PNG files here</span>
+                      <button
+                        type="button"
+                        onClick={() => handleDeleteAlbum(album)}
+                        className="ml-auto px-3 py-2 rounded-xl bg-rose-950/40 hover:bg-rose-900/50 border border-rose-500/30 text-rose-300 text-xs"
+                      >
+                        Delete Album
                       </button>
                     </div>
-                  </div>
-                  <div className="grid grid-cols-2 gap-3">
-                    <div>
-                      <label className="block text-xs text-slate-400 mb-1">Caption</label>
+
+                    {album.photos.length === 0 ? (
+                      <p className="text-sm text-slate-500 py-8 text-center">No photos yet.</p>
+                    ) : (
+                      <div className="grid grid-cols-1 sm:grid-cols-2 xl:grid-cols-3 gap-4">
+                        {album.photos.map((photo, idx) => {
+                          const photoDraft = photoDrafts[photo.id] || { caption: photo.caption, altText: photo.altText };
+                          const isCover = album.coverUrl === photo.thumbUrl;
+                          return (
+                            <div key={photo.id} className="bg-slate-950 border border-slate-800 rounded-xl overflow-hidden">
+                              <img
+                                src={mediaSrc(photo.thumbUrl || photo.url)}
+                                alt={photo.altText}
+                                className="w-full aspect-[4/3] object-cover bg-slate-800"
+                              />
+                              <div className="p-2.5 space-y-1.5">
+                                <input
+                                  type="text"
+                                  value={photoDraft.caption}
+                                  placeholder="Caption"
+                                  onChange={(e) =>
+                                    setPhotoDrafts((prev) => ({ ...prev, [photo.id]: { ...photoDraft, caption: e.target.value } }))
+                                  }
+                                  onBlur={() => handleSavePhotoDetails(photo.id)}
+                                  className="w-full px-2 py-1 rounded-lg bg-slate-900 border border-slate-800 text-xs"
+                                />
+                                <input
+                                  type="text"
+                                  value={photoDraft.altText}
+                                  placeholder="Alt text (describe the photo)"
+                                  onChange={(e) =>
+                                    setPhotoDrafts((prev) => ({ ...prev, [photo.id]: { ...photoDraft, altText: e.target.value } }))
+                                  }
+                                  onBlur={() => handleSavePhotoDetails(photo.id)}
+                                  className="w-full px-2 py-1 rounded-lg bg-slate-900 border border-slate-800 text-xs"
+                                />
+                                <div className="text-[10px] text-slate-500">
+                                  {photo.width && photo.height ? `${photo.width}×${photo.height}` : 'External image'}
+                                  {photo.bytes ? ` · ${formatBytes(photo.bytes)}` : ''}
+                                  {isCover ? ' · Cover' : ''}
+                                </div>
+                                <div className="flex flex-wrap gap-1 text-[11px]">
+                                  <button type="button" disabled={idx === 0} onClick={() => handlePhotoAction(photo, 'up')} className="px-2 py-1 rounded bg-slate-800 hover:bg-slate-700 disabled:opacity-40" title="Move earlier">←</button>
+                                  <button type="button" disabled={idx === album.photos.length - 1} onClick={() => handlePhotoAction(photo, 'down')} className="px-2 py-1 rounded bg-slate-800 hover:bg-slate-700 disabled:opacity-40" title="Move later">→</button>
+                                  {!isCover && (
+                                    <button type="button" onClick={() => handlePhotoAction(photo, 'cover')} className="px-2 py-1 rounded bg-slate-800 hover:bg-slate-700">Cover</button>
+                                  )}
+                                  {photo.sha256 && (
+                                    <button type="button" onClick={() => handlePhotoAction(photo, 'replace')} className="px-2 py-1 rounded bg-slate-800 hover:bg-slate-700">Replace</button>
+                                  )}
+                                  <button type="button" onClick={() => handlePhotoAction(photo, 'delete')} className="px-2 py-1 rounded bg-rose-950/40 hover:bg-rose-900/50 text-rose-300">Delete</button>
+                                </div>
+                              </div>
+                            </div>
+                          );
+                        })}
+                      </div>
+                    )}
+
+                    {/* External image by URL (not stored in the library) */}
+                    <form onSubmit={handleAddPhoto} className="flex flex-wrap gap-2 border-t border-slate-800 pt-4">
+                      <input
+                        type="url"
+                        value={newPhotoUrl}
+                        onChange={(e) => setNewPhotoUrl(e.target.value)}
+                        placeholder="Or link an image hosted elsewhere: https://..."
+                        className="flex-1 min-w-[14rem] px-3 py-2 rounded-xl bg-slate-950 border border-slate-800 text-xs"
+                      />
                       <input
                         type="text"
                         value={newPhotoCaption}
                         onChange={(e) => setNewPhotoCaption(e.target.value)}
-                        placeholder="Golden hour over the bay..."
-                        className="w-full px-3 py-2 rounded-xl bg-slate-950 border border-slate-800 text-sm"
+                        placeholder="Caption"
+                        className="w-40 px-3 py-2 rounded-xl bg-slate-950 border border-slate-800 text-xs"
                       />
-                    </div>
-                    <div>
-                      <label className="block text-xs text-slate-400 mb-1">Tags</label>
-                      <input
-                        type="text"
-                        value={newPhotoTags}
-                        onChange={(e) => setNewPhotoTags(e.target.value)}
-                        placeholder="sunset, film"
-                        className="w-full px-3 py-2 rounded-xl bg-slate-950 border border-slate-800 text-sm"
-                      />
-                    </div>
+                      <button type="submit" className="px-3 py-2 rounded-xl bg-slate-800 hover:bg-slate-700 text-xs">
+                        Add Link
+                      </button>
+                    </form>
                   </div>
-                  <button
-                    type="submit"
-                    className="px-4 py-2 rounded-xl bg-emerald-600 hover:bg-emerald-500 text-white font-semibold text-xs"
-                  >
-                    + Add Photo to Album
-                  </button>
-                </form>
+                )}
               </div>
 
-              {/* Existing Albums List */}
-              <div className="space-y-6">
-                {bundle.albums.albums.map((album) => (
-                  <div
-                    key={album.id}
-                    className="bg-slate-900 border border-slate-800 rounded-2xl p-5 space-y-4"
-                  >
-                    <div className="flex items-start justify-between">
-                      <div>
-                        <h4 className="font-bold text-lg">{album.title}</h4>
-                        <p className="text-xs text-slate-400">{album.description}</p>
-                        <p className="text-[11px] font-mono text-indigo-400 mt-1">
-                          Canonical URI: {album.canonicalUrl}
-                        </p>
-                      </div>
-                      <button
-                        onClick={async () => {
-                          await window.studioApi?.deleteAlbum(album.id);
-                          await refreshStudioData();
-                        }}
-                        className="text-slate-500 hover:text-rose-400 p-1.5"
-                        title="Delete Album"
-                      >
-                        <Trash2 className="w-4 h-4" />
-                      </button>
-                    </div>
-
-                    <div className="grid grid-cols-1 sm:grid-cols-2 md:grid-cols-3 gap-4">
-                      {album.photos.map((photo) => (
-                        <div
-                          key={photo.id}
-                          className="bg-slate-950 border border-slate-800 rounded-xl overflow-hidden flex flex-col justify-between"
-                        >
-                          <div>
-                            <img
-                              src={photo.thumbUrl || photo.url}
-                              alt={photo.caption}
-                              className="w-full h-40 object-cover bg-slate-900"
-                            />
-                            <div className="p-3">
-                              <p className="text-xs font-medium">{photo.caption}</p>
-                              <p className="text-[10px] font-mono text-slate-500 truncate mt-1">
-                                {photo.canonicalUrl}
-                              </p>
-                            </div>
-                          </div>
-                          <div className="px-3 py-2 border-t border-slate-800 flex justify-between items-center">
-                            <span className="text-[10px] text-slate-400">
-                              {photo.tags.map((t) => `#${t}`).join(' ')}
-                            </span>
-                            <button
-                              onClick={async () => {
-                                await window.studioApi?.deletePhoto(photo.id);
-                                await refreshStudioData();
-                              }}
-                              className="text-slate-500 hover:text-rose-400"
-                            >
-                              <Trash2 className="w-3.5 h-3.5" />
-                            </button>
-                          </div>
-                        </div>
-                      ))}
-                    </div>
-                  </div>
-                ))}
+              <div className="bg-slate-900/60 border border-slate-800 rounded-2xl p-4 text-xs text-slate-400 space-y-2">
+                <p>
+                  <strong className="text-slate-200">What gets published:</strong> a web copy of each
+                  photo (up to 2048 px) and a thumbnail, with camera details and GPS location removed.
+                  Your originals stay on this computer. Replacing a photo publishes it under a new file
+                  name, so nobody sees a stale copy.
+                </p>
+                <p>
+                  Publishing only uploads what changed, and removes photos you deleted from your folder,
+                  server or GitHub repo. It only ever removes files Studio published there; anything
+                  else is left alone.
+                </p>
+                <button
+                  type="button"
+                  onClick={handleForgetPublishHistory}
+                  className="px-3 py-1.5 rounded-lg bg-slate-800 hover:bg-slate-700 text-slate-200"
+                >
+                  Re-upload everything at next publish
+                </button>
               </div>
             </div>
-          )}
+            );
+          })()}
 
           {/* TAB 3: WALL POSTS, LIKES & SHARES */}
           {activeTab === 'items' && (
@@ -2566,7 +2764,7 @@ export const App: React.FC = () => {
                         </div>
                         {item.mediaUrl && (
                           <img
-                            src={item.mediaUrl}
+                            src={mediaSrc(item.mediaUrl)}
                             alt={item.title}
                             className="w-full max-h-60 object-cover rounded-xl mb-3"
                           />
@@ -5727,9 +5925,10 @@ export const App: React.FC = () => {
                         <p className="text-xs text-slate-400 leading-relaxed">
                           Post native status updates (<code>post</code>), threaded replies to friends
                           (<code>comment</code>), likes, and recommendations in{' '}
-                          <strong>Wall, Likes & Comments</strong>, or import local photos in{' '}
-                          <strong>Photo Albums</strong>. Every post and photo receives a permanent
-                          canonical URI so peers in your ring can reply or like it.
+                          <strong>Wall, Likes & Comments</strong>, or add your own photos in the{' '}
+                          <strong>Media Library</strong>. Photos are published as resized copies with
+                          location data removed, with a signed manifest per album. Every post and photo
+                          receives a permanent canonical URI so peers in your ring can reply or like it.
                         </p>
                         <div className="flex gap-3 pt-1">
                           <button
