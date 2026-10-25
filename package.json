@@ -3,6 +3,9 @@
   "version": "1.0.0",
   "description": "Self-contained federated personal profile & webring studio with static JSON generation and ATProto did:web identity",
   "main": "dist-electron/electron/main.js",
+  "engines": {
+    "node": ">=22.13.0"
+  },
   "scripts": {
     "dev:vite": "vite",
     "build:vite": "vite build",

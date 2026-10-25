@@ -30,12 +30,19 @@ There are no packaged releases yet; run Webring Studio from source.
 
 **Requirements**
 
-- **Node.js 22.13 or newer** (Node 24 recommended) and npm. The test suite and the standalone MCP server use Node's built-in `node:sqlite`.
+- **Node.js 22.13 or newer** (Node 24 recommended) and npm. `npm install` refuses older versions. Ubuntu and Debian's `apt` package is too old (Node 18), so install Node with [nvm](https://github.com/nvm-sh/nvm) instead:
+  ```bash
+  curl -o- https://raw.githubusercontent.com/nvm-sh/nvm/v0.40.3/install.sh | bash
+  # open a new terminal, then:
+  nvm install 24
+  ```
+  The repo includes an `.nvmrc`, so `nvm use` inside the project folder switches to the right version.
 - **Git**
 - **Build tools for native modules**, used to compile `better-sqlite3` for Electron during install:
   - macOS: Xcode Command Line Tools (`xcode-select --install`)
   - Windows: "Desktop development with C++" from the Visual Studio Build Tools, plus Python 3
   - Linux: `build-essential` and Python 3
+- **Linux only:** a Secret Service keyring (GNOME Keyring, or KWallet on KDE) so Studio can encrypt your keys and passwords. Ubuntu's desktop includes one.
 
 **Steps**
 
@@ -51,6 +58,11 @@ The first launch creates an empty primary persona. Start by setting your site's 
 - macOS: `~/Library/Application Support/webring-studio`
 - Windows: `%APPDATA%\webring-studio`
 - Linux: `~/.config/webring-studio`
+
+**Troubleshooting**
+
+- **`EBADENGINE` / "Unsupported engine":** your Node is too old. Check with `node -v`, run `nvm install 24 && nvm use 24`, delete `node_modules`, and run `npm install` again.
+- **"N vulnerabilities" after `npm install`:** npm's audit report about the project's dependencies; it doesn't mean the install failed. **Don't run `npm audit fix --force`**: it upgrades packages across major versions and will break the app.
 
 ## Getting started
 
