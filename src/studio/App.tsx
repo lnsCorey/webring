@@ -1798,9 +1798,7 @@ export const App: React.FC = () => {
         <div>
           <div className="p-5 border-b border-slate-800">
             <div className="flex items-center gap-2.5">
-              <div className="w-9 h-9 rounded-xl bg-indigo-600 flex items-center justify-center shadow-lg shadow-indigo-600/30">
-                <Globe className="w-5 h-5 text-white" />
-              </div>
+              <img src="./logo-mark.png" alt="" className="w-10 h-10 shrink-0" />
               <div>
                 <h1 className="font-extrabold text-base tracking-tight">Webring Studio</h1>
                 <p className="text-[11px] text-slate-400">Local SQLite • Static JSON v{WEBRING_SCHEMA_VERSION}</p>

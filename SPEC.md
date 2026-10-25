@@ -32,6 +32,7 @@
 - `src/studio/App.tsx`: studio UI.
 - `src/profile-site/`: public profile site.
 - `tests/federation.test.ts`: test suite.
+- `images/logo-icon.png`: the source logo. `scripts/generate-icons.py` (macOS) derives everything else from it: `build/icon.icns|ico|png` and `build/icons/` for packagers, `electron/assets/` (window, dev dock and tray icons, including the monochrome macOS menu-bar template) and `public/favicon.png` / `public/logo-mark.png` for the Studio window. Edit the logo, then rerun the script; don't hand-edit the generated files.
 - `docs/architecture/federation.md`: federation design and boundaries.
 
 ### Conventions
