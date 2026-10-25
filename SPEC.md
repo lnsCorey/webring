@@ -15,12 +15,11 @@
 - `npm run build:electron`: compile `electron/` to `dist-electron/` (needed before `npm run mcp` or after pulling changes).
 - `npm run mcp`: start the stdio MCP server.
 
-### Native SQLite module
+### SQLite
 
-- The database layer prefers Node's built-in `node:sqlite` and falls back to `better-sqlite3` (`openSqliteAdapter` in `electron/db/database.ts`).
-- Electron 33 ships Node 20, which has no `node:sqlite`, so the app uses `better-sqlite3` compiled for Electron (`npm run rebuild:electron`).
-- Tests and the MCP CLI run on Node 22+ and use `node:sqlite`.
-- `npm run rebuild:node` recompiles `better-sqlite3` for Node, which breaks the app until you run `npm run rebuild:electron` again.
+- Storage uses Node's built-in `node:sqlite` only (`openSqliteAdapter` in `electron/db/database.ts`); there are no native modules to compile.
+- The app runs on Electron 45 (bundled Node 24); tests and the stdio MCP CLI need Node 22.13+ (enforced by `engines` + `.npmrc` `engine-strict`).
+- Electron 45 deprecates the synchronous `safeStorage` methods used by `electron/security/keyVault.ts`; they're removed in Electron 46, so moving to Electron 46+ requires switching key access to the async API.
 
 ### Layout
 

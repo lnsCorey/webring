@@ -38,10 +38,6 @@ There are no packaged releases yet; run Webring Studio from source.
   ```
   The repo includes an `.nvmrc`, so `nvm use` inside the project folder switches to the right version.
 - **Git**
-- **Build tools for native modules**, used to compile `better-sqlite3` for Electron during install:
-  - macOS: Xcode Command Line Tools (`xcode-select --install`)
-  - Windows: "Desktop development with C++" from the Visual Studio Build Tools, plus Python 3
-  - Linux: `build-essential` and Python 3
 - **Linux only:** a Secret Service keyring (GNOME Keyring, or KWallet on KDE) so Studio can encrypt your keys and passwords. Ubuntu's desktop includes one.
 
 **Steps**
@@ -49,8 +45,8 @@ There are no packaged releases yet; run Webring Studio from source.
 ```bash
 git clone https://github.com/lnsCorey/webring.git
 cd webring
-npm install          # also rebuilds better-sqlite3 for Electron
-npm run dev          # builds the UI and app, then opens Webring Studio
+npm install
+npm run dev          # builds the UI and app, then opens Webring Studio (the first run downloads Electron)
 ```
 
 The first launch creates an empty primary persona. Start by setting your site's address and name in **Profile & Identity**. Your data lives in the app's data folder:
@@ -157,9 +153,8 @@ Then configure your MCP client to run:
 | `npx tsc -p tsconfig.json --noEmit` | Type-check the UI |
 | `npx tsc -p tsconfig.electron.json --noEmit` | Type-check the Electron code |
 | `npm run mcp` | Build and start the stdio MCP server |
-| `npm run rebuild:electron` | Recompile `better-sqlite3` for Electron |
 
-**Native module note.** The app (Electron 33, which ships Node 20) uses `better-sqlite3` compiled for Electron. Tests and the standalone MCP server use Node's built-in `node:sqlite` instead. `npm run rebuild:node` recompiles `better-sqlite3` for plain Node, and the app won't start until you run `npm run rebuild:electron` again.
+**No native modules.** Storage uses Node's built-in `node:sqlite`, available in Node 22.13+ (tests, stdio MCP server) and in Electron 45's bundled Node 24 (the app), so nothing is compiled during install. If `ELECTRON_RUN_AS_NODE=1` is set in your shell (some editors set it), `npm run dev` will fail to open a window; unset it first.
 
 **Project layout**
 
