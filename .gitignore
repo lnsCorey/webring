@@ -5,3 +5,7 @@ dist-electron
 # Personal agent instructions and local settings
 CLAUDE.local.md
 .claude/settings.local.json
+
+# Python bytecode
+__pycache__/
+*.pyc
