@@ -484,19 +484,26 @@ export interface CreatePersonaInput {
   bio?: string;
   avatarUrl?: string;
   theme?: ProfileTheme;
-  seedStarterData?: boolean;
 }
 
 // ============================================================================
 // 2. Identity (did:web), Canonical URL, and Ed25519 Crypto Helpers
 // ============================================================================
 
+/** Where a new profile points until the user sets their real site address. */
+export const PLACEHOLDER_SITE_URL = 'https://my-profile.local';
+export const PLACEHOLDER_DISPLAY_NAME = 'Your Name';
+
+export function isPlaceholderSiteUrl(siteUrl: string): boolean {
+  return normalizeSiteUrl(siteUrl) === PLACEHOLDER_SITE_URL;
+}
+
 /**
  * Normalizes a site URL (removes trailing slash, ensures protocol)
  */
 export function normalizeSiteUrl(rawUrl: string): string {
   const trimmed = rawUrl.trim();
-  if (!trimmed) return 'https://my-profile.local';
+  if (!trimmed) return PLACEHOLDER_SITE_URL;
   const withProto = /^https?:\/\//i.test(trimmed) ? trimmed : `https://${trimmed}`;
   return withProto.replace(/\/+$/, '');
 }

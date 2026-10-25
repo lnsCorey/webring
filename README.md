@@ -46,7 +46,7 @@ npm install          # also rebuilds better-sqlite3 for Electron
 npm run dev          # builds the UI and app, then opens Webring Studio
 ```
 
-The first launch creates a primary persona with some starter content so there's something to look at. Your data lives in the app's data folder:
+The first launch creates an empty primary persona. Start by setting your site's address and name in **Profile & Identity**. Your data lives in the app's data folder:
 
 - macOS: `~/Library/Application Support/webring-studio`
 - Windows: `%APPDATA%\webring-studio`
@@ -58,7 +58,7 @@ The first launch creates a primary persona with some starter content so there's 
 2. **Add content.** Write wall posts, create albums and add photos.
 3. **Preview.** **Test Export & Preview** builds the site into a scratch folder and serves it on `127.0.0.1`, so you can check it in a browser before publishing.
 4. **Publish.** In **Publish & SFTP**, export to a folder, upload over SFTP/FTP, or push to GitHub Pages. The Publish tab shows when you last published and whether anything has changed since.
-5. **Add friends.** In **Friends & Webrings**, add a friend's site URL, then **Sync All Friends**. Their posts appear in your **Neighborhood Feed**. Want to try it without a friend? **Add Demo Peer (Maya)** in the Feed tab builds a simulated peer site.
+5. **Add friends.** In **Friends & Webrings**, add a friend's site URL, then **Sync All Friends**. Their posts appear in your **Neighborhood Feed**.
 6. **Join or start a webring** (see below), and **set a schedule** so syncing and publishing happen on their own.
 
 The in-app **Help & Deploy Guide** tab has step-by-step guides for GitHub Pages, SFTP/FTP hosting, add-ons, webrings and MCP.

@@ -541,16 +541,11 @@ export class WebringMcpServer {
       {
         name: 'webring_crawl_all_friends',
         description:
-          'Crawl all friends in the persona’s ring (plus the simulated peer site if offline) and return a summary of newly indexed posts, photos, and back-endorsements.',
+          'Crawl all friends in the persona’s ring and return a summary of newly indexed posts, photos, and back-endorsements.',
         inputSchema: {
           type: 'object',
           properties: {
             personaId: personaIdProp,
-            includeSimulatedPeer: {
-              type: 'boolean',
-              description:
-                'If true, also generates and crawls the built-in simulated peer site (Maya Lin) so offline testing has rich feed data.',
-            },
           },
         },
       },
