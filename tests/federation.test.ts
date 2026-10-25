@@ -8,6 +8,7 @@ import {
   buildDidDocument,
   buildWebringUri,
   generateIdentityKeyPair,
+  isPlaceholderSiteUrl,
   parseWebringUri,
   signDocument,
   siteUrlToDidWeb,
@@ -15,6 +16,7 @@ import {
   WebringManifestSchema,
 } from '../src/shared/schema';
 import { STORED_SECRET_PLACEHOLDER, StudioDatabase } from '../electron/db/database';
+import { LEGACY_DEMO_PHOTOS, LEGACY_DEMO_PROFILE } from '../electron/db/legacyDemoContent';
 import { StaticSiteGenerator } from '../electron/services/siteGenerator';
 import { defaultJsonFetcher, RingCrawler } from '../electron/services/ringCrawler';
 import { RingService } from '../electron/services/ringService';
@@ -461,8 +463,8 @@ describe('Two-Peer Pull Federation, Static Site Generation & Endorsement Discove
   it('publishes Wall Posts and federates threaded Comments across peer static sites', async () => {
     const aliceDir = path.join(tempRoot, 'alice-wall');
     const bobDir = path.join(tempRoot, 'bob-wall');
-    const aliceDb = new StudioDatabase(aliceDir, 'alice.sqlite', { seedStarterData: false });
-    const bobDb = new StudioDatabase(bobDir, 'bob.sqlite', { seedStarterData: false });
+    const aliceDb = new StudioDatabase(aliceDir, 'alice.sqlite');
+    const bobDb = new StudioDatabase(bobDir, 'bob.sqlite');
 
     try {
       aliceDb.updateProfile({
@@ -544,8 +546,8 @@ describe('Two-Peer Pull Federation, Static Site Generation & Endorsement Discove
   it('hardens static HTML against DOM XSS, verifies per-document Ed25519 signatures, and enforces TOFU key pinning', async () => {
     const aliceDir = path.join(tempRoot, 'alice-sec');
     const bobDir = path.join(tempRoot, 'bob-sec');
-    const aliceDb = new StudioDatabase(aliceDir, 'alice.sqlite', { seedStarterData: false });
-    const bobDb = new StudioDatabase(bobDir, 'bob.sqlite', { seedStarterData: false });
+    const aliceDb = new StudioDatabase(aliceDir, 'alice.sqlite');
+    const bobDb = new StudioDatabase(bobDir, 'bob.sqlite');
 
     try {
       // 1. FIX-01: Test DOM XSS & script breakout escaping in generated standalone index.html
@@ -630,7 +632,7 @@ describe('Two-Peer Pull Federation, Static Site Generation & Endorsement Discove
 
       // 4. FIX-04: Simulate domain hijack / key swap on Bob's site with a rogue Ed25519 keypair
       const rogueDir = path.join(tempRoot, 'bob-rogue');
-      const rogueDb = new StudioDatabase(rogueDir, 'rogue.sqlite', { seedStarterData: false });
+      const rogueDb = new StudioDatabase(rogueDir, 'rogue.sqlite');
       rogueDb.updateProfile({
         siteUrl: 'https://bob-sec.ring.test',
         handle: 'bob-sec.ring.test',
@@ -671,7 +673,7 @@ describe('Two-Peer Pull Federation, Static Site Generation & Endorsement Discove
     const manager = new PersonaManager(studioDataDir);
     const mcpServer = new WebringMcpServer(manager, studioDataDir);
     const httpServer = new McpHttpServer(mcpServer);
-    const peerDb = new StudioDatabase(peerDataDir, 'peer.sqlite', { seedStarterData: false });
+    const peerDb = new StudioDatabase(peerDataDir, 'peer.sqlite');
 
     try {
       // 1. Test MCP initialize, tools/list, resources/list, prompts/list
@@ -969,7 +971,7 @@ describe('Feed Integrity, Moderation & Publish Snapshot', () => {
 
   const makeSite = (name: string) => {
     const dir = path.join(tempRoot, name);
-    const db = new StudioDatabase(dir, `${name}.sqlite`, { seedStarterData: false });
+    const db = new StudioDatabase(dir, `${name}.sqlite`);
     const siteUrl = `https://${name}.ring.test`;
     db.updateProfile({ siteUrl, handle: `${name}.ring.test`, displayName: name });
     const outDir = path.join(dir, 'public_html');
@@ -1183,7 +1185,7 @@ describe('Private Key Encryption at Rest', () => {
   };
 
   it('migrates a plaintext key to encrypted storage and still signs', () => {
-    const plainDb = new StudioDatabase(tempRoot, 'p.sqlite', { seedStarterData: false });
+    const plainDb = new StudioDatabase(tempRoot, 'p.sqlite');
     const originalKey = plainDb.getKeys().privateKeyPem;
     plainDb.close();
     expect(readStoredKey(path.join(tempRoot, 'p.sqlite'))).toContain('BEGIN PRIVATE KEY');
@@ -1198,7 +1200,7 @@ describe('Private Key Encryption at Rest', () => {
 
   it('seals publishing credentials, never returns them from getProfile, and keeps them through the form', () => {
     // An older install stored them in plaintext
-    const legacy = new StudioDatabase(tempRoot, 'creds.sqlite', { seedStarterData: false });
+    const legacy = new StudioDatabase(tempRoot, 'creds.sqlite');
     legacy.updateProfile({ publishSettings: { password: 'sftp-secret', githubToken: 'ghp_legacy' } });
     legacy.close();
     // eslint-disable-next-line @typescript-eslint/no-require-imports
@@ -1351,7 +1353,7 @@ describe('SSRF Guard for Peer Crawling', () => {
 
   it('reports a blocked peer as a failed crawl, and allows it when explicitly enabled', async () => {
     const dir = fs.mkdtempSync(path.join(os.tmpdir(), 'webring-ssrf-'));
-    const db = new StudioDatabase(dir, 'ssrf.sqlite', { seedStarterData: false });
+    const db = new StudioDatabase(dir, 'ssrf.sqlite');
     try {
       const res = await new RingCrawler(db).crawlFriendSite(`http://127.0.0.1:${port}`);
       expect(res.success).toBe(false);
@@ -1385,7 +1387,7 @@ describe('Curated Webrings (hosted rings, signed requests, sync)', () => {
   const makeSite = (name: string) => {
     const siteUrl = `https://${name}.ring.test`;
     const dir = path.join(tempRoot, name);
-    const db = new StudioDatabase(dir, `${name}.sqlite`, { seedStarterData: false });
+    const db = new StudioDatabase(dir, `${name}.sqlite`);
     db.updateProfile({ siteUrl, handle: `${name}.ring.test`, displayName: name });
     const outDir = path.join(dir, 'public_html');
     sites.set(siteUrl, { db, outDir });
@@ -1601,7 +1603,7 @@ describe('Curated Webrings (hosted rings, signed requests, sync)', () => {
     expect(solo.prevSiteUrl).toBeUndefined();
     expect(solo.nextSiteUrl).toBeUndefined();
 
-    // Old install: hub setting on, one public friend, plus the seeded demo ring
+    // Old install: hub setting on, one public friend
     const legacyDir = path.join(tempRoot, 'legacy');
     const legacy = new StudioDatabase(legacyDir, 'legacy.sqlite');
     legacy.updateProfile({ siteUrl: 'https://legacy.ring.test', publishSettings: { publishWebringHub: true } });
@@ -1763,7 +1765,7 @@ describe('Scheduled Sync & Publish', () => {
   it('fingerprints site content, ignoring timestamps and signatures', async () => {
     const dir = path.join(tempRoot, 'fp');
     const mediaDir = path.join(dir, 'media');
-    const db = new StudioDatabase(dir, 'fp.sqlite', { seedStarterData: false });
+    const db = new StudioDatabase(dir, 'fp.sqlite');
     try {
       db.updateProfile({ siteUrl: 'https://fp.ring.test' });
       const generator = new StaticSiteGenerator(db, mediaDir);
@@ -1847,6 +1849,119 @@ describe('Scheduled Sync & Publish', () => {
       expect(remote.message).toMatch(/host and username/);
     } finally {
       manager.closeAll();
+    }
+  });
+});
+
+describe('Release defaults (no sample content)', () => {
+  let tempRoot: string;
+
+  beforeEach(() => {
+    tempRoot = fs.mkdtempSync(path.join(os.tmpdir(), 'webring-defaults-'));
+  });
+
+  afterEach(() => {
+    fs.rmSync(tempRoot, { recursive: true, force: true });
+  });
+
+  it('starts new installs empty, with a placeholder profile', () => {
+    const db = new StudioDatabase(tempRoot, 'fresh.sqlite');
+    try {
+      const profile = db.getProfile();
+      expect(isPlaceholderSiteUrl(profile.siteUrl)).toBe(true);
+      expect(profile.displayName).toBe('Your Name');
+      expect(profile.bio).toBe('');
+      expect(db.getItems()).toHaveLength(0);
+      expect(db.getAlbums()).toHaveLength(0);
+      expect(db.getFriends()).toHaveLength(0);
+      expect(db.getJoinedRings()).toHaveLength(0);
+    } finally {
+      db.close();
+    }
+  });
+
+  it('removes untouched sample content from older installs and keeps anything edited', () => {
+    const dbFile = path.join(tempRoot, 'old.sqlite');
+    new StudioDatabase(tempRoot, 'old.sqlite').close();
+
+    // Recreate what older versions seeded, as an old install would have it
+    // eslint-disable-next-line @typescript-eslint/no-require-imports
+    const { DatabaseSync } = require('node:sqlite');
+    const raw = new DatabaseSync(dbFile);
+    const now = new Date().toISOString();
+    raw.prepare(
+      `UPDATE profile SET site_url = ?, handle = ?, display_name = ?, tagline = ?, bio = ?, location = ?,
+         avatar_url = ?, banner_url = ?, interests_json = ?, atproto_handle = ?, publish_settings_json = '{}'`
+    ).run(
+      LEGACY_DEMO_PROFILE.siteUrl,
+      LEGACY_DEMO_PROFILE.handle,
+      LEGACY_DEMO_PROFILE.displayName,
+      'My own tagline', // the user changed this one
+      LEGACY_DEMO_PROFILE.bio,
+      LEGACY_DEMO_PROFILE.location,
+      LEGACY_DEMO_PROFILE.avatarUrl,
+      LEGACY_DEMO_PROFILE.bannerUrl,
+      JSON.stringify(LEGACY_DEMO_PROFILE.interests),
+      LEGACY_DEMO_PROFILE.atprotoHandle
+    );
+    raw.prepare(
+      `INSERT INTO albums (id, title, description, cover_url, tags_json, created_at, updated_at)
+       VALUES ('album-pnw-trails', 'Misty Morning Trails', '', '', '[]', ?, ?)`
+    ).run(now, now);
+    raw.prepare(
+      `INSERT INTO photos (id, album_id, url, thumb_url, caption, alt_text, tags_json, created_at)
+       VALUES ('photo-sunbeams', 'album-pnw-trails', ?, '', '', '', '[]', ?)`
+    ).run(LEGACY_DEMO_PHOTOS[0].url, now);
+    const insertItem = raw.prepare(
+      `INSERT INTO items (id, type, title, target_url, category, commentary, tags_json, created_at)
+       VALUES (?, 'post', ?, '', 'status', '', '[]', ?)`
+    );
+    insertItem.run('item-welcome-post', 'Building My Own Static Social Wall on the IndieWeb', now);
+    insertItem.run('item-camera-rec', 'My edited review of the OM-1', now); // edited: keep
+    insertItem.run('item-user-post', 'A post the user wrote', now); // not seeded: keep
+    raw.prepare(
+      `INSERT INTO friends (id, site_url, did, display_name, handle, relationship_json, visibility, added_at)
+       VALUES ('friend-maya', 'https://maya.indiering.social', 'did:web:maya.indiering.social', 'Maya Lin', 'maya', '[]', 'private', ?)`
+    ).run(now);
+    raw.prepare(
+      `INSERT INTO network_feed (id, friend_site_url, friend_name, entry_type, title, canonical_url, target_url, created_at)
+       VALUES ('feed-demo', 'https://maya.indiering.social', 'Maya Lin', 'post', 'Demo', 'https://maya.indiering.social/api/items.json#x', '', ?)`
+    ).run(now);
+    raw.prepare(
+      `INSERT INTO webrings (id, name, hub_url, description, prev_site_url, next_site_url, joined_at)
+       VALUES ('ring-indie-craft', 'Indie Craft & Photo Ring', 'https://ring.indiecraft.org/webring-hub.json', '', '', '', ?)`
+    ).run(now);
+    raw.close();
+
+    const db = new StudioDatabase(tempRoot, 'old.sqlite');
+    try {
+      const profile = db.getProfile();
+      expect(isPlaceholderSiteUrl(profile.siteUrl)).toBe(true);
+      expect(profile.displayName).toBe('Your Name');
+      expect(profile.tagline).toBe('My own tagline');
+      expect(profile.bio).toBe('');
+      expect(profile.interests).toEqual([]);
+      expect(db.getItems().map((i) => i.id).sort()).toEqual(['item-camera-rec', 'item-user-post']);
+      expect(db.getAlbums()).toHaveLength(0);
+      expect(db.getFriends()).toHaveLength(0);
+      expect(db.getNetworkFeed()).toHaveLength(0);
+      expect(db.getJoinedRings()).toHaveLength(0);
+    } finally {
+      db.close();
+    }
+
+    // Runs once: content added afterwards with the same ids is left alone
+    const again = new DatabaseSync(dbFile);
+    again.prepare(
+      `INSERT INTO items (id, type, title, target_url, category, commentary, tags_json, created_at)
+       VALUES ('item-welcome-post', 'post', 'Building My Own Static Social Wall on the IndieWeb', '', 'status', '', '[]', ?)`
+    ).run(now);
+    again.close();
+    const reopened = new StudioDatabase(tempRoot, 'old.sqlite');
+    try {
+      expect(reopened.getItems().some((i) => i.id === 'item-welcome-post')).toBe(true);
+    } finally {
+      reopened.close();
     }
   });
 });

@@ -125,7 +125,6 @@ export class PersonaManager {
     }
 
     const tempDb = new StudioDatabase(this.userDataDir, record.dbFileName, {
-      seedStarterData: record.id === 'default',
       keyCipher: this.options.keyCipher,
     });
     const summary = computeSummary(tempDb);
@@ -165,7 +164,6 @@ export class PersonaManager {
         : path.join(this.userDataDir, `exported-profile-site-${record.id}`);
 
     const db = new StudioDatabase(this.userDataDir, record.dbFileName, {
-      seedStarterData: record.id === 'default',
       defaultExportPath,
       keyCipher: this.options.keyCipher,
     });
@@ -266,7 +264,6 @@ export class PersonaManager {
 
     // Initialize isolated SQLite DB with a fresh Ed25519 keypair and clean slate
     const newDb = new StudioDatabase(this.userDataDir, dbFileName, {
-      seedStarterData: Boolean(input.seedStarterData),
       defaultExportPath,
       keyCipher: this.options.keyCipher,
       initialProfile: {

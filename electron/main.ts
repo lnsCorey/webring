@@ -13,12 +13,11 @@ import {
 } from 'electron';
 import * as path from 'path';
 import * as fs from 'fs';
-import { StudioDatabase } from './db/database';
-import { StaticSiteGenerator } from './services/siteGenerator';
 import { PersonaManager } from './services/personaManager';
 import { LocalPreviewServer } from './services/localPreviewServer';
 import { WebringMcpServer } from './mcp/mcpServer';
 import { McpHttpServer } from './mcp/mcpHttpServer';
+import { DEMO_PEER_FOLDER_NAME } from './db/legacyDemoContent';
 import { isRingMemberFlagged } from './services/ringService';
 import {
   describePreset,
@@ -211,6 +210,9 @@ async function initServices() {
     },
   });
   applyLoginItem(scheduler.loadConfig());
+
+  // Older versions generated a fictional demo friend's site here; it's no longer used
+  fs.rmSync(path.join(userDataDir, DEMO_PEER_FOLDER_NAME), { recursive: true, force: true });
   webringMcpServer.attachScheduler(scheduler);
 
   mcpHttpServer = new McpHttpServer(webringMcpServer, {
@@ -615,71 +617,6 @@ function registerIpcHandlers() {
   ipcMain.handle('studio:open-path', async (_e, targetPath: string) => {
     await shell.openPath(targetPath);
     return { ok: true };
-  });
-
-  ipcMain.handle('studio:simulate-peer-site', async () => {
-    const ctx = personaManager.getActiveContext();
-    // Creates a local simulated friend's published static site on disk and crawls it!
-    const peerDir = path.join(app.getPath('userData'), 'simulated-peer-maya');
-    const peerDb = new StudioDatabase(peerDir, 'maya.sqlite');
-    const myProfile = ctx.db.getProfile();
-    const myBundle = ctx.db.buildSignedSiteBundle();
-
-    peerDb.updateProfile({
-      siteUrl: 'https://maya.indiering.social',
-      handle: 'maya.indiering.social',
-      displayName: 'Maya Lin',
-      tagline: 'Sound designer, botanical illustrator & modular synth tinkerer',
-      bio: 'Publishing static JSON feeds from my studio.',
-    });
-
-    // Have Maya publish a Wall Post AND comment/like one of OUR items or photos so the user can see live threads!
-    const targetItemUrl =
-      myBundle.items.items.find((i) => i.type === 'post')?.canonicalUrl ||
-      myBundle.items.items[0]?.canonicalUrl ||
-      myBundle.albums.albums[0]?.photos[0]?.canonicalUrl ||
-      `${myProfile.siteUrl}/api/profile.json`;
-
-    peerDb.createItem({
-      type: 'post',
-      title: 'Late-Night Buchla & Tape Loop Session',
-      category: 'status',
-      commentary:
-        'Just finished splicing a 14-second quarter-inch tape loop through a spring reverb tank. Posting this directly from my static JSON wall!',
-      mediaUrl:
-        'https://images.unsplash.com/photo-1511671782779-c97d3d27a1d4?w=800&auto=format&fit=crop&q=80',
-      tags: ['synth', 'status', 'webring'],
-    });
-
-    peerDb.createItem({
-      type: 'comment',
-      title: `Reply to ${myProfile.displayName}`,
-      targetUrl: targetItemUrl,
-      targetAuthorUrl: myProfile.siteUrl,
-      targetAuthorName: myProfile.displayName,
-      category: 'comment',
-      commentary:
-        'Love this post! So cool seeing wall posts and comments federate across our static sites without a central server.',
-      tags: ['reply', 'webring'],
-    });
-
-    peerDb.createItem({
-      type: 'like',
-      title: `Loved ${myProfile.displayName}'s post!`,
-      targetUrl: targetItemUrl,
-      targetAuthorUrl: myProfile.siteUrl,
-      targetAuthorName: myProfile.displayName,
-      category: 'photo',
-      commentary: 'Such incredible light and atmosphere on this shot! Discovered via our Webring.',
-      tags: ['webring', 'endorsed', 'photography'],
-    });
-
-    const peerSiteOut = path.join(peerDir, 'public_html');
-    const peerGen = new StaticSiteGenerator(peerDb);
-    peerGen.generateToDirectory(peerSiteOut);
-    peerDb.close();
-
-    return await ctx.ringCrawler.crawlFriendSite('https://maya.indiering.social', peerSiteOut);
   });
 
   ipcMain.handle('studio:get-mcp-info', () => {

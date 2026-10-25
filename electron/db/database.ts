@@ -21,6 +21,8 @@ import {
   computeRingNeighbors,
   ModerationAction,
   normalizeAdSensePublisherId,
+  PLACEHOLDER_DISPLAY_NAME,
+  PLACEHOLDER_SITE_URL,
   normalizeSiteUrl,
   PhotoItem,
   ProfileDocument,
@@ -43,6 +45,15 @@ import {
   sealPrivateKey,
   sealSecret,
 } from '../security/keyVault';
+import {
+  DEMO_PEER_SITE_URL,
+  LEGACY_DEMO_ALBUM,
+  LEGACY_DEMO_FRIEND,
+  LEGACY_DEMO_ITEMS,
+  LEGACY_DEMO_PHOTOS,
+  LEGACY_DEMO_PROFILE,
+  LEGACY_DEMO_WEBRING,
+} from './legacyDemoContent';
 
 /** Publishing credentials, sealed at rest and never returned by getProfile(). */
 const SECRET_PUBLISH_FIELDS = ['password', 'githubToken'] as const;
@@ -95,6 +106,8 @@ export interface PublishSettings {
   githubCustomDomain?: string;
   /** Set once the old single webring hub has been converted into a hosted ring. */
   legacyHubMigrated?: boolean;
+  /** Set once sample content seeded by earlier versions has been cleaned up. */
+  legacyDemoContentRemoved?: boolean;
   // Snapshot bookkeeping: when the static site was last generated and what it contained
   lastPublishedAt?: string;
   lastPublishedCounts?: PublishedCounts;
@@ -264,7 +277,6 @@ function openSqliteAdapter(dbPath: string): SqlDatabaseAdapter {
 }
 
 export interface StudioDatabaseOptions {
-  seedStarterData?: boolean;
   /** Seals the private key at rest. Without one, the key is stored and read as plaintext. */
   keyCipher?: KeyCipher;
   defaultExportPath?: string;
@@ -304,6 +316,70 @@ export class StudioDatabase {
     this.sealPrivateKeyAtRest();
     this.sealPublishSecretsAtRest();
     this.migrateLegacyHub();
+    this.removeLegacyDemoContent();
+  }
+
+  /**
+   * Earlier versions seeded sample content (a sample profile, album, posts, the fictional friend
+   * "Maya Lin" and a fake webring) that would otherwise end up on the user's published site.
+   * Removes it once, row by row, only where it still matches what was seeded. Anything the user
+   * edited is kept. Everything crawled from the fictional demo peer goes regardless.
+   */
+  private removeLegacyDemoContent(): void {
+    const stored = this.readStoredPublishSettings();
+    if (stored.legacyDemoContentRemoved) return;
+
+    this.transaction(() => {
+      const run = (sql: string, ...params: unknown[]) => this.db.prepare(sql).run(...params);
+
+      // The fictional friend and everything crawled from her site
+      run(
+        'DELETE FROM friends WHERE id = ? AND site_url = ? AND display_name = ?',
+        LEGACY_DEMO_FRIEND.id,
+        LEGACY_DEMO_FRIEND.siteUrl,
+        LEGACY_DEMO_FRIEND.displayName
+      );
+      run('DELETE FROM network_feed WHERE friend_site_url = ?', DEMO_PEER_SITE_URL);
+      run('DELETE FROM endorsements WHERE author_site_url = ?', DEMO_PEER_SITE_URL);
+      run('DELETE FROM site_keys WHERE site_url = ?', DEMO_PEER_SITE_URL);
+      run('DELETE FROM moderation WHERE site_url = ?', DEMO_PEER_SITE_URL);
+
+      run('DELETE FROM webrings WHERE id = ? AND hub_url = ?', LEGACY_DEMO_WEBRING.id, LEGACY_DEMO_WEBRING.hubUrl);
+      for (const item of LEGACY_DEMO_ITEMS) {
+        run('DELETE FROM items WHERE id = ? AND title = ?', item.id, item.title);
+      }
+      for (const photo of LEGACY_DEMO_PHOTOS) {
+        run('DELETE FROM photos WHERE id = ? AND url = ? AND album_id = ?', photo.id, photo.url, LEGACY_DEMO_ALBUM.id);
+      }
+      run(
+        `DELETE FROM albums WHERE id = ? AND title = ?
+           AND NOT EXISTS (SELECT 1 FROM photos WHERE album_id = albums.id)`,
+        LEGACY_DEMO_ALBUM.id,
+        LEGACY_DEMO_ALBUM.title
+      );
+
+      // Reset sample profile fields the user never changed
+      const legacy = LEGACY_DEMO_PROFILE;
+      const resets: Array<[string, string, string]> = [
+        ['site_url', legacy.siteUrl, PLACEHOLDER_SITE_URL],
+        ['handle', legacy.handle, new URL(PLACEHOLDER_SITE_URL).hostname],
+        ['display_name', legacy.displayName, PLACEHOLDER_DISPLAY_NAME],
+        ['tagline', legacy.tagline, ''],
+        ['bio', legacy.bio, ''],
+        ['location', legacy.location, ''],
+        ['avatar_url', legacy.avatarUrl, ''],
+        ['banner_url', legacy.bannerUrl, ''],
+        ['interests_json', JSON.stringify(legacy.interests), '[]'],
+        ['atproto_handle', legacy.atprotoHandle, ''],
+      ];
+      for (const [column, seeded, replacement] of resets) {
+        run(`UPDATE profile SET ${column} = ? WHERE id = 1 AND ${column} = ?`, replacement, seeded);
+      }
+
+      this.db
+        .prepare('UPDATE profile SET publish_settings_json = ? WHERE id = 1')
+        .run(JSON.stringify({ ...this.readStoredPublishSettings(), legacyDemoContentRemoved: true }));
+    });
   }
 
   /**
@@ -679,24 +755,20 @@ export class StudioDatabase {
     if (!existing) {
       const { publicKeyPem, privateKeyPem } = generateIdentityKeyPair();
       const now = new Date().toISOString();
-      const shouldSeedStarter = options?.seedStarterData !== false;
       const init = options?.initialProfile;
 
-      const siteUrl = normalizeSiteUrl(init?.siteUrl || 'https://alex.indiering.social');
+      // New profiles start empty: a placeholder address the user replaces with their real site
+      const siteUrl = normalizeSiteUrl(init?.siteUrl || PLACEHOLDER_SITE_URL);
       let defaultHandle = init?.handle || '';
       if (!defaultHandle) {
         try {
           defaultHandle = new URL(siteUrl).hostname;
         } catch {
-          defaultHandle = 'alex.indiering.social';
+          defaultHandle = new URL(PLACEHOLDER_SITE_URL).hostname;
         }
       }
 
-      const defaultInterests =
-        init?.interests ||
-        (shouldSeedStarter
-          ? ['IndieWeb', 'Photography', 'Self-Hosting', 'Decentralized Web', 'Sci-Fi']
-          : ['IndieWeb', 'Decentralized Web']);
+      const defaultInterests = init?.interests || [];
       // Relative, not root-absolute: these must still resolve correctly when the exported site is
       // hosted in a subfolder (e.g. a GitHub Pages project site at username.github.io/repo-name/).
       const defaultLinks = [
@@ -714,28 +786,16 @@ export class StudioDatabase {
         .run(
           siteUrl,
           defaultHandle,
-          init?.displayName || 'Alex Rivera',
-          init?.tagline ??
-            (shouldSeedStarter
-              ? 'Digital gardener, analog photographer & webring explorer'
-              : ''),
-          init?.bio ??
-            (shouldSeedStarter
-              ? 'Welcome to my self-contained corner of the web! Everything here is hosted as static JSON & HTML, managed locally from my desktop studio, and federated across my friend ring.'
-              : ''),
-          init?.location ?? (shouldSeedStarter ? 'Pacific Northwest' : ''),
-          init?.avatarUrl ??
-            (shouldSeedStarter
-              ? 'https://images.unsplash.com/photo-1534528741775-53994a69daeb?w=300&auto=format&fit=crop&q=80'
-              : ''),
-          init?.bannerUrl ??
-            (shouldSeedStarter
-              ? 'https://images.unsplash.com/photo-1506744038136-46273834b3fb?w=1200&auto=format&fit=crop&q=80'
-              : ''),
+          init?.displayName || PLACEHOLDER_DISPLAY_NAME,
+          init?.tagline ?? '',
+          init?.bio ?? '',
+          init?.location ?? '',
+          init?.avatarUrl ?? '',
+          init?.bannerUrl ?? '',
           JSON.stringify(defaultInterests),
           JSON.stringify(defaultLinks),
           init?.theme || 'neo-webring',
-          init?.atprotoHandle ?? (shouldSeedStarter ? 'alex.bsky.social' : ''),
+          init?.atprotoHandle ?? '',
           publicKeyPem,
           privateKeyPem,
           JSON.stringify({
@@ -754,182 +814,7 @@ export class StudioDatabase {
           }),
           now
         );
-
-      if (shouldSeedStarter) {
-        this.seedStarterData();
-      }
     }
-  }
-
-  private seedStarterData(): void {
-    const albumId = 'album-pnw-trails';
-    const now = new Date().toISOString();
-    this.db
-      .prepare(
-        `INSERT INTO albums (id, title, description, cover_url, tags_json, created_at, updated_at)
-         VALUES (?, ?, ?, ?, ?, ?, ?)`
-      )
-      .run(
-        albumId,
-        'Misty Morning Trails',
-        '35mm film and digital snapshots from autumn hikes around old-growth forests and coastal headlands.',
-        'https://images.unsplash.com/photo-1441974231531-c6227db76b6e?w=800&auto=format&fit=crop&q=80',
-        JSON.stringify(['photography', 'nature', 'pnw', '35mm']),
-        now,
-        now
-      );
-
-    const samplePhotos = [
-      {
-        id: 'photo-sunbeams',
-        url: 'https://images.unsplash.com/photo-1441974231531-c6227db76b6e?w=1200&auto=format&fit=crop&q=80',
-        thumbUrl: 'https://images.unsplash.com/photo-1441974231531-c6227db76b6e?w=400&auto=format&fit=crop&q=80',
-        caption: 'First light breaking through the Douglas fir canopy at 6:30 AM.',
-        tags: ['forest', 'sunlight', 'morning'],
-      },
-      {
-        id: 'photo-coast-fog',
-        url: 'https://images.unsplash.com/photo-1470071459604-3b5ec3a7fe05?w=1200&auto=format&fit=crop&q=80',
-        thumbUrl: 'https://images.unsplash.com/photo-1470071459604-3b5ec3a7fe05?w=400&auto=format&fit=crop&q=80',
-        caption: 'Ridge line rolling fog before the rain moved in.',
-        tags: ['fog', 'mountains', 'landscape'],
-      },
-    ];
-
-    for (const p of samplePhotos) {
-      this.db
-        .prepare(
-          `INSERT INTO photos (id, album_id, url, thumb_url, caption, alt_text, tags_json, width, height, taken_at, created_at)
-           VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)`
-        )
-        .run(p.id, albumId, p.url, p.thumbUrl, p.caption, p.caption, JSON.stringify(p.tags), 1200, 800, now, now);
-    }
-
-    const sampleItems: Array<{
-      id: string;
-      type: SharedItemType;
-      title: string;
-      targetUrl: string;
-      targetAuthorUrl: string;
-      targetAuthorName: string;
-      category: string;
-      commentary: string;
-      mediaUrl: string;
-      rating: number;
-      tags: string[];
-    }> = [
-      {
-        id: 'item-welcome-post',
-        type: 'post',
-        title: 'Building My Own Static Social Wall on the IndieWeb',
-        targetUrl: 'https://alex.indiering.social/api/items.json#item-welcome-post',
-        targetAuthorUrl: '',
-        targetAuthorName: '',
-        category: 'status',
-        commentary:
-          'Just set up my self-contained profile wall! No algorithms, no cloud database lock-in—just local SQLite authoring, Ed25519 signatures, and pull-federated comments across our friend ring.',
-        mediaUrl:
-          'https://images.unsplash.com/photo-1518770660439-4636190af475?w=800&auto=format&fit=crop&q=80',
-        rating: 5,
-        tags: ['status', 'indieweb', 'webring'],
-      },
-      {
-        id: 'item-posse-manifesto',
-        type: 'share',
-        title: 'Why Small Static Websites & Webrings Are Returning',
-        targetUrl: 'https://indieweb.org/POSSE',
-        targetAuthorUrl: 'https://indieweb.org',
-        targetAuthorName: 'IndieWeb Community',
-        category: 'article',
-        commentary: 'Owning your own digital home and syndicating outward via clean JSON schemas is the antidote to algorithmic burnout.',
-        mediaUrl: '',
-        rating: 5,
-        tags: ['indieweb', 'federation', 'webrings'],
-      },
-      {
-        id: 'item-synth-album',
-        type: 'like',
-        title: 'Music for Subterranean Greenhouses (Ambient Tape Loop LP)',
-        targetUrl: 'https://maya.indiering.social/api/items.json#item-ambient-tape',
-        targetAuthorUrl: 'https://maya.indiering.social',
-        targetAuthorName: 'Maya Lin',
-        category: 'music',
-        commentary: 'Been listening to this modular synth tape study non-stop while editing photos.',
-        mediaUrl: 'https://images.unsplash.com/photo-1511671782779-c97d3d27a1d4?w=600&auto=format&fit=crop&q=80',
-        rating: 5,
-        tags: ['ambient', 'synth', 'music'],
-      },
-      {
-        id: 'item-camera-rec',
-        type: 'recommendation',
-        title: 'Olympus OM-1 Mechanical 35mm SLR',
-        targetUrl: 'https://camerawiki.org/olympus-om1',
-        targetAuthorUrl: '',
-        targetAuthorName: 'Camera Wiki',
-        category: 'gear',
-        commentary: 'Fully mechanical shutter, huge bright viewfinder, and compact enough to carry on every trail.',
-        mediaUrl: 'https://images.unsplash.com/photo-1516035069371-29a1b244cc32?w=600&auto=format&fit=crop&q=80',
-        rating: 5,
-        tags: ['camera', 'film', 'photography'],
-      },
-    ];
-
-    for (const item of sampleItems) {
-      this.db
-        .prepare(
-          `INSERT INTO items (
-            id, type, title, target_url, target_author_url, target_author_name,
-            category, commentary, media_url, rating, tags_json, created_at
-          ) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)`
-        )
-        .run(
-          item.id,
-          item.type,
-          item.title,
-          item.targetUrl,
-          item.targetAuthorUrl,
-          item.targetAuthorName,
-          item.category,
-          item.commentary,
-          item.mediaUrl,
-          item.rating,
-          JSON.stringify(item.tags),
-          now
-        );
-    }
-
-    this.db
-      .prepare(
-        `INSERT INTO friends (id, site_url, did, display_name, handle, avatar_url, bio, relationship_json, visibility, added_at)
-         VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?)`
-      )
-      .run(
-        'friend-maya',
-        'https://maya.indiering.social',
-        'did:web:maya.indiering.social',
-        'Maya Lin',
-        'maya.indiering.social',
-        'https://images.unsplash.com/photo-1517841905240-472988babdf9?w=300&auto=format&fit=crop&q=80',
-        'Sound designer, botanical illustrator & modular synth tinkerer.',
-        JSON.stringify(['friend', 'met', 'muse']),
-        'private',
-        now
-      );
-
-    this.db
-      .prepare(
-        `INSERT INTO webrings (id, name, hub_url, description, prev_site_url, next_site_url, joined_at)
-         VALUES (?, ?, ?, ?, ?, ?, ?)`
-      )
-      .run(
-        'ring-indie-craft',
-        'Indie Craft & Photo Ring',
-        'https://ring.indiecraft.org/webring-hub.json',
-        'A federated ring of independent photographers, makers, and digital gardeners.',
-        'https://maya.indiering.social',
-        'https://devon.indiering.social',
-        now
-      );
   }
 
   public getProfile(): ProfileDocument & { publicKeyPem: string; publishSettings: PublishSettings } {

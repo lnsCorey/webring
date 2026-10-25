@@ -53,7 +53,6 @@ contextBridge.exposeInMainWorld('studioApi', {
   publishGithub: (settings: unknown) => ipcRenderer.invoke('studio:publish-github', settings),
   checkGithubRepo: (settings: unknown) => ipcRenderer.invoke('studio:check-github-repo', settings),
   openPath: (targetPath: string) => ipcRenderer.invoke('studio:open-path', targetPath),
-  simulatePeerSite: () => ipcRenderer.invoke('studio:simulate-peer-site'),
   getMcpInfo: () => ipcRenderer.invoke('studio:get-mcp-info'),
   callMcpTool: (toolName: string, args?: Record<string, unknown>) =>
     ipcRenderer.invoke('studio:call-mcp-tool', toolName, args),
