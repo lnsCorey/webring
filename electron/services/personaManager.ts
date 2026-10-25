@@ -3,7 +3,7 @@ import * as path from 'path';
 import * as crypto from 'crypto';
 import { KeyCipher } from '../security/keyVault';
 import { StudioDatabase } from '../db/database';
-import { MediaProcessor } from './mediaProcessor';
+import { MediaLibrary, optimizeLegacyPhotos } from './mediaLibrary';
 import { StaticSiteGenerator } from './siteGenerator';
 import { SitePublisher } from './publisher';
 import { RingCrawler } from './ringCrawler';
@@ -26,7 +26,7 @@ interface StoredPersonaRegistry {
 export interface ActivePersonaContext {
   persona: PersonaSummary;
   db: StudioDatabase;
-  mediaProcessor: MediaProcessor;
+  mediaLibrary: MediaLibrary;
   siteGenerator: StaticSiteGenerator;
   sitePublisher: SitePublisher;
   ringCrawler: RingCrawler;
@@ -168,10 +168,17 @@ export class PersonaManager {
       keyCipher: this.options.keyCipher,
     });
     const siteGenerator = new StaticSiteGenerator(db, mediaStoreDir);
+    const mediaLibrary = new MediaLibrary(mediaStoreDir);
+    try {
+      // One-time upgrade of photos imported before the Media Library (no-op afterwards)
+      optimizeLegacyPhotos(db, mediaLibrary);
+    } catch {
+      // Never block opening a persona over a photo
+    }
     return {
       persona: this.hydratePersonaSummary(record, db),
       db,
-      mediaProcessor: new MediaProcessor(mediaStoreDir),
+      mediaLibrary,
       siteGenerator,
       sitePublisher: new SitePublisher(siteGenerator),
       ringCrawler: new RingCrawler(db),

@@ -189,6 +189,14 @@ export const PhotoItemSchema = z.object({
   height: z.number().optional(),
   takenAt: z.string().optional(),
   createdAt: z.string(),
+  // Media Library photos: exact published files (content-addressed), so changes are detectable
+  sha256: z.string().optional(),
+  bytes: z.number().optional(),
+  mimeType: z.string().optional(),
+  thumbSha256: z.string().optional(),
+  thumbBytes: z.number().optional(),
+  thumbWidth: z.number().optional(),
+  thumbHeight: z.number().optional(),
 });
 export type PhotoItem = z.infer<typeof PhotoItemSchema>;
 
@@ -202,8 +210,56 @@ export const AlbumItemSchema = z.object({
   photos: z.array(PhotoItemSchema).default([]),
   createdAt: z.string(),
   updatedAt: z.string(),
+  /** Relative URL of the album's signed manifest (media/albums/<id>/manifest.json). */
+  manifestUrl: z.string().optional(),
 });
 export type AlbumItem = z.infer<typeof AlbumItemSchema>;
+
+const AlbumManifestFileSchema = z.object({
+  url: z.string(),
+  sha256: z.string().optional(),
+  bytes: z.number().optional(),
+  mimeType: z.string().optional(),
+  width: z.number().optional(),
+  height: z.number().optional(),
+});
+
+/**
+ * A signed description of one album and every file in it, published next to the photos at
+ * media/albums/<albumId>/manifest.json. Hashes let anyone check the files they download, and a
+ * new updatedAt plus changed or missing entries tell readers what was replaced or removed.
+ */
+export const AlbumManifestSchema = z.object({
+  schemaVersion: z.string().default(WEBRING_SCHEMA_VERSION),
+  type: z.literal('webring-album-manifest'),
+  siteUrl: z.string(),
+  did: z.string(),
+  updatedAt: z.string(),
+  album: z.object({
+    id: z.string(),
+    canonicalUrl: z.string(),
+    title: z.string(),
+    description: z.string().default(''),
+    coverUrl: z.string().default(''),
+    tags: z.array(z.string()).default([]),
+    createdAt: z.string(),
+  }),
+  photos: z.array(
+    z.object({
+      id: z.string(),
+      canonicalUrl: z.string(),
+      caption: z.string().default(''),
+      altText: z.string().default(''),
+      tags: z.array(z.string()).default([]),
+      takenAt: z.string().optional(),
+      createdAt: z.string(),
+      image: AlbumManifestFileSchema,
+      thumbnail: AlbumManifestFileSchema,
+    })
+  ),
+  proof: SignatureProofSchema.optional(),
+});
+export type AlbumManifest = z.infer<typeof AlbumManifestSchema>;
 
 export const AlbumsDocumentSchema = z.object({
   schemaVersion: z.string().default(WEBRING_SCHEMA_VERSION),

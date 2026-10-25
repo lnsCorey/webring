@@ -2,6 +2,15 @@ import * as fs from 'fs';
 import * as path from 'path';
 import SftpClient from 'ssh2-sftp-client';
 import * as ftp from 'basic-ftp';
+import * as crypto from 'crypto';
+import {
+  applySyncPlan,
+  describeOutcome,
+  finishLocalExport,
+  hashStagedFiles,
+  planSync,
+  STUDIO_OWNED_PREFIXES,
+} from './publishSync';
 import { PublishSettings } from '../db/database';
 import { StaticSiteGenerator } from './siteGenerator';
 
@@ -10,7 +19,21 @@ export interface PublishResult {
   mode: 'local' | 'sftp' | 'ftp' | 'github-pages';
   destination: string;
   filesPublished: number;
+  uploaded?: number;
+  unchanged?: number;
+  removed?: number;
   message: string;
+}
+
+/** Git's blob id for file contents: sha1("blob <size>\0" + content). */
+export function gitBlobSha(content: Buffer): string {
+  return crypto.createHash('sha1').update(`blob ${content.length}\0`).update(content).digest('hex');
+}
+
+function missingNote(missing: string[]): string {
+  return missing.length
+    ? ` ${missing.length} photo file(s) are missing from the Media Library and weren't published.`
+    : '';
 }
 
 export interface GitHubRepoCheckResult {
@@ -34,13 +57,15 @@ export class SitePublisher {
   public publishToLocalDirectory(targetDir: string): PublishResult {
     try {
       const result = this.generator.generateToDirectory(targetDir);
+      const outcome = finishLocalExport(this.generator.database, targetDir, result.filesWritten);
       this.generator.recordPublished(result.bundle);
       return {
         success: true,
         mode: 'local',
         destination: result.outputDir,
-        filesPublished: result.filesWritten.length,
-        message: `Successfully exported ${result.filesWritten.length} files (HTML, DID, and JSON endpoints) to ${result.outputDir}`,
+        filesPublished: outcome.uploaded,
+        ...outcome,
+        message: `Exported to ${result.outputDir}: ${describeOutcome(outcome)}.${missingNote(result.missingMedia)}`,
       };
     } catch (err: unknown) {
       return {
@@ -54,80 +79,141 @@ export class SitePublisher {
   }
 
   /**
-   * Generates the site to a staging folder and uploads it to the configured SFTP or FTP host.
+   * Generates the site to a staging folder and uploads what changed to the configured SFTP or
+   * FTP folder, deleting files Studio published there before that are no longer part of the site.
    */
   public async publishToRemoteHost(
     settings: PublishSettings,
     stagingDir: string
   ): Promise<PublishResult> {
     const genResult = this.generator.generateToDirectory(stagingDir);
+    const db = this.generator.database;
+    const mode = settings.protocol === 'sftp' ? 'sftp' : 'ftp';
+    const port = settings.port || (mode === 'sftp' ? 22 : 21);
+    const root = (settings.remotePath || '/').replace(/\/+$/, '') || '';
+    const remote = (relPath: string) => `${root}/${relPath}`;
+    const destination = `${mode}://${settings.username}@${settings.host}:${port}${root || '/'}`;
+    const files = hashStagedFiles(stagingDir);
 
-    if (settings.protocol === 'sftp') {
+    if (mode === 'sftp') {
       const sftp = new SftpClient();
       try {
-        await sftp.connect({
-          host: settings.host,
-          port: settings.port || 22,
-          username: settings.username,
-          password: settings.password,
+        await sftp.connect({ host: settings.host, port, username: settings.username, password: settings.password });
+        const owned = await this.listSftpOwned(sftp, root);
+        const plan = planSync(files, db.getPublishLedger(destination), owned);
+        const madeDirs = new Set<string>();
+        const outcome = await applySyncPlan(db, destination, stagingDir, plan, {
+          upload: async (localFile, relPath) => {
+            const dir = path.posix.dirname(remote(relPath));
+            if (!madeDirs.has(dir)) {
+              await sftp.mkdir(dir, true).catch(() => undefined);
+              await sftp.chmod(dir, 0o755).catch(() => undefined);
+              madeDirs.add(dir);
+            }
+            await sftp.fastPut(localFile, remote(relPath));
+            await sftp.chmod(remote(relPath), 0o644).catch(() => undefined);
+          },
+          remove: async (relPath) => {
+            await sftp.delete(remote(relPath), true);
+          },
         });
-        await sftp.uploadDir(stagingDir, settings.remotePath);
-        await this.ensureRemoteSftpPermissions(sftp, stagingDir, settings.remotePath);
         await sftp.end();
         this.generator.recordPublished(genResult.bundle);
         return {
           success: true,
-          mode: 'sftp',
-          destination: `sftp://${settings.host}:${settings.port}${settings.remotePath}`,
-          filesPublished: genResult.filesWritten.length,
-          message: `Uploaded ${genResult.filesWritten.length} files via SFTP to ${settings.host}:${settings.remotePath}`,
+          mode,
+          destination: `sftp://${settings.host}:${port}${root || '/'}`,
+          filesPublished: outcome.uploaded,
+          ...outcome,
+          message: `Published via SFTP to ${settings.host}:${root || '/'}: ${describeOutcome(outcome)}.${missingNote(genResult.missingMedia)}`,
         };
       } catch (err: unknown) {
-        try {
-          await sftp.end();
-        } catch {
-          // ignore
-        }
+        await sftp.end().catch(() => undefined);
         return {
           success: false,
-          mode: 'sftp',
+          mode,
           destination: settings.host,
           filesPublished: 0,
           message: `SFTP upload failed: ${err instanceof Error ? err.message : String(err)}`,
         };
       }
-    } else {
-      const client = new ftp.Client();
-      try {
-        await client.access({
-          host: settings.host,
-          port: settings.port || 21,
-          user: settings.username,
-          password: settings.password,
-          secure: false,
-        });
-        await client.ensureDir(settings.remotePath);
-        await client.uploadFromDir(stagingDir, settings.remotePath);
-        client.close();
-        this.generator.recordPublished(genResult.bundle);
-        return {
-          success: true,
-          mode: 'ftp',
-          destination: `ftp://${settings.host}:${settings.port}${settings.remotePath}`,
-          filesPublished: genResult.filesWritten.length,
-          message: `Uploaded ${genResult.filesWritten.length} files via FTP to ${settings.host}:${settings.remotePath}`,
-        };
-      } catch (err: unknown) {
-        client.close();
-        return {
-          success: false,
-          mode: 'ftp',
-          destination: settings.host,
-          filesPublished: 0,
-          message: `FTP upload failed: ${err instanceof Error ? err.message : String(err)}`,
-        };
-      }
     }
+
+    const client = new ftp.Client();
+    try {
+      await client.access({ host: settings.host, port, user: settings.username, password: settings.password, secure: false });
+      const owned = await this.listFtpOwned(client, root);
+      const plan = planSync(files, db.getPublishLedger(destination), owned);
+      const outcome = await applySyncPlan(db, destination, stagingDir, plan, {
+        upload: async (localFile, relPath) => {
+          // ensureDir also moves into that folder, so upload by file name
+          await client.ensureDir(path.posix.dirname(remote(relPath)));
+          await client.uploadFrom(localFile, path.posix.basename(relPath));
+        },
+        remove: async (relPath) => {
+          await client.remove(remote(relPath), true);
+        },
+      });
+      client.close();
+      this.generator.recordPublished(genResult.bundle);
+      return {
+        success: true,
+        mode,
+        destination: `ftp://${settings.host}:${port}${root || '/'}`,
+        filesPublished: outcome.uploaded,
+        ...outcome,
+        message: `Published via FTP to ${settings.host}:${root || '/'}: ${describeOutcome(outcome)}.${missingNote(genResult.missingMedia)}`,
+      };
+    } catch (err: unknown) {
+      client.close();
+      return {
+        success: false,
+        mode,
+        destination: settings.host,
+        filesPublished: 0,
+        message: `FTP upload failed: ${err instanceof Error ? err.message : String(err)}`,
+      };
+    }
+  }
+
+  /** Studio-owned files already on an SFTP host (missing folders are fine: nothing to clean). */
+  private async listSftpOwned(sftp: SftpClient, root: string): Promise<string[]> {
+    const found: string[] = [];
+    const walk = async (rel: string): Promise<void> => {
+      let entries: Array<{ name: string; type: string }>;
+      try {
+        entries = await sftp.list(`${root}/${rel}`);
+      } catch {
+        return;
+      }
+      for (const entry of entries) {
+        const child = `${rel}/${entry.name}`;
+        if (entry.type === 'd') await walk(child);
+        else found.push(child);
+      }
+    };
+    for (const prefix of STUDIO_OWNED_PREFIXES) await walk(prefix.replace(/\/$/, ''));
+    return found;
+  }
+
+  private async listFtpOwned(client: ftp.Client, root: string): Promise<string[]> {
+    const found: string[] = [];
+    const walk = async (rel: string): Promise<void> => {
+      let entries: ftp.FileInfo[];
+      try {
+        entries = await client.list(`${root}/${rel}`);
+      } catch {
+        return;
+      }
+      for (const entry of entries) {
+        if (entry.name === '.' || entry.name === '..') continue;
+        const child = `${rel}/${entry.name}`;
+        if (entry.isDirectory) await walk(child);
+        else found.push(child);
+      }
+    };
+    for (const prefix of STUDIO_OWNED_PREFIXES) await walk(prefix.replace(/\/$/, ''));
+    return found;
   }
 
   /**
@@ -219,12 +305,46 @@ export class SitePublisher {
       }
       const baseTreeSha = (baseCommitRes.body as { tree: { sha: string } }).tree.sha;
 
-      // 2. Upload every file in the staging dir as a blob. GitHub's abuse-detection rate limiter
-      // flags concurrent writes to this endpoint, so these go one at a time (retried internally
-      // with backoff by githubRequest on 403/429) rather than in parallel chunks.
-      const files = this.listFilesRecursive(stagingDir);
-      const treeEntries: Array<{ path: string; mode: string; type: string; sha: string }> = [];
-      for (const relPath of files) {
+      // 2. Compare with what's on the branch: GitHub identifies files by their git blob hash, so
+      // unchanged files (most photos, most of the time) aren't uploaded again.
+      const remoteTreeRes = await gh(`${repoPath}/git/trees/${baseTreeSha}?recursive=1`);
+      const remoteTree = new Map<string, string>();
+      let remoteComplete = false;
+      if (remoteTreeRes.status === 200) {
+        const body = remoteTreeRes.body as { truncated?: boolean; tree: Array<{ path: string; type: string; sha: string }> };
+        for (const entry of body.tree) if (entry.type === 'blob') remoteTree.set(entry.path, entry.sha);
+        remoteComplete = !body.truncated;
+      }
+      const destination = `github:${owner}/${repo}@${branch}`;
+      const db = this.generator.database;
+      const ledger = db.getPublishLedger(destination);
+      const files = hashStagedFiles(stagingDir);
+      const toUpload = [...files.keys()].filter(
+        (relPath) => remoteTree.get(relPath) !== gitBlobSha(fs.readFileSync(path.join(stagingDir, relPath)))
+      );
+      // Only delete what Studio published here (or owns outright), and only if it's still there
+      const plan = planSync(files, ledger, remoteComplete ? [...remoteTree.keys()] : []);
+      const toRemove = plan.remove.filter((relPath) => remoteTree.has(relPath));
+      if (toUpload.length === 0 && toRemove.length === 0) {
+        for (const [relPath, hash] of files) db.setPublishLedgerEntry(destination, relPath, hash);
+        this.generator.recordPublished(genResult.bundle);
+        return {
+          success: true,
+          mode: 'github-pages',
+          destination: `https://github.com/${owner}/${repo}/tree/${branch}`,
+          filesPublished: 0,
+          uploaded: 0,
+          unchanged: files.size,
+          removed: 0,
+          message: `${owner}/${repo}@${branch} is already up to date.${missingNote(genResult.missingMedia)}`,
+        };
+      }
+
+      // 3. Upload changed files as blobs. GitHub's abuse-detection rate limiter flags concurrent
+      // writes to this endpoint, so these go one at a time (retried internally with backoff by
+      // githubRequest on 403/429) rather than in parallel chunks.
+      const treeEntries: Array<{ path: string; mode: string; type: string; sha: string | null }> = [];
+      for (const relPath of toUpload) {
         const content = fs.readFileSync(path.join(stagingDir, relPath)).toString('base64');
         const blobRes = await gh(`${repoPath}/git/blobs`, 'POST', {
           content,
@@ -242,8 +362,11 @@ export class SitePublisher {
           sha: (blobRes.body as { sha: string }).sha,
         });
       }
+      for (const relPath of toRemove) {
+        treeEntries.push({ path: relPath, mode: '100644', type: 'blob', sha: null });
+      }
 
-      // 3. Create a new tree + commit on top of the branch's current state, then fast-forward the ref.
+      // 4. Create a new tree + commit on top of the branch's current state, then fast-forward the ref.
       const treeRes = await gh(`${repoPath}/git/trees`, 'POST', {
         base_tree: baseTreeSha,
         tree: treeEntries,
@@ -254,7 +377,7 @@ export class SitePublisher {
       const newTreeSha = (treeRes.body as { sha: string }).sha;
 
       const commitRes = await gh(`${repoPath}/git/commits`, 'POST', {
-        message: `Publish site via Webring Studio (${genResult.filesWritten.length} files)`,
+        message: `Publish site via Webring Studio (${toUpload.length} changed, ${toRemove.length} removed)`,
         tree: newTreeSha,
         parents: [baseCommitSha],
       });
@@ -271,7 +394,10 @@ export class SitePublisher {
         throw new Error(`Failed to update branch "${branch}" (HTTP ${updateRefRes.status})${this.githubErrorDetail(updateRefRes.body)}`);
       }
 
-      // 4. Ensure GitHub Pages is configured to serve from this branch (best-effort; not fatal).
+      for (const [relPath, hash] of files) db.setPublishLedgerEntry(destination, relPath, hash);
+      for (const relPath of plan.remove) db.setPublishLedgerEntry(destination, relPath, null);
+
+      // 5. Ensure GitHub Pages is configured to serve from this branch (best-effort; not fatal).
       let pagesNote = '';
       try {
         const pagesCreateRes = await gh(`${repoPath}/pages`, 'POST', {
@@ -291,8 +417,11 @@ export class SitePublisher {
         success: true,
         mode: 'github-pages',
         destination: `https://github.com/${owner}/${repo}/tree/${branch}`,
-        filesPublished: genResult.filesWritten.length,
-        message: `Pushed ${genResult.filesWritten.length} files to ${owner}/${repo}@${branch}.${pagesNote}`,
+        filesPublished: toUpload.length,
+        uploaded: toUpload.length,
+        unchanged: files.size - toUpload.length,
+        removed: toRemove.length,
+        message: `Pushed to ${owner}/${repo}@${branch}: ${toUpload.length} uploaded, ${files.size - toUpload.length} unchanged${toRemove.length ? `, ${toRemove.length} removed` : ''}.${pagesNote}${missingNote(genResult.missingMedia)}`,
       };
     } catch (err: unknown) {
       return {
@@ -427,50 +556,4 @@ export class SitePublisher {
     const msg = (body as { message?: string } | null)?.message;
     return msg ? ` — ${msg}` : '';
   }
-
-  private listFilesRecursive(dir: string, prefix = ''): string[] {
-    const out: string[] = [];
-    for (const entry of fs.readdirSync(dir, { withFileTypes: true })) {
-      const relPath = prefix ? `${prefix}/${entry.name}` : entry.name;
-      if (entry.isDirectory()) {
-        out.push(...this.listFilesRecursive(path.join(dir, entry.name), relPath));
-      } else {
-        out.push(relPath);
-      }
-    }
-    return out;
-  }
-
-  /**
-   * Ensures remote directories have 0o755 and files have 0o644 permissions after SFTP upload
-   * so Apache / Nginx / LiteSpeed web servers do not return 403 Forbidden when SFTP umask is restrictive.
-   */
-  private async ensureRemoteSftpPermissions(
-    sftp: SftpClient,
-    localDir: string,
-    remoteDir: string
-  ): Promise<void> {
-    const cleanRemoteDir = remoteDir.replace(/\/+$/, '') || '/';
-    try {
-      await sftp.chmod(cleanRemoteDir, 0o755);
-    } catch {
-      // ignore if host disallows chmod on root target dir
-    }
-
-    if (!fs.existsSync(localDir)) return;
-    for (const entry of fs.readdirSync(localDir, { withFileTypes: true })) {
-      const localPath = path.join(localDir, entry.name);
-      const remotePath = `${cleanRemoteDir}/${entry.name}`;
-      if (entry.isDirectory()) {
-        await this.ensureRemoteSftpPermissions(sftp, localPath, remotePath);
-      } else {
-        try {
-          await sftp.chmod(remotePath, 0o644);
-        } catch {
-          // ignore if host disallows chmod
-        }
-      }
-    }
-  }
 }
-

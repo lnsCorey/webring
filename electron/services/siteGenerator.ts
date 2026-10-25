@@ -2,6 +2,7 @@ import * as fs from 'fs';
 import * as path from 'path';
 import * as crypto from 'crypto';
 import { StudioDatabase } from '../db/database';
+import { MediaLibrary } from './mediaLibrary';
 import {
   CompleteSiteBundle,
   isValidAdSlotId,
@@ -15,6 +16,8 @@ export interface GeneratedSiteResult {
   outputDir: string;
   filesWritten: string[];
   bundle: CompleteSiteBundle;
+  /** Media Library files a photo refers to but that are missing from the library folder. */
+  missingMedia: string[];
 }
 
 /**
@@ -30,6 +33,11 @@ export interface GeneratedSiteResult {
  */
 export class StaticSiteGenerator {
   constructor(private db: StudioDatabase, private mediaStoreDir?: string) {}
+
+  /** The persona database this generator publishes from (used by the publisher's ledger). */
+  public get database(): StudioDatabase {
+    return this.db;
+  }
 
   /**
    * Remembers that this bundle actually went live (local export or upload), so the studio can
@@ -64,21 +72,10 @@ export class StaticSiteGenerator {
       }
       return value;
     };
-    const media: string[] = [];
-    const walk = (dir: string, rel: string) => {
-      if (!fs.existsSync(dir)) return;
-      for (const entry of fs.readdirSync(dir, { withFileTypes: true }).sort((a, b) => a.name.localeCompare(b.name))) {
-        const full = path.join(dir, entry.name);
-        const relPath = rel ? `${rel}/${entry.name}` : entry.name;
-        if (entry.isDirectory()) {
-          walk(full, relPath);
-        } else {
-          const stat = fs.statSync(full);
-          media.push(`${relPath}:${stat.size}:${Math.floor(stat.mtimeMs)}`);
-        }
-      }
-    };
-    if (this.mediaStoreDir) walk(this.mediaStoreDir, '');
+    const media = this.localMediaFiles().map(({ url, file }) => {
+      const stat = file && fs.existsSync(file) ? fs.statSync(file) : null;
+      return stat ? `${url}:${stat.size}:${Math.floor(stat.mtimeMs)}` : `${url}:missing`;
+    });
     const hubs = this.db.buildSignedHubDocuments().map(({ ring, doc }) => ({ path: ring.hubPath, doc }));
     return crypto
       .createHash('sha256')
@@ -130,9 +127,21 @@ export class StaticSiteGenerator {
       fs.rmSync(legacyHubPath, { force: true });
     }
 
-    // 3. Copy local media files if mediaStoreDir exists
-    if (this.mediaStoreDir && fs.existsSync(this.mediaStoreDir)) {
-      this.copyDirectoryRecursive(this.mediaStoreDir, mediaOutDir, 'media', filesWritten);
+    // 3. Media Library: only the files current photos use (so removed or replaced photos stop
+    // being published), plus each album's signed manifest
+    const missingMedia: string[] = [];
+    for (const { url, file } of this.localMediaFiles()) {
+      if (!file || !fs.existsSync(file)) {
+        missingMedia.push(url);
+        continue;
+      }
+      const dest = path.join(outputDir, url);
+      fs.mkdirSync(path.dirname(dest), { recursive: true });
+      fs.copyFileSync(file, dest);
+      filesWritten.push(url);
+    }
+    for (const { path: manifestPath, doc } of this.db.buildSignedAlbumManifests()) {
+      writeJson(manifestPath, doc);
     }
 
     // 4. Write standalone index.html for the hosted Profile Website
@@ -177,28 +186,15 @@ export class StaticSiteGenerator {
       outputDir,
       filesWritten,
       bundle,
+      missingMedia,
     };
   }
 
-  private copyDirectoryRecursive(
-    srcDir: string,
-    destDir: string,
-    relPrefix: string,
-    filesWritten: string[]
-  ): void {
-    if (!fs.existsSync(srcDir)) return;
-    fs.mkdirSync(destDir, { recursive: true });
-    for (const entry of fs.readdirSync(srcDir, { withFileTypes: true })) {
-      const srcPath = path.join(srcDir, entry.name);
-      const destPath = path.join(destDir, entry.name);
-      const relPath = `${relPrefix}/${entry.name}`;
-      if (entry.isDirectory()) {
-        this.copyDirectoryRecursive(srcPath, destPath, relPath, filesWritten);
-      } else {
-        fs.copyFileSync(srcPath, destPath);
-        filesWritten.push(relPath);
-      }
-    }
+  /** Media Library files referenced by photos, with their location in the library folder. */
+  private localMediaFiles(): Array<{ url: string; file: string | null }> {
+    if (!this.mediaStoreDir) return [];
+    const library = new MediaLibrary(this.mediaStoreDir);
+    return [...this.db.getLocalMediaReferences().urls].sort().map((url) => ({ url, file: library.resolveLocalUrl(url) }));
   }
 
   private injectHydrationData(htmlTemplate: string, bundle: CompleteSiteBundle): string {

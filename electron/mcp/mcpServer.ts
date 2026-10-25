@@ -2,6 +2,7 @@ import * as path from 'path';
 import * as fs from 'fs';
 import { PersonaManager, ActivePersonaContext } from '../services/personaManager';
 import { LocalPreviewServer } from '../services/localPreviewServer';
+import { deleteAlbumWithFiles, deletePhotoWithFiles } from '../services/mediaLibrary';
 import { jobNextRunAt, Scheduler, SchedulePreset } from '../services/scheduler';
 import {
   FriendVisibility,
@@ -404,7 +405,7 @@ export class WebringMcpServer {
       {
         name: 'webring_add_photo',
         description:
-          'Add a photo to an album using either a local image file path (copied into the persona media store) or a remote image URL.',
+          'Add a photo to an album from a local JPEG/PNG file (imported into the Media Library: resized for the web, thumbnail made, camera and GPS metadata removed, published with the site) or a remote image URL.',
         inputSchema: {
           type: 'object',
           properties: {
@@ -1089,22 +1090,12 @@ export class WebringMcpServer {
           const ctx = this.resolveContext(args);
           const albumId = String(args.albumId || '');
           const urlOrPath = String(args.urlOrLocalPath || '');
-          let photoUrl = urlOrPath;
-          let thumbUrl = urlOrPath;
-          let localSourcePath = '';
-
-          if (!/^https?:\/\//i.test(urlOrPath) && fs.existsSync(urlOrPath)) {
-            const imported = ctx.mediaProcessor.importLocalPhoto(urlOrPath, albumId);
-            photoUrl = imported.relativeUrl;
-            thumbUrl = imported.thumbRelativeUrl;
-            localSourcePath = imported.localFullPath;
-          }
-
+          const isLocalFile = !/^https?:\/\//i.test(urlOrPath) && fs.existsSync(urlOrPath);
+          const media = isLocalFile ? ctx.mediaLibrary.importPhoto(urlOrPath, albumId) : undefined;
           const photo = ctx.db.addPhotoToAlbum({
             albumId,
-            url: photoUrl,
-            thumbUrl,
-            localSourcePath,
+            url: urlOrPath,
+            media,
             caption: args.caption ? String(args.caption) : undefined,
             tags: Array.isArray(args.tags) ? args.tags.map(String) : [],
           });
@@ -1116,7 +1107,7 @@ export class WebringMcpServer {
         case 'webring_delete_album': {
           const ctx = this.resolveContext(args);
           const albumId = String(args.albumId || '');
-          ctx.db.deleteAlbum(albumId);
+          deleteAlbumWithFiles(ctx.db, ctx.mediaLibrary, albumId);
           resultData = { deleted: true, albumId };
           summary = `Deleted album ${albumId}`;
           break;
@@ -1125,7 +1116,7 @@ export class WebringMcpServer {
         case 'webring_delete_photo': {
           const ctx = this.resolveContext(args);
           const photoId = String(args.photoId || '');
-          ctx.db.deletePhoto(photoId);
+          deletePhotoWithFiles(ctx.db, ctx.mediaLibrary, photoId);
           resultData = { deleted: true, photoId };
           summary = `Deleted photo ${photoId}`;
           break;
