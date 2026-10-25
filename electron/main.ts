@@ -167,10 +167,15 @@ function refreshTrayMenu() {
   );
 }
 
+/** Branded images generated from images/logo-icon.png by scripts/generate-icons.py. */
+const assetPath = (name: string) => path.join(__dirname, '../../electron/assets', name);
+
 function createTray() {
-  const iconPath = path.join(__dirname, '../../electron/assets/trayTemplate.png');
+  // macOS menu bars want a monochrome template; Windows and Linux trays show the colour logo
+  const isMac = process.platform === 'darwin';
+  const iconPath = assetPath(isMac ? 'trayTemplate.png' : 'trayIcon.png');
   const icon = fs.existsSync(iconPath) ? nativeImage.createFromPath(iconPath) : nativeImage.createEmpty();
-  icon.setTemplateImage(true);
+  if (isMac) icon.setTemplateImage(true);
   tray = new Tray(icon);
   if (icon.isEmpty() && process.platform === 'darwin') tray.setTitle('◎');
   tray.on('click', () => {
@@ -240,6 +245,8 @@ async function initServices() {
 function createWindow(show = true) {
   mainWindow = new BrowserWindow({
     show,
+    // Window and taskbar icon on Windows and Linux (macOS uses the app/dock icon)
+    icon: assetPath('app-icon.png'),
     width: 1380,
     height: 900,
     minWidth: 1024,
@@ -320,6 +327,12 @@ if (!gotTheLock) {
       if (!file || !fs.existsSync(file)) return new Response('Not found', { status: 404 });
       return net.fetch(pathToFileURL(file).toString());
     });
+    // Packaged builds get their icon from build/icon.*; when running from source, show the logo
+    // in the dock and About panel instead of Electron's default
+    if (process.platform === 'darwin' && !app.isPackaged && fs.existsSync(assetPath('dock-icon.png'))) {
+      app.dock?.setIcon(nativeImage.createFromPath(assetPath('dock-icon.png')));
+    }
+    app.setAboutPanelOptions({ applicationName: 'Webring Studio', iconPath: assetPath('app-icon.png') });
     createWindow(!startHidden);
     createTray();
     scheduler.start();
