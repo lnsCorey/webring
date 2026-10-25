@@ -49,3 +49,4 @@
 ### Known state
 
 - Both type checks are clean (`npx tsc -p tsconfig.json --noEmit` and `npx tsc -p tsconfig.electron.json --noEmit`); keep them at zero errors.
+- `npm audit` reports 3 moderate findings, all from Tailwind CSS 3 (`tailwindcss`, `postcss-nested`, `postcss-selector-parser`). They're build-time only and never ship in the app. Clearing them needs the Tailwind 4 migration, which should be done on its own with a visual check of the Studio UI. Never use `npm audit fix --force`.
