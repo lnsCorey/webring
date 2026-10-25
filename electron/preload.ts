@@ -1,4 +1,4 @@
-import { contextBridge, ipcRenderer } from 'electron';
+import { contextBridge, ipcRenderer, webUtils } from 'electron';
 import { WebringDeepLinkAction } from '../src/shared/schema';
 
 contextBridge.exposeInMainWorld('studioApi', {
@@ -14,7 +14,18 @@ contextBridge.exposeInMainWorld('studioApi', {
   createAlbum: (input: unknown) => ipcRenderer.invoke('studio:create-album', input),
   deleteAlbum: (albumId: string) => ipcRenderer.invoke('studio:delete-album', albumId),
   addPhoto: (input: unknown) => ipcRenderer.invoke('studio:add-photo', input),
-  pickAndImportPhoto: (albumId: string) => ipcRenderer.invoke('studio:pick-and-import-photo', albumId),
+  importPhotos: (albumId: string, filePaths?: string[]) =>
+    ipcRenderer.invoke('studio:media-import-photos', albumId, filePaths),
+  replacePhoto: (photoId: string) => ipcRenderer.invoke('studio:media-replace-photo', photoId),
+  importImage: () => ipcRenderer.invoke('studio:media-import-image'),
+  updatePhoto: (photoId: string, updates: unknown) => ipcRenderer.invoke('studio:media-update-photo', photoId, updates),
+  movePhoto: (photoId: string, direction: 'up' | 'down') =>
+    ipcRenderer.invoke('studio:media-move-photo', photoId, direction),
+  updateAlbum: (albumId: string, updates: unknown) => ipcRenderer.invoke('studio:media-update-album', albumId, updates),
+  getMediaUsage: () => ipcRenderer.invoke('studio:media-usage'),
+  forgetPublishHistory: () => ipcRenderer.invoke('studio:forget-publish-history'),
+  // Dropped files carry no path in a sandboxed window; webUtils recovers it
+  getPathForFile: (file: File) => webUtils.getPathForFile(file),
   deletePhoto: (photoId: string) => ipcRenderer.invoke('studio:delete-photo', photoId),
   createItem: (input: unknown) => ipcRenderer.invoke('studio:create-item', input),
   deleteItem: (itemId: string) => ipcRenderer.invoke('studio:delete-item', itemId),

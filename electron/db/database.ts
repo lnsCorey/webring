@@ -4,6 +4,7 @@ import * as crypto from 'crypto';
 import {
   AdsAddon,
   AlbumItem,
+  AlbumManifest,
   AlbumsDocument,
   AnalyticsAddon,
   buildCanonicalUrl,
@@ -64,6 +65,26 @@ type SecretPublishField = (typeof SECRET_PUBLISH_FIELDS)[number];
  * the Publish form) keeps the stored value; '' clears it; anything else replaces it.
  */
 export const STORED_SECRET_PLACEHOLDER = '••••••••';
+
+/** The published files behind a Media Library photo (see electron/services/mediaLibrary.ts). */
+export interface LocalPhotoMedia {
+  url: string;
+  thumbUrl: string;
+  sha256: string;
+  bytes: number;
+  mimeType: string;
+  width: number;
+  height: number;
+  thumbSha256: string;
+  thumbBytes: number;
+  thumbWidth: number;
+  thumbHeight: number;
+  originalPath: string;
+}
+
+export function albumManifestPath(albumId: string): string {
+  return `media/albums/${albumId.replace(/[^a-zA-Z0-9_-]/g, '')}/manifest.json`;
+}
 
 export interface PublishSettings {
   exportPath: string;
@@ -654,6 +675,14 @@ export class StudioDatabase {
         PRIMARY KEY (ring_id, site_url)
       );
 
+      CREATE TABLE IF NOT EXISTS publish_ledger (
+        destination TEXT NOT NULL,
+        path TEXT NOT NULL,
+        sha256 TEXT NOT NULL,
+        published_at TEXT NOT NULL,
+        PRIMARY KEY (destination, path)
+      );
+
       CREATE TABLE IF NOT EXISTS moderation (
         site_url TEXT PRIMARY KEY,
         action TEXT NOT NULL CHECK (action IN ('mute', 'block')),
@@ -694,6 +723,24 @@ export class StudioDatabase {
     addRingColumn('last_synced_at', 'TEXT');
     addRingColumn('request_token', "TEXT NOT NULL DEFAULT ''");
     addRingColumn('sync_warning', "TEXT NOT NULL DEFAULT ''");
+
+    // Media Library: the exact published files behind each local photo
+    const photoColumns = this.db
+      .prepare('PRAGMA table_info(photos)')
+      .all() as Array<{ name: string }>;
+    const addPhotoColumn = (name: string, ddl: string) => {
+      if (!photoColumns.some((c) => c.name === name)) {
+        this.db.exec(`ALTER TABLE photos ADD COLUMN ${name} ${ddl};`);
+      }
+    };
+    addPhotoColumn('sha256', "TEXT NOT NULL DEFAULT ''");
+    addPhotoColumn('byte_size', 'INTEGER');
+    addPhotoColumn('mime_type', "TEXT NOT NULL DEFAULT ''");
+    addPhotoColumn('thumb_sha256', "TEXT NOT NULL DEFAULT ''");
+    addPhotoColumn('thumb_byte_size', 'INTEGER');
+    addPhotoColumn('thumb_width', 'INTEGER');
+    addPhotoColumn('thumb_height', 'INTEGER');
+    addPhotoColumn('position', 'INTEGER NOT NULL DEFAULT 0');
 
     // One pinned key per site, shared by friends, ring hubs, applicants and members
     this.db.exec(`
@@ -1007,7 +1054,7 @@ export class StudioDatabase {
     return albumRows.map((a) => {
       const albumId = String(a.id);
       const photoRows = this.db
-        .prepare('SELECT * FROM photos WHERE album_id = ? ORDER BY created_at ASC')
+        .prepare('SELECT * FROM photos WHERE album_id = ? ORDER BY position ASC, created_at ASC')
         .all(albumId) as Array<Record<string, unknown>>;
 
       const photos: PhotoItem[] = photoRows.map((p) => {
@@ -1024,6 +1071,17 @@ export class StudioDatabase {
           height: p.height ? Number(p.height) : undefined,
           takenAt: p.taken_at ? String(p.taken_at) : undefined,
           createdAt: String(p.created_at),
+          ...(p.sha256
+            ? {
+                sha256: String(p.sha256),
+                bytes: p.byte_size ? Number(p.byte_size) : undefined,
+                mimeType: String(p.mime_type || '') || undefined,
+                thumbSha256: String(p.thumb_sha256 || '') || undefined,
+                thumbBytes: p.thumb_byte_size ? Number(p.thumb_byte_size) : undefined,
+                thumbWidth: p.thumb_width ? Number(p.thumb_width) : undefined,
+                thumbHeight: p.thumb_height ? Number(p.thumb_height) : undefined,
+              }
+            : {}),
         };
       });
 
@@ -1039,6 +1097,7 @@ export class StudioDatabase {
         photos,
         createdAt: String(a.created_at),
         updatedAt: String(a.updated_at),
+        manifestUrl: albumManifestPath(albumId),
       };
     });
   }
@@ -1077,51 +1136,294 @@ export class StudioDatabase {
     tags?: string[];
     width?: number;
     height?: number;
+    altText?: string;
+    media?: LocalPhotoMedia;
   }): PhotoItem {
     const id = `photo-${crypto.randomBytes(4).toString('hex')}`;
     const now = new Date().toISOString();
-    const thumb = input.thumbUrl || input.url;
+    const media = input.media;
+    const url = media?.url || input.url;
+    const thumb = media?.thumbUrl || input.thumbUrl || url;
+    const next = this.db
+      .prepare('SELECT COALESCE(MAX(position), 0) + 1 AS n FROM photos WHERE album_id = ?')
+      .get(input.albumId) as { n: number };
 
     this.db
       .prepare(
-        `INSERT INTO photos (id, album_id, url, thumb_url, local_source_path, caption, alt_text, tags_json, width, height, taken_at, created_at)
-         VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)`
+        `INSERT INTO photos (id, album_id, url, thumb_url, local_source_path, caption, alt_text, tags_json, width, height, taken_at, created_at, position)
+         VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)`
       )
       .run(
         id,
         input.albumId,
-        input.url,
+        url,
         thumb,
-        input.localSourcePath || '',
+        media?.originalPath || input.localSourcePath || '',
         input.caption || '',
-        input.caption || '',
+        input.altText || input.caption || '',
         JSON.stringify(input.tags || []),
-        input.width ?? null,
-        input.height ?? null,
+        media?.width ?? input.width ?? null,
+        media?.height ?? input.height ?? null,
         now,
-        now
+        now,
+        next.n
       );
+    if (media) this.writePhotoMedia(id, media);
+    this.touchAlbum(input.albumId);
+    return this.getPhoto(id)!;
+  }
 
-    this.db.prepare('UPDATE albums SET updated_at = ? WHERE id = ?').run(now, input.albumId);
+  public getPhoto(photoId: string): PhotoItem | undefined {
+    for (const album of this.getAlbums()) {
+      const photo = album.photos.find((p) => p.id === photoId);
+      if (photo) return photo;
+    }
+    return undefined;
+  }
 
-    const profile = this.getProfile();
-    return {
-      id,
-      canonicalUrl: buildCanonicalUrl(profile.siteUrl, 'photos', id),
-      url: input.url,
-      thumbUrl: thumb,
-      caption: input.caption || '',
-      altText: input.caption || '',
-      tags: input.tags || [],
-      width: input.width,
-      height: input.height,
-      takenAt: now,
-      createdAt: now,
-    };
+  public getPhotoAlbumId(photoId: string): string | undefined {
+    return this.photoAlbumId(photoId);
+  }
+
+  /** Local photos imported before the Media Library (no recorded hash yet). */
+  public getLegacyLocalPhotos(): Array<{ id: string; albumId: string; url: string }> {
+    return (
+      this.db
+        .prepare("SELECT id, album_id, url FROM photos WHERE url LIKE 'media/%' AND sha256 = ''")
+        .all() as Array<{ id: string; album_id: string; url: string }>
+    ).map((r) => ({ id: r.id, albumId: r.album_id, url: r.url }));
+  }
+
+  private photoAlbumId(photoId: string): string | undefined {
+    const row = this.db.prepare('SELECT album_id FROM photos WHERE id = ?').get(photoId) as
+      | { album_id: string }
+      | undefined;
+    return row?.album_id;
+  }
+
+  private touchAlbum(albumId: string | undefined): void {
+    if (!albumId) return;
+    this.db.prepare('UPDATE albums SET updated_at = ? WHERE id = ?').run(new Date().toISOString(), albumId);
+  }
+
+  private writePhotoMedia(photoId: string, media: LocalPhotoMedia): void {
+    this.db
+      .prepare(
+        `UPDATE photos SET url = ?, thumb_url = ?, local_source_path = ?, width = ?, height = ?,
+           sha256 = ?, byte_size = ?, mime_type = ?, thumb_sha256 = ?, thumb_byte_size = ?,
+           thumb_width = ?, thumb_height = ?
+         WHERE id = ?`
+      )
+      .run(
+        media.url,
+        media.thumbUrl,
+        media.originalPath,
+        media.width,
+        media.height,
+        media.sha256,
+        media.bytes,
+        media.mimeType,
+        media.thumbSha256,
+        media.thumbBytes,
+        media.thumbWidth,
+        media.thumbHeight,
+        photoId
+      );
+  }
+
+  /** Swaps a photo's image for a new one, keeping its id, caption and place in the album. */
+  public replacePhotoMedia(photoId: string, media: LocalPhotoMedia): PhotoItem {
+    if (!this.photoAlbumId(photoId)) throw new Error(`Photo "${photoId}" not found.`);
+    this.writePhotoMedia(photoId, media);
+    this.touchAlbum(this.photoAlbumId(photoId));
+    return this.getPhoto(photoId)!;
+  }
+
+  public updatePhotoDetails(
+    photoId: string,
+    updates: { caption?: string; altText?: string; tags?: string[] }
+  ): PhotoItem {
+    const current = this.getPhoto(photoId);
+    if (!current) throw new Error(`Photo "${photoId}" not found.`);
+    this.db
+      .prepare('UPDATE photos SET caption = ?, alt_text = ?, tags_json = ? WHERE id = ?')
+      .run(
+        updates.caption ?? current.caption,
+        updates.altText ?? current.altText,
+        JSON.stringify(updates.tags ?? current.tags),
+        photoId
+      );
+    this.touchAlbum(this.photoAlbumId(photoId));
+    return this.getPhoto(photoId)!;
+  }
+
+  public movePhoto(photoId: string, direction: 'up' | 'down'): void {
+    const albumId = this.photoAlbumId(photoId);
+    const album = this.getAlbums().find((a) => a.id === albumId);
+    if (!album) return;
+    const ids = album.photos.map((p) => p.id);
+    const idx = ids.indexOf(photoId);
+    const swap = direction === 'up' ? idx - 1 : idx + 1;
+    if (idx === -1 || swap < 0 || swap >= ids.length) return;
+    [ids[idx], ids[swap]] = [ids[swap], ids[idx]];
+    this.transaction(() => {
+      ids.forEach((id, i) => this.db.prepare('UPDATE photos SET position = ? WHERE id = ?').run(i + 1, id));
+    });
+    this.touchAlbum(albumId);
+  }
+
+  public updateAlbum(
+    albumId: string,
+    updates: { title?: string; description?: string; tags?: string[]; coverUrl?: string }
+  ): AlbumItem {
+    const current = this.getAlbums().find((a) => a.id === albumId);
+    if (!current) throw new Error(`Album "${albumId}" not found.`);
+    const storedCover = (this.db.prepare('SELECT cover_url FROM albums WHERE id = ?').get(albumId) as {
+      cover_url: string;
+    }).cover_url;
+    this.db
+      .prepare('UPDATE albums SET title = ?, description = ?, tags_json = ?, cover_url = ?, updated_at = ? WHERE id = ?')
+      .run(
+        updates.title?.trim() || current.title,
+        updates.description ?? current.description,
+        JSON.stringify(updates.tags ?? current.tags),
+        updates.coverUrl ?? storedCover,
+        new Date().toISOString(),
+        albumId
+      );
+    return this.getAlbums().find((a) => a.id === albumId)!;
   }
 
   public deletePhoto(photoId: string): void {
+    const albumId = this.photoAlbumId(photoId);
+    const photo = this.getPhoto(photoId);
     this.db.prepare('DELETE FROM photos WHERE id = ?').run(photoId);
+    // Don't leave the album pointing at a cover that no longer exists
+    if (albumId && photo) {
+      this.db
+        .prepare("UPDATE albums SET cover_url = '' WHERE id = ? AND cover_url IN (?, ?)")
+        .run(albumId, photo.thumbUrl, photo.url);
+    }
+    this.touchAlbum(albumId);
+  }
+
+  /**
+   * Every Media Library file still in use: photos' web copies, thumbnails and originals, plus
+   * post images, album covers and profile images that point at library files.
+   */
+  public getLocalMediaReferences(): { urls: Set<string>; originals: Set<string> } {
+    const rows = this.db.prepare('SELECT url, thumb_url, local_source_path FROM photos').all() as Array<{
+      url: string;
+      thumb_url: string;
+      local_source_path: string;
+    }>;
+    const urls = new Set<string>();
+    const originals = new Set<string>();
+    for (const row of rows) {
+      if (row.url.startsWith('media/')) urls.add(row.url);
+      if (row.thumb_url.startsWith('media/')) urls.add(row.thumb_url);
+      if (row.local_source_path) originals.add(row.local_source_path);
+    }
+    // Post images, album covers and profile images can point at library files too
+    const others = [
+      ...(this.db.prepare("SELECT media_url AS u FROM items WHERE media_url LIKE 'media/%'").all() as Array<{ u: string }>),
+      ...(this.db.prepare("SELECT cover_url AS u FROM albums WHERE cover_url LIKE 'media/%'").all() as Array<{ u: string }>),
+      ...(this.db.prepare("SELECT avatar_url AS u FROM profile WHERE avatar_url LIKE 'media/%'").all() as Array<{ u: string }>),
+      ...(this.db.prepare("SELECT banner_url AS u FROM profile WHERE banner_url LIKE 'media/%'").all() as Array<{ u: string }>),
+    ];
+    for (const { u } of others) urls.add(u);
+    return { urls, originals };
+  }
+
+  /**
+   * Signed manifests for every album: what's in it and the exact files (with hashes) behind each
+   * photo. Published at media/albums/<id>/manifest.json, next to the photos.
+   */
+  public buildSignedAlbumManifests(): Array<{ path: string; doc: AlbumManifest }> {
+    const albums = this.getAlbums();
+    if (albums.length === 0) return [];
+    const profile = this.getProfile();
+    const siteUrl = normalizeSiteUrl(profile.siteUrl);
+    const did = siteUrlToDidWeb(siteUrl);
+    const { privateKeyPem } = this.getKeys();
+    return albums.map((album) => {
+      const unsigned: AlbumManifest = {
+        schemaVersion: WEBRING_SCHEMA_VERSION,
+        type: 'webring-album-manifest',
+        siteUrl,
+        did,
+        updatedAt: album.updatedAt,
+        album: {
+          id: album.id,
+          canonicalUrl: album.canonicalUrl,
+          title: album.title,
+          description: album.description,
+          coverUrl: album.coverUrl,
+          tags: album.tags,
+          createdAt: album.createdAt,
+        },
+        photos: album.photos.map((p) => ({
+          id: p.id,
+          canonicalUrl: p.canonicalUrl,
+          caption: p.caption,
+          altText: p.altText,
+          tags: p.tags,
+          ...(p.takenAt ? { takenAt: p.takenAt } : {}),
+          createdAt: p.createdAt,
+          image: {
+            url: p.url,
+            ...(p.sha256 ? { sha256: p.sha256 } : {}),
+            ...(p.bytes ? { bytes: p.bytes } : {}),
+            ...(p.mimeType ? { mimeType: p.mimeType } : {}),
+            ...(p.width ? { width: p.width } : {}),
+            ...(p.height ? { height: p.height } : {}),
+          },
+          thumbnail: {
+            url: p.thumbUrl,
+            ...(p.thumbSha256 ? { sha256: p.thumbSha256 } : {}),
+            ...(p.thumbBytes ? { bytes: p.thumbBytes } : {}),
+            ...(p.mimeType ? { mimeType: p.mimeType } : {}),
+            ...(p.thumbWidth ? { width: p.thumbWidth } : {}),
+            ...(p.thumbHeight ? { height: p.thumbHeight } : {}),
+          },
+        })),
+      };
+      return { path: albumManifestPath(album.id), doc: signDocument(unsigned, did, privateKeyPem) };
+    });
+  }
+
+  // ---------------------------------------------------------------------------
+  // Publish ledger: what Studio last put at each destination, so publishing can upload only
+  // changes and delete only files it created
+
+  public getPublishLedger(destination: string): Map<string, string> {
+    const rows = this.db
+      .prepare('SELECT path, sha256 FROM publish_ledger WHERE destination = ?')
+      .all(destination) as Array<{ path: string; sha256: string }>;
+    return new Map(rows.map((r) => [r.path, r.sha256]));
+  }
+
+  public setPublishLedgerEntry(destination: string, filePath: string, sha256: string | null): void {
+    if (sha256 === null) {
+      this.db.prepare('DELETE FROM publish_ledger WHERE destination = ? AND path = ?').run(destination, filePath);
+      return;
+    }
+    this.db
+      .prepare(
+        `INSERT INTO publish_ledger (destination, path, sha256, published_at) VALUES (?, ?, ?, ?)
+         ON CONFLICT(destination, path) DO UPDATE SET sha256 = excluded.sha256, published_at = excluded.published_at`
+      )
+      .run(destination, filePath, sha256, new Date().toISOString());
+  }
+
+  /** Forgets every destination's publish history, so the next publish anywhere uploads everything. */
+  public clearAllPublishLedgers(): void {
+    this.db.exec('DELETE FROM publish_ledger');
+  }
+
+  /** Forgets what was published to a destination, so the next publish uploads everything. */
+  public clearPublishLedger(destination: string): void {
+    this.db.prepare('DELETE FROM publish_ledger WHERE destination = ?').run(destination);
   }
 
   public getItems(): SharedItem[] {

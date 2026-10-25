@@ -5,14 +5,17 @@ import {
   ipcMain,
   Menu,
   nativeImage,
+  net,
   Notification,
   powerMonitor,
+  protocol,
   safeStorage,
   shell,
   Tray,
 } from 'electron';
 import * as path from 'path';
 import * as fs from 'fs';
+import { pathToFileURL } from 'url';
 import { PersonaManager } from './services/personaManager';
 import { LocalPreviewServer } from './services/localPreviewServer';
 import { WebringMcpServer } from './mcp/mcpServer';
@@ -29,6 +32,19 @@ import {
   SchedulerConfig,
 } from './services/scheduler';
 import { publishTo, runScheduledPublish, runSyncAll, summarizeSync } from './services/jobs';
+import {
+  cleanUpLibrary,
+  deleteAlbumWithFiles,
+  deletePhotoWithFiles,
+  importPhotosIntoAlbum,
+  replacePhotoImage,
+} from './services/mediaLibrary';
+
+// Lets the Studio window show Media Library images: studio-media://local/<path> maps to the
+// active persona's library file for media/<path>. Must be registered before the app is ready.
+protocol.registerSchemesAsPrivileged([
+  { scheme: 'studio-media', privileges: { standard: true, secure: true, supportFetchAPI: true } },
+]);
 import {
   CreatePersonaInput,
   ModerationAction,
@@ -298,6 +314,12 @@ if (!gotTheLock) {
     const startHidden =
       process.argv.includes('--background') ||
       (process.platform === 'darwin' && app.getLoginItemSettings().wasOpenedAtLogin);
+    protocol.handle('studio-media', (request) => {
+      const relative = decodeURIComponent(new URL(request.url).pathname.replace(/^\/+/, ''));
+      const file = personaManager.getActiveContext().mediaLibrary.resolveLocalUrl(`media/${relative}`);
+      if (!file || !fs.existsSync(file)) return new Response('Not found', { status: 404 });
+      return net.fetch(pathToFileURL(file).toString());
+    });
     createWindow(!startHidden);
     createTray();
     scheduler.start();
@@ -397,7 +419,8 @@ function registerIpcHandlers() {
   });
 
   ipcMain.handle('studio:delete-album', (_e, albumId: string) => {
-    personaManager.getActiveContext().db.deleteAlbum(albumId);
+    const ctx = personaManager.getActiveContext();
+    deleteAlbumWithFiles(ctx.db, ctx.mediaLibrary, albumId);
     return { ok: true };
   });
 
@@ -405,20 +428,83 @@ function registerIpcHandlers() {
     return personaManager.getActiveContext().db.addPhotoToAlbum(input);
   });
 
-  ipcMain.handle('studio:pick-and-import-photo', async (_e, albumId: string) => {
-    if (!mainWindow) return null;
-    const result = await dialog.showOpenDialog(mainWindow, {
-      title: 'Select Photo for Album',
-      properties: ['openFile'],
-      filters: [{ name: 'Images', extensions: ['jpg', 'jpeg', 'png', 'webp', 'gif', 'avif'] }],
-    });
-    if (result.canceled || result.filePaths.length === 0) return null;
-    const imported = personaManager.getActiveContext().mediaProcessor.importLocalPhoto(result.filePaths[0], albumId);
-    return imported;
+  ipcMain.handle('studio:delete-photo', (_e, photoId: string) => {
+    const ctx = personaManager.getActiveContext();
+    deletePhotoWithFiles(ctx.db, ctx.mediaLibrary, photoId);
+    return { ok: true };
   });
 
-  ipcMain.handle('studio:delete-photo', (_e, photoId: string) => {
-    personaManager.getActiveContext().db.deletePhoto(photoId);
+  const photoFilters = [{ name: 'Photos (JPEG, PNG)', extensions: ['jpg', 'jpeg', 'png'] }];
+
+  ipcMain.handle('studio:media-import-photos', async (_e, albumId: string, filePaths?: string[]) => {
+    let files = filePaths;
+    if (!files) {
+      if (!mainWindow) return { added: [], failed: [] };
+      const result = await dialog.showOpenDialog(mainWindow, {
+        title: 'Add Photos to Album',
+        properties: ['openFile', 'multiSelections'],
+        filters: photoFilters,
+      });
+      if (result.canceled) return { added: [], failed: [] };
+      files = result.filePaths;
+    }
+    const ctx = personaManager.getActiveContext();
+    return importPhotosIntoAlbum(ctx.db, ctx.mediaLibrary, albumId, files);
+  });
+
+  // A single image for a wall post: same optimizing, metadata-stripping pipeline as album photos
+  ipcMain.handle('studio:media-import-image', async () => {
+    if (!mainWindow) return null;
+    const result = await dialog.showOpenDialog(mainWindow, {
+      title: 'Attach Image',
+      properties: ['openFile'],
+      filters: photoFilters,
+    });
+    if (result.canceled || result.filePaths.length === 0) return null;
+    const media = personaManager.getActiveContext().mediaLibrary.importPhoto(result.filePaths[0], 'wall-posts');
+    return { url: media.url, fileName: path.basename(result.filePaths[0]) };
+  });
+
+  ipcMain.handle('studio:media-replace-photo', async (_e, photoId: string) => {
+    if (!mainWindow) return { replaced: false };
+    const result = await dialog.showOpenDialog(mainWindow, {
+      title: 'Replace Photo',
+      properties: ['openFile'],
+      filters: photoFilters,
+    });
+    if (result.canceled || result.filePaths.length === 0) return { replaced: false };
+    const ctx = personaManager.getActiveContext();
+    replacePhotoImage(ctx.db, ctx.mediaLibrary, photoId, result.filePaths[0]);
+    return { replaced: true };
+  });
+
+  ipcMain.handle(
+    'studio:media-update-photo',
+    (_e, photoId: string, updates: { caption?: string; altText?: string; tags?: string[] }) => {
+      return personaManager.getActiveContext().db.updatePhotoDetails(photoId, updates);
+    }
+  );
+
+  ipcMain.handle('studio:media-move-photo', (_e, photoId: string, direction: 'up' | 'down') => {
+    personaManager.getActiveContext().db.movePhoto(photoId, direction);
+    return { ok: true };
+  });
+
+  ipcMain.handle(
+    'studio:media-update-album',
+    (_e, albumId: string, updates: { title?: string; description?: string; tags?: string[]; coverUrl?: string }) => {
+      return personaManager.getActiveContext().db.updateAlbum(albumId, updates);
+    }
+  );
+
+  ipcMain.handle('studio:media-usage', () => {
+    const ctx = personaManager.getActiveContext();
+    cleanUpLibrary(ctx.db, ctx.mediaLibrary);
+    return ctx.mediaLibrary.storageUsage();
+  });
+
+  ipcMain.handle('studio:forget-publish-history', () => {
+    personaManager.getActiveContext().db.clearAllPublishLedgers();
     return { ok: true };
   });
 

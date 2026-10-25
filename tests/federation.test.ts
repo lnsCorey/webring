@@ -1,4 +1,6 @@
-import { describe, it, expect, beforeEach, afterEach } from 'vitest';
+import { describe, it, expect, beforeEach, afterEach, vi } from 'vitest';
+import * as jpegJs from 'jpeg-js';
+import { PNG } from 'pngjs';
 import * as fs from 'fs';
 import * as path from 'path';
 import * as os from 'os';
@@ -24,7 +26,18 @@ import { jobNextRunAt, nextRunAt, Scheduler } from '../electron/services/schedul
 import { runScheduledPublish } from '../electron/services/jobs';
 import { isPrivateNetworkAddress } from '../electron/security/networkGuard';
 import { PersonaManager } from '../electron/services/personaManager';
-import { SitePublisher } from '../electron/services/publisher';
+import { gitBlobSha, SitePublisher } from '../electron/services/publisher';
+import {
+  cleanUpLibrary,
+  deletePhotoWithFiles,
+  importPhotosIntoAlbum,
+  MediaLibrary,
+  optimizeLegacyPhotos,
+  replacePhotoImage,
+  sha256Hex,
+} from '../electron/services/mediaLibrary';
+import { readJpegOrientation, UnsupportedImageError } from '../electron/services/imagePipeline';
+import { applySyncPlan, hashStagedFiles, planSync } from '../electron/services/publishSync';
 import { KeyCipher, KeyVaultUnavailableError } from '../electron/security/keyVault';
 import { LocalPreviewServer } from '../electron/services/localPreviewServer';
 import { WebringMcpServer } from '../electron/mcp/mcpServer';
@@ -1799,9 +1812,18 @@ describe('Scheduled Sync & Publish', () => {
       const afterMember = generator.contentFingerprint();
       expect(afterMember).not.toBe(afterRing);
 
-      fs.mkdirSync(mediaDir, { recursive: true });
-      fs.writeFileSync(path.join(mediaDir, 'photo.jpg'), 'pixels');
-      expect(generator.contentFingerprint()).not.toBe(afterMember);
+      // Files no photo uses aren't published, so they don't count
+      fs.mkdirSync(path.join(mediaDir, 'albums', 'a1'), { recursive: true });
+      fs.writeFileSync(path.join(mediaDir, 'stray.jpg'), 'pixels');
+      expect(generator.contentFingerprint()).toBe(afterMember);
+      // A photo's file changing on disk does
+      const album = db.createAlbum({ title: 'FP' });
+      fs.writeFileSync(path.join(mediaDir, 'albums', 'a1', 'p.jpg'), 'pixels');
+      db.addPhotoToAlbum({ albumId: album.id, url: 'media/albums/a1/p.jpg' });
+      const withPhoto = generator.contentFingerprint();
+      expect(withPhoto).not.toBe(afterMember);
+      fs.writeFileSync(path.join(mediaDir, 'albums', 'a1', 'p.jpg'), 'different pixels');
+      expect(generator.contentFingerprint()).not.toBe(withPhoto);
     } finally {
       db.close();
     }
@@ -1962,6 +1984,359 @@ describe('Release defaults (no sample content)', () => {
       expect(reopened.getItems().some((i) => i.id === 'item-welcome-post')).toBe(true);
     } finally {
       reopened.close();
+    }
+  });
+});
+
+describe('Media Library', () => {
+  let tempRoot: string;
+
+  beforeEach(() => {
+    tempRoot = fs.mkdtempSync(path.join(os.tmpdir(), 'webring-media-'));
+  });
+
+  afterEach(() => {
+    vi.unstubAllGlobals();
+    fs.rmSync(tempRoot, { recursive: true, force: true });
+  });
+
+  /** A JPEG with an EXIF block (orientation + a fake GPS marker) like a phone photo. */
+  const makePhoneJpeg = (width: number, height: number, orientation: number, seed = 0): Buffer => {
+    const data = Buffer.alloc(width * height * 4);
+    for (let i = 0; i < width * height; i++) {
+      data[i * 4] = (i + seed) % 256;
+      data[i * 4 + 1] = (i * 3 + seed) % 256;
+      data[i * 4 + 2] = 128;
+      data[i * 4 + 3] = 255;
+    }
+    const encoded = jpegJs.encode({ data, width, height }, 90).data;
+    const tiff = Buffer.alloc(26);
+    tiff.write('II', 0, 'ascii');
+    tiff.writeUInt16LE(42, 2);
+    tiff.writeUInt32LE(8, 4);
+    tiff.writeUInt16LE(1, 8); // one IFD entry
+    tiff.writeUInt16LE(0x0112, 10); // Orientation
+    tiff.writeUInt16LE(3, 12); // SHORT
+    tiff.writeUInt32LE(1, 14);
+    tiff.writeUInt16LE(orientation, 18);
+    tiff.writeUInt32LE(0, 22);
+    const payload = Buffer.concat([Buffer.from('Exif\0\0', 'ascii'), tiff, Buffer.from('GPS-SECRET-48.8584N', 'ascii')]);
+    const header = Buffer.from([0xff, 0xe1, 0, 0]);
+    header.writeUInt16BE(payload.length + 2, 2);
+    return Buffer.concat([encoded.subarray(0, 2), header, payload, encoded.subarray(2)]);
+  };
+
+  const makeSite = (name: string) => {
+    const dir = path.join(tempRoot, name);
+    const db = new StudioDatabase(dir, `${name}.sqlite`);
+    db.updateProfile({ siteUrl: `https://${name}.example`, displayName: name });
+    const mediaDir = path.join(dir, 'media-store');
+    const library = new MediaLibrary(mediaDir);
+    const generator = new StaticSiteGenerator(db, mediaDir);
+    return { db, library, generator, publisher: new SitePublisher(generator), dir };
+  };
+
+  it('publishes upright, resized, metadata-free copies and keeps the original locally', () => {
+    const source = path.join(tempRoot, 'phone.jpg');
+    fs.writeFileSync(source, makePhoneJpeg(3000, 1000, 6));
+    expect(readJpegOrientation(fs.readFileSync(source))).toBe(6);
+
+    const library = new MediaLibrary(path.join(tempRoot, 'store'));
+    const media = library.importPhoto(source, 'album-1');
+    // Orientation 6 = rotate 90°, so a 3000x1000 landscape becomes portrait, then fits 2048
+    expect([media.width, media.height]).toEqual([683, 2048]);
+    expect(Math.max(media.thumbWidth, media.thumbHeight)).toBe(480);
+    const web = fs.readFileSync(library.resolveLocalUrl(media.url)!);
+    expect(web.includes(Buffer.from('GPS-SECRET'))).toBe(false);
+    expect(web.includes(Buffer.from('Exif'))).toBe(false);
+    expect(sha256Hex(web)).toBe(media.sha256);
+    expect(media.url).toBe(`media/albums/album-1/${media.sha256.slice(0, 20)}.jpg`);
+    expect(fs.readFileSync(media.originalPath).equals(fs.readFileSync(source))).toBe(true);
+
+    // PNG keeps transparency
+    const png = new PNG({ width: 4, height: 4 });
+    png.data.fill(0);
+    const pngPath = path.join(tempRoot, 'logo.png');
+    fs.writeFileSync(pngPath, PNG.sync.write(png));
+    const pngMedia = library.importPhoto(pngPath, 'album-1');
+    expect(pngMedia.mimeType).toBe('image/png');
+    expect(PNG.sync.read(fs.readFileSync(library.resolveLocalUrl(pngMedia.url)!)).data[3]).toBe(0);
+
+    // Other formats are refused with a clear message, and paths can't escape the library
+    const gif = path.join(tempRoot, 'anim.gif');
+    fs.writeFileSync(gif, 'GIF89a....');
+    expect(() => library.importPhoto(gif, 'album-1')).toThrow(UnsupportedImageError);
+    expect(library.resolveLocalUrl('media/../../etc/passwd')).toBeNull();
+  });
+
+  it('exports albums with signed manifests and reflects replaced and removed photos', () => {
+    const site = makeSite('alice');
+    const album = site.db.createAlbum({ title: 'Trip' });
+    const files = [0, 1].map((n) => {
+      const f = path.join(tempRoot, `p${n}.jpg`);
+      fs.writeFileSync(f, makePhoneJpeg(64, 48, 1, n * 50));
+      return f;
+    });
+    const report = importPhotosIntoAlbum(site.db, site.library, album.id, files);
+    expect(report.added).toHaveLength(2);
+
+    const out = path.join(tempRoot, 'export');
+    fs.mkdirSync(path.join(out, 'media/albums/old'), { recursive: true });
+    fs.writeFileSync(path.join(out, 'README.md'), 'mine'); // not Studio's: must survive
+    fs.writeFileSync(path.join(out, 'media/albums/old/stale.jpg'), 'old'); // Studio's old photo area
+    expect(site.publisher.publishToLocalDirectory(out).success).toBe(true);
+
+    const manifestPath = path.join(out, `media/albums/${album.id}/manifest.json`);
+    const manifest = JSON.parse(fs.readFileSync(manifestPath, 'utf8'));
+    const didDoc = JSON.parse(fs.readFileSync(path.join(out, '.well-known/did.json'), 'utf8'));
+    expect(verifyDocumentSignature(manifest, didDoc.verificationMethod[0].publicKeyPem)).toBe(true);
+    expect(manifest.photos).toHaveLength(2);
+    for (const photo of manifest.photos) {
+      expect(sha256Hex(fs.readFileSync(path.join(out, photo.image.url)))).toBe(photo.image.sha256);
+      expect(sha256Hex(fs.readFileSync(path.join(out, photo.thumbnail.url)))).toBe(photo.thumbnail.sha256);
+    }
+    const albumsDoc = JSON.parse(fs.readFileSync(path.join(out, 'api/albums.json'), 'utf8'));
+    expect(albumsDoc.albums[0].manifestUrl).toBe(`media/albums/${album.id}/manifest.json`);
+    expect(fs.existsSync(path.join(out, 'README.md'))).toBe(true);
+    expect(fs.existsSync(path.join(out, 'media/albums/old/stale.jpg'))).toBe(false);
+
+    // Replace the first photo's image: new file published, old one gone, same photo id
+    const [first, second] = manifest.photos;
+    const replacement = path.join(tempRoot, 'new.jpg');
+    fs.writeFileSync(replacement, makePhoneJpeg(64, 48, 1, 200));
+    replacePhotoImage(site.db, site.library, first.id, replacement);
+    site.publisher.publishToLocalDirectory(out);
+    const afterReplace = JSON.parse(fs.readFileSync(manifestPath, 'utf8'));
+    const replaced = afterReplace.photos.find((p: { id: string }) => p.id === first.id);
+    expect(replaced.image.sha256).not.toBe(first.image.sha256);
+    expect(fs.existsSync(path.join(out, first.image.url))).toBe(false);
+    expect(fs.existsSync(path.join(out, replaced.image.url))).toBe(true);
+    expect(site.library.resolveLocalUrl(first.image.url) && fs.existsSync(site.library.resolveLocalUrl(first.image.url)!)).toBe(false);
+
+    // Remove the second photo
+    deletePhotoWithFiles(site.db, site.library, second.id);
+    site.publisher.publishToLocalDirectory(out);
+    const afterDelete = JSON.parse(fs.readFileSync(manifestPath, 'utf8'));
+    expect(afterDelete.photos.map((p: { id: string }) => p.id)).toEqual([first.id]);
+    expect(fs.existsSync(path.join(out, second.image.url))).toBe(false);
+    expect(fs.existsSync(path.join(out, 'README.md'))).toBe(true);
+    site.db.close();
+  });
+
+  it('uploads only changes to a remote folder and deletes only files Studio published', async () => {
+    const site = makeSite('bob');
+    const album = site.db.createAlbum({ title: 'Remote' });
+    const photoFile = path.join(tempRoot, 'r.jpg');
+    fs.writeFileSync(photoFile, makePhoneJpeg(40, 30, 1));
+    importPhotosIntoAlbum(site.db, site.library, album.id, [photoFile]);
+
+    const remote = new Map<string, Buffer>([['notes/keep.txt', Buffer.from('user file')]]);
+    const uploads: string[] = [];
+    const target = {
+      upload: async (localFile: string, relPath: string) => {
+        uploads.push(relPath);
+        remote.set(relPath, fs.readFileSync(localFile));
+      },
+      remove: async (relPath: string) => {
+        remote.delete(relPath);
+      },
+    };
+    const publishOnce = async () => {
+      const staging = fs.mkdtempSync(path.join(tempRoot, 'stage-'));
+      site.generator.generateToDirectory(staging);
+      const files = hashStagedFiles(staging);
+      const owned = [...remote.keys()];
+      const plan = planSync(files, site.db.getPublishLedger('ftp://test'), owned);
+      return applySyncPlan(site.db, 'ftp://test', staging, plan, target);
+    };
+
+    const first = await publishOnce();
+    expect(first.removed).toBe(0);
+    const photoPaths = [...remote.keys()].filter((p) => p.endsWith('.jpg'));
+    expect(photoPaths).toHaveLength(2); // web copy + thumbnail
+    // Media goes up before the pages that reference it
+    expect(uploads.findIndex((p) => p.endsWith('.jpg'))).toBeLessThan(uploads.indexOf('index.html'));
+
+    uploads.length = 0;
+    await publishOnce();
+    expect(uploads.filter((p) => p.endsWith('.jpg'))).toEqual([]); // unchanged photos not re-sent
+
+    const photoId = site.db.getAlbums()[0].photos[0].id;
+    deletePhotoWithFiles(site.db, site.library, photoId);
+    const third = await publishOnce();
+    expect(third.removed).toBeGreaterThanOrEqual(2);
+    expect([...remote.keys()].some((p) => p.endsWith('.jpg'))).toBe(false);
+    expect(remote.has('notes/keep.txt')).toBe(true);
+    site.db.close();
+  });
+
+  it('pushes only changed files to GitHub and removes deleted photos from the branch', async () => {
+    // A tiny in-memory GitHub: refs, commits, flat trees and blobs
+    const blobs = new Map<string, Buffer>();
+    const trees = new Map<string, Map<string, string>>();
+    const commits = new Map<string, { tree: string }>();
+    const refs = new Map<string, string>();
+    let counter = 0;
+    const newId = () => `id${++counter}`;
+    const readme = Buffer.from('# my repo');
+    const readmeSha = gitBlobSha(readme);
+    blobs.set(readmeSha, readme);
+    trees.set('t0', new Map([['README.md', readmeSha]]));
+    commits.set('c0', { tree: 't0' });
+    refs.set('gh-pages', 'c0');
+    const blobPosts: string[] = [];
+    const json = (status: number, body: unknown) =>
+      new Response(JSON.stringify(body), { status, headers: { 'Content-Type': 'application/json' } });
+    vi.stubGlobal('fetch', async (url: string, init?: { method?: string; body?: string }) => {
+      const route = new URL(url).pathname.replace('/repos/o/r', '');
+      const method = init?.method || 'GET';
+      const body = init?.body ? JSON.parse(init.body) : {};
+      if (route === '' && method === 'GET') return json(200, { default_branch: 'main', permissions: { push: true } });
+      if (route.startsWith('/git/ref/heads/')) {
+        const sha = refs.get(decodeURIComponent(route.slice('/git/ref/heads/'.length)));
+        return sha ? json(200, { object: { sha } }) : json(404, {});
+      }
+      if (route.startsWith('/git/commits/') && method === 'GET') {
+        return json(200, { tree: { sha: commits.get(route.slice('/git/commits/'.length))!.tree } });
+      }
+      if (route.startsWith('/git/trees/') && method === 'GET') {
+        const tree = trees.get(route.slice('/git/trees/'.length))!;
+        return json(200, { truncated: false, tree: [...tree].map(([p, sha]) => ({ path: p, type: 'blob', sha })) });
+      }
+      if (route === '/git/blobs') {
+        const content = Buffer.from(body.content, 'base64');
+        const sha = gitBlobSha(content);
+        blobs.set(sha, content);
+        blobPosts.push(sha);
+        return json(201, { sha });
+      }
+      if (route === '/git/trees') {
+        const tree = new Map(trees.get(body.base_tree)!);
+        for (const entry of body.tree) {
+          if (entry.sha === null) tree.delete(entry.path);
+          else tree.set(entry.path, entry.sha);
+        }
+        const id = newId();
+        trees.set(id, tree);
+        return json(201, { sha: id });
+      }
+      if (route === '/git/commits') {
+        const id = newId();
+        commits.set(id, { tree: body.tree });
+        return json(201, { sha: id });
+      }
+      if (route.startsWith('/git/refs/heads/')) {
+        refs.set(decodeURIComponent(route.slice('/git/refs/heads/'.length)), body.sha);
+        return json(200, {});
+      }
+      if (route === '/pages') return json(409, {});
+      return json(404, { message: `unhandled ${method} ${route}` });
+    });
+    const branchFiles = () => trees.get(commits.get(refs.get('gh-pages')!)!.tree)!;
+
+    const site = makeSite('carol');
+    const settings = { ...site.db.getProfile().publishSettings, githubOwner: 'o', githubRepo: 'r', githubBranch: 'gh-pages', githubToken: 'tok' };
+    const album = site.db.createAlbum({ title: 'GH' });
+    const f = path.join(tempRoot, 'g.jpg');
+    fs.writeFileSync(f, makePhoneJpeg(40, 30, 1));
+    importPhotosIntoAlbum(site.db, site.library, album.id, [f]);
+    const photo = site.db.getAlbums()[0].photos[0];
+
+    const first = await site.publisher.publishToGitHubPages(settings, fs.mkdtempSync(path.join(tempRoot, 'gh-')));
+    expect(first.success).toBe(true);
+    expect(branchFiles().has(photo.url)).toBe(true);
+    expect(branchFiles().has(photo.thumbUrl)).toBe(true);
+    expect(branchFiles().has(`media/albums/${album.id}/manifest.json`)).toBe(true);
+    expect(branchFiles().has('README.md')).toBe(true);
+
+    blobPosts.length = 0;
+    const second = await site.publisher.publishToGitHubPages(settings, fs.mkdtempSync(path.join(tempRoot, 'gh-')));
+    expect(second.success).toBe(true);
+    const photoBlob = gitBlobSha(fs.readFileSync(site.library.resolveLocalUrl(photo.url)!));
+    expect(blobPosts).not.toContain(photoBlob); // unchanged photo not uploaded again
+
+    deletePhotoWithFiles(site.db, site.library, photo.id);
+    const third = await site.publisher.publishToGitHubPages(settings, fs.mkdtempSync(path.join(tempRoot, 'gh-')));
+    expect(third.success).toBe(true);
+    expect(third.removed).toBeGreaterThanOrEqual(2);
+    expect(branchFiles().has(photo.url)).toBe(false);
+    expect(branchFiles().has(photo.thumbUrl)).toBe(false);
+    expect(branchFiles().has('README.md')).toBe(true);
+    site.db.close();
+  });
+
+  it('upgrades photos imported before the Media Library, once', () => {
+    const site = makeSite('dave');
+    const album = site.db.createAlbum({ title: 'Old' });
+    const legacyDir = path.join(site.library.rootDir, 'albums', album.id);
+    fs.mkdirSync(legacyDir, { recursive: true });
+    fs.writeFileSync(path.join(legacyDir, 'photo-123.jpg'), makePhoneJpeg(100, 80, 1));
+    site.db.addPhotoToAlbum({ albumId: album.id, url: `media/albums/${album.id}/photo-123.jpg` });
+
+    expect(optimizeLegacyPhotos(site.db, site.library)).toBe(1);
+    const photo = site.db.getAlbums()[0].photos[0];
+    expect(photo.sha256).toBeTruthy();
+    expect(photo.url).not.toContain('photo-123');
+    expect(fs.existsSync(path.join(legacyDir, 'photo-123.jpg'))).toBe(false);
+    expect(optimizeLegacyPhotos(site.db, site.library)).toBe(0);
+    site.db.close();
+  });
+
+  it('lets friends see replaced and removed photos when they sync', async () => {
+    const owner = makeSite('erin');
+    const album = owner.db.createAlbum({ title: 'Shared' });
+    const files = [0, 1].map((n) => {
+      const f = path.join(tempRoot, `s${n}.jpg`);
+      fs.writeFileSync(f, makePhoneJpeg(32, 32, 1, n * 70));
+      return f;
+    });
+    importPhotosIntoAlbum(owner.db, owner.library, album.id, files);
+    const out = path.join(tempRoot, 'erin-site');
+    owner.publisher.publishToLocalDirectory(out);
+
+    const friend = makeSite('frank');
+    const crawler = new RingCrawler(friend.db);
+    await crawler.crawlFriendSite('https://erin.example', out);
+    const [keep, drop] = owner.db.getAlbums()[0].photos;
+    expect(friend.db.getNetworkFeed().filter((e) => e.entryType === 'photo')).toHaveLength(2);
+
+    const replacement = path.join(tempRoot, 'swap.jpg');
+    fs.writeFileSync(replacement, makePhoneJpeg(32, 32, 1, 222));
+    replacePhotoImage(owner.db, owner.library, keep.id, replacement);
+    deletePhotoWithFiles(owner.db, owner.library, drop.id);
+    owner.publisher.publishToLocalDirectory(out);
+    await crawler.crawlFriendSite('https://erin.example', out);
+
+    const photos = friend.db.getNetworkFeed().filter((e) => e.entryType === 'photo');
+    expect(photos).toHaveLength(1);
+    expect(photos[0].canonicalUrl).toBe(keep.canonicalUrl);
+    expect(photos[0].mediaUrl).toContain(owner.db.getAlbums()[0].photos[0].sha256!.slice(0, 20));
+    owner.db.close();
+    friend.db.close();
+  });
+});
+
+describe('Media Library references', () => {
+  it('keeps and publishes post images and covers that live in the library', () => {
+    const tempRoot = fs.mkdtempSync(path.join(os.tmpdir(), 'webring-mediaref-'));
+    try {
+      const db = new StudioDatabase(tempRoot, 'r.sqlite');
+      const mediaDir = path.join(tempRoot, 'media-store');
+      const library = new MediaLibrary(mediaDir);
+      const postImage = path.join(mediaDir, 'albums', 'wall-posts', 'post.jpg');
+      fs.mkdirSync(path.dirname(postImage), { recursive: true });
+      fs.writeFileSync(postImage, 'jpeg bytes');
+      fs.writeFileSync(path.join(mediaDir, 'albums', 'wall-posts', 'orphan.jpg'), 'unused');
+      db.createItem({ type: 'post', title: 'With image', commentary: '', mediaUrl: 'media/albums/wall-posts/post.jpg' });
+
+      expect(cleanUpLibrary(db, library)).toBe(1); // only the orphan
+      expect(fs.existsSync(postImage)).toBe(true);
+      const out = path.join(tempRoot, 'out');
+      new StaticSiteGenerator(db, mediaDir).generateToDirectory(out);
+      expect(fs.existsSync(path.join(out, 'media/albums/wall-posts/post.jpg'))).toBe(true);
+      db.close();
+    } finally {
+      fs.rmSync(tempRoot, { recursive: true, force: true });
     }
   });
 });
