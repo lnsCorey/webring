@@ -15,12 +15,11 @@
 - `npm run build:electron`: compile `electron/` to `dist-electron/` (needed before `npm run mcp` or after pulling changes).
 - `npm run mcp`: start the stdio MCP server.
 
-### Native SQLite module
+### SQLite
 
-- The database layer prefers Node's built-in `node:sqlite` and falls back to `better-sqlite3` (`openSqliteAdapter` in `electron/db/database.ts`).
-- Electron 33 ships Node 20, which has no `node:sqlite`, so the app uses `better-sqlite3` compiled for Electron (`npm run rebuild:electron`).
-- Tests and the MCP CLI run on Node 22+ and use `node:sqlite`.
-- `npm run rebuild:node` recompiles `better-sqlite3` for Node, which breaks the app until you run `npm run rebuild:electron` again.
+- Storage uses Node's built-in `node:sqlite` only (`openSqliteAdapter` in `electron/db/database.ts`); there are no native modules to compile.
+- The app runs on Electron 45 (bundled Node 24); tests and the stdio MCP CLI need Node 22.13+ (enforced by `engines` + `.npmrc` `engine-strict`).
+- Electron 45 deprecates the synchronous `safeStorage` methods used by `electron/security/keyVault.ts`; they're removed in Electron 46, so moving to Electron 46+ requires switching key access to the async API.
 
 ### Layout
 
@@ -50,3 +49,4 @@
 ### Known state
 
 - Both type checks are clean (`npx tsc -p tsconfig.json --noEmit` and `npx tsc -p tsconfig.electron.json --noEmit`); keep them at zero errors.
+- `npm audit` reports 3 moderate findings, all from Tailwind CSS 3 (`tailwindcss`, `postcss-nested`, `postcss-selector-parser`). They're build-time only and never ship in the app. Clearing them needs the Tailwind 4 migration, which should be done on its own with a visual check of the Studio UI. Never use `npm audit fix --force`.

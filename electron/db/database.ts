@@ -243,37 +243,34 @@ interface SqlDatabaseAdapter {
   close(): void;
 }
 
+/**
+ * Opens the database with Node's built-in `node:sqlite` (Node 22.13+, and Electron 45+'s
+ * bundled Node 24), so no native module has to be compiled during install.
+ */
 function openSqliteAdapter(dbPath: string): SqlDatabaseAdapter {
-  // Prefer Node's built-in node:sqlite (zero native compilation issues)
+  let nodeSqlite: { DatabaseSync: new (path: string) => SqlDatabaseAdapter & { prepare(sql: string): SqlStatementAdapter } };
   try {
     // eslint-disable-next-line @typescript-eslint/no-require-imports
-    const nodeSqlite = require('node:sqlite');
-    if (nodeSqlite && nodeSqlite.DatabaseSync) {
-      const db = new nodeSqlite.DatabaseSync(dbPath);
-      db.exec('PRAGMA journal_mode = WAL; PRAGMA foreign_keys = ON;');
-      return {
-        exec: (sql: string) => db.exec(sql),
-        prepare: (sql: string) => {
-          const stmt = db.prepare(sql);
-          return {
-            get: (...params: unknown[]) => stmt.get(...params),
-            all: (...params: unknown[]) => stmt.all(...params),
-            run: (...params: unknown[]) => stmt.run(...params),
-          };
-        },
-        close: () => db.close(),
-      };
-    }
+    nodeSqlite = require('node:sqlite');
   } catch {
-    // Fallback to better-sqlite3 if node:sqlite is unavailable
+    throw new Error(
+      `Webring Studio needs Node.js 22.13 or newer (built-in node:sqlite); this is Node ${process.versions.node}.`
+    );
   }
-
-  // eslint-disable-next-line @typescript-eslint/no-require-imports
-  const BetterSqlite3 = require('better-sqlite3');
-  const db = new BetterSqlite3(dbPath);
-  db.pragma('journal_mode = WAL');
-  db.pragma('foreign_keys = ON');
-  return db;
+  const db = new nodeSqlite.DatabaseSync(dbPath);
+  db.exec('PRAGMA journal_mode = WAL; PRAGMA foreign_keys = ON;');
+  return {
+    exec: (sql: string) => db.exec(sql),
+    prepare: (sql: string) => {
+      const stmt = db.prepare(sql);
+      return {
+        get: (...params: unknown[]) => stmt.get(...params),
+        all: (...params: unknown[]) => stmt.all(...params),
+        run: (...params: unknown[]) => stmt.run(...params),
+      };
+    },
+    close: () => db.close(),
+  };
 }
 
 export interface StudioDatabaseOptions {
