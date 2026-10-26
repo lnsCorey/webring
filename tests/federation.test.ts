@@ -4,6 +4,7 @@ import { PNG } from 'pngjs';
 import * as fs from 'fs';
 import * as path from 'path';
 import * as os from 'os';
+import * as vm from 'vm';
 import * as http from 'http';
 import {
   buildCanonicalUrl,
@@ -11,6 +12,10 @@ import {
   buildWebringUri,
   generateIdentityKeyPair,
   isPlaceholderSiteUrl,
+  parseLayout,
+  ProfileDocumentSchema,
+  type Appearance,
+  type LayoutBlock,
   parseWebringUri,
   signDocument,
   siteUrlToDidWeb,
@@ -37,6 +42,7 @@ import {
   sha256Hex,
 } from '../electron/services/mediaLibrary';
 import { readJpegOrientation, UnsupportedImageError } from '../electron/services/imagePipeline';
+import { renderMarkdown } from '../src/shared/markdown';
 import { applySyncPlan, hashStagedFiles, planSync } from '../electron/services/publishSync';
 import { KeyCipher, KeyVaultUnavailableError } from '../electron/security/keyVault';
 import { LocalPreviewServer } from '../electron/services/localPreviewServer';
@@ -2338,5 +2344,159 @@ describe('Media Library references', () => {
     } finally {
       fs.rmSync(tempRoot, { recursive: true, force: true });
     }
+  });
+});
+
+describe('Site Design (look & feel, page layout)', () => {
+  let tempRoot: string;
+
+  beforeEach(() => {
+    tempRoot = fs.mkdtempSync(path.join(os.tmpdir(), 'webring-design-'));
+  });
+
+  afterEach(() => {
+    fs.rmSync(tempRoot, { recursive: true, force: true });
+  });
+
+  /** Runs the published page's scripts against a tiny fake DOM and returns what they render. */
+  const renderPage = async (html: string) => {
+    const scripts = [...html.matchAll(/<script(?![^>]*src)[^>]*>([\s\S]*?)<\/script>/g)].map((m) => m[1]);
+    const root = { innerHTML: '', addEventListener: () => undefined, querySelectorAll: () => [] };
+    const attrs = new Map<string, string>();
+    const styles = new Map<string, string>();
+    const body = {
+      className: '',
+      setAttribute: (k: string, v: string) => attrs.set(k, v),
+      removeAttribute: (k: string) => attrs.delete(k),
+      style: { setProperty: (k: string, v: string) => styles.set(k, v) },
+    };
+    const windowStub: Record<string, unknown> = { location: { protocol: 'file:' } };
+    const context = vm.createContext({
+      window: windowStub,
+      document: {
+        body,
+        getElementById: (id: string) => (id === 'profile-root' ? root : null),
+        addEventListener: () => undefined,
+        createElement: () => ({ setAttribute: () => undefined }),
+      },
+      URLSearchParams,
+      console,
+      setTimeout,
+      parent: { postMessage: () => undefined },
+    });
+    windowStub.document = (context as { document: unknown }).document;
+    for (const code of scripts) {
+      // `window.__WEBRING_BUNDLE__ = …` must land on the window stub
+      vm.runInContext(code.replace(/^\s*window\./, 'window.'), context);
+    }
+    await new Promise((r) => setTimeout(r, 20)); // let the async page script finish
+    return { html: root.innerHTML, attrs, styles };
+  };
+
+  const blockOrder = (html: string) => [...html.matchAll(/data-block="([a-z]+)"/g)].map((m) => m[1]);
+
+  it('renders the default layout like the page did before layouts existed', async () => {
+    const db = new StudioDatabase(tempRoot, 'd.sqlite');
+    db.createAlbum({ title: 'Trips' });
+    db.createItem({ type: 'post', title: 'Hello', commentary: '' });
+    const page = await renderPage(new StaticSiteGenerator(db).buildStandaloneProfileHtml(db.buildSignedSiteBundle()));
+    expect(blockOrder(page.html)).toEqual(['albums', 'items']); // no public friends, no guestbook configured
+    expect(page.html).toContain('📸 Photo Albums');
+    expect(page.html).toContain('✨ Shared Items &amp; Things I Like');
+    db.close();
+  });
+
+  it('follows a custom layout: order, hidden blocks, titles, text with tables, unknown blocks dropped', async () => {
+    const db = new StudioDatabase(tempRoot, 'c.sqlite');
+    db.createItem({ type: 'post', title: 'My post', commentary: '' });
+    db.createItem({ type: 'recommendation', title: 'A great book', commentary: '' });
+    db.updateProfile({
+      layout: [
+        { id: 'intro', type: 'text', visible: true, title: 'About me', options: { markdown: '**Hi!**\n\n| Year | Event |\n|---|---|\n| 2026 | Joined |\n\n<script>alert(1)</script>' } },
+        { id: 'future', type: 'hologram', visible: true, options: {} },
+        { id: 'recs', type: 'items', visible: true, title: 'Recommendations', options: { kinds: ['recommendation'] } },
+        { id: 'albums', type: 'albums', visible: false, options: { style: 'grid' } },
+        { id: 'links', type: 'links', visible: true, title: '', options: { links: [{ label: 'Blog', url: 'https://blog.example' }, { label: 'Bad', url: 'javascript:alert(1)' }] } },
+      ] as unknown as LayoutBlock[],
+    });
+    expect(db.getProfile().layout!.map((b) => b.id)).toEqual(['intro', 'recs', 'albums', 'links']);
+
+    const page = await renderPage(new StaticSiteGenerator(db).buildStandaloneProfileHtml(db.buildSignedSiteBundle()));
+    expect(blockOrder(page.html)).toEqual(['text', 'items', 'links']);
+    expect(page.html).toContain('<h2 class="text-2xl font-bold mb-4 flex items-center gap-2">About me</h2>');
+    expect(page.html).toContain('<table><thead><tr><th>Year</th><th>Event</th></tr></thead>');
+    expect(page.html).toContain('&lt;script&gt;alert(1)&lt;/script&gt;');
+    expect(page.html).not.toContain('<script>alert(1)');
+    expect(page.html).toContain('A great book');
+    expect(page.html).not.toContain('My post'); // only recommendations in that block
+    expect(page.html).toContain('https://blog.example');
+    expect(page.html).toContain('#blocked-unsafe-url');
+    db.close();
+  });
+
+  it('signs appearance and layout into profile.json and applies the look & feel', async () => {
+    const db = new StudioDatabase(tempRoot, 'a.sqlite');
+    db.updateProfile({
+      appearance: { accent: '#ff6600', font: 'serif', corners: 'sharp', avatarShape: 'circle', bannerHeight: 'nope' } as unknown as Appearance,
+      layout: [],
+    });
+    const profile = db.getProfile();
+    expect(profile.appearance).toEqual({ accent: '#ff6600', font: 'serif', corners: 'sharp', avatarShape: 'circle' });
+    expect(profile.layout).toEqual([]);
+
+    const out = path.join(tempRoot, 'out');
+    new StaticSiteGenerator(db).generateToDirectory(out);
+    const published = JSON.parse(fs.readFileSync(path.join(out, 'api/profile.json'), 'utf8'));
+    const didDoc = JSON.parse(fs.readFileSync(path.join(out, '.well-known/did.json'), 'utf8'));
+    expect(verifyDocumentSignature(published, didDoc.verificationMethod[0].publicKeyPem)).toBe(true);
+    expect(published.appearance.accent).toBe('#ff6600');
+    expect(published.layout).toEqual([]);
+
+    const html = fs.readFileSync(path.join(out, 'index.html'), 'utf8');
+    expect(html).toMatch(/<body[^>]*data-font="serif"[^>]*data-corners="sharp"/);
+    const page = await renderPage(html);
+    expect(page.attrs.get('data-avatar')).toBe('circle');
+    expect(page.styles.get('--accent')).toBe('#ff6600');
+    expect(blockOrder(page.html)).toEqual([]); // an emptied layout stays empty
+    db.close();
+  });
+
+  it('keeps preview-only extras out of the published page', () => {
+    const db = new StudioDatabase(tempRoot, 'p.sqlite');
+    const generator = new StaticSiteGenerator(db);
+    const bundle = db.buildSignedSiteBundle();
+    const published = generator.buildStandaloneProfileHtml(bundle);
+    const preview = generator.buildStandaloneProfileHtml(bundle, { preview: true });
+    for (const marker of ['<base href="studio-media://local/"', 'studio-media:', 'webring-preview-deeplink']) {
+      expect(published).not.toContain(marker);
+      expect(preview).toContain(marker);
+    }
+    db.close();
+  });
+
+  it('parses friends’ profiles leniently', () => {
+    const parsed = ProfileDocumentSchema.parse({
+      did: 'did:web:x.example',
+      siteUrl: 'https://x.example',
+      handle: 'x',
+      displayName: 'X',
+      updatedAt: new Date().toISOString(),
+      appearance: { accent: 'red', font: 'comic-sans', corners: 'soft' },
+      layout: [{ id: 'a', type: 'text', options: { markdown: 'hi' } }, { nonsense: true }, 'string'],
+    });
+    expect(parsed.appearance).toEqual({ corners: 'soft' });
+    expect(parsed.layout!.map((b) => b.id)).toEqual(['a']);
+    expect(parseLayout('not an array')).toEqual([]);
+  });
+
+  it('renders Markdown safely', () => {
+    expect(renderMarkdown('[x](javascript:alert(1)) [y](data:text/html,hi) [z](//evil.example)')).not.toMatch(/href=/);
+    expect(renderMarkdown('<img src=x onerror=alert(1)>')).toBe('<p>&lt;img src=x onerror=alert(1)&gt;</p>');
+    expect(renderMarkdown('[site](https://a.example)')).toContain('<a href="https://a.example" target="_blank" rel="noopener noreferrer">site</a>');
+    expect(renderMarkdown('- a\n- b')).toBe('<ul><li>a</li><li>b</li></ul>');
+    expect(renderMarkdown('# Title')).toBe('<h2>Title</h2>');
+    // It must work as embedded, standalone source
+    const standalone = new Function(`return ${renderMarkdown.toString()}`)() as (s: string) => string;
+    expect(standalone('**b**')).toBe('<p><strong>b</strong></p>');
   });
 });

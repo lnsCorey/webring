@@ -3,8 +3,11 @@ import * as path from 'path';
 import * as crypto from 'crypto';
 import { StudioDatabase } from '../db/database';
 import { MediaLibrary } from './mediaLibrary';
+import { renderMarkdown } from '../../src/shared/markdown';
 import {
+  Appearance,
   CompleteSiteBundle,
+  DEFAULT_LAYOUT,
   isValidAdSlotId,
   isValidGa4MeasurementId,
   normalizeAdSensePublisherId,
@@ -210,7 +213,16 @@ export class StaticSiteGenerator {
    * `/api/*.json` when hosted on an HTTP server, and falls back to `window.__WEBRING_BUNDLE__`
    * when opened locally via `file://`.
    */
-  public buildStandaloneProfileHtml(bundle: CompleteSiteBundle): string {
+  /**
+   * The published profile page. With `preview: true` it's the Studio's live preview instead: the
+   * same page plus a base URL for local Media Library images and a bridge that sends link clicks
+   * to Studio. Preview extras are never part of a published file.
+   */
+  public buildStandaloneProfileHtml(bundle: CompleteSiteBundle, options: { preview?: boolean } = {}): string {
+    const preview = options.preview === true;
+    const markdownSource = renderMarkdown.toString();
+    if (/<\/script/i.test(markdownSource)) throw new Error('Markdown renderer source cannot be embedded safely.');
+    const appearance = bundle.profile.appearance || {};
     const safeJson = JSON.stringify(bundle)
       .replace(/</g, '\\u003c')
       .replace(/>/g, '\\u003e')
@@ -271,8 +283,8 @@ export class StaticSiteGenerator {
 <head>
   <meta charset="UTF-8" />
   <meta name="viewport" content="width=device-width, initial-scale=1.0" />
-  <meta http-equiv="Content-Security-Policy" content="default-src 'self'; script-src 'self' 'unsafe-inline' https://cdn.tailwindcss.com https://giscus.app https://utteranc.es${scriptSrcExtras ? ' ' + scriptSrcExtras : ''}; style-src 'self' 'unsafe-inline'; img-src 'self' https: http: data:; frame-src https://giscus.app https://utteranc.es${frameSrcExtras}; connect-src 'self' https: http:;" />
-  <title>${this.escapeHtml(bundle.profile.displayName)} — Federated Profile & Webring</title>
+  <meta http-equiv="Content-Security-Policy" content="default-src 'self'; script-src 'self' 'unsafe-inline' https://cdn.tailwindcss.com https://giscus.app https://utteranc.es${scriptSrcExtras ? ' ' + scriptSrcExtras : ''}; style-src 'self' 'unsafe-inline'; img-src 'self' https: http: data:${preview ? ' studio-media:' : ''}; frame-src https://giscus.app https://utteranc.es${frameSrcExtras}; connect-src 'self' https: http:;" />
+  <title>${this.escapeHtml(bundle.profile.displayName)} — Federated Profile & Webring</title>${preview ? '\n  <base href="studio-media://local/" />' : ''}
   <link rel="alternate" type="application/json" title="Webring Manifest" href="./api/manifest.json" />
   <link rel="me" href="${this.escapeHtml(bundle.profile.siteUrl)}" />
   <script src="https://cdn.tailwindcss.com"></script>${analyticsHeadSnippet}${adsHeadSnippet}
@@ -286,9 +298,43 @@ export class StaticSiteGenerator {
     body.theme-minimal-zine .card-surface { background: #ffffff; border: 1px solid #e7e5e4; color: #1c1917; }
     body.theme-cyber-terminal .card-surface { background: #0a0f0d; border: 1px solid #22c55e; color: #4ade80; }
     body.theme-cozy-scrapbook .card-surface { background: #fffbeb; border: 2px solid #d97706; color: #451a03; }
+    /* Look & feel options (Site Design); each applies only when set */
+    body[data-font="sans"] { font-family: system-ui, -apple-system, "Segoe UI", Roboto, sans-serif !important; }
+    body[data-font="serif"] { font-family: "Iowan Old Style", "Palatino Linotype", Palatino, Georgia, serif !important; }
+    body[data-font="rounded"] { font-family: ui-rounded, "SF Pro Rounded", Nunito, "Varela Round", system-ui, sans-serif !important; }
+    body[data-font="mono"] { font-family: ui-monospace, SFMono-Regular, Menlo, Consolas, monospace !important; }
+    body[data-corners="sharp"] .card-surface, body[data-corners="sharp"] .rounded, body[data-corners="sharp"] .rounded-lg,
+    body[data-corners="sharp"] .rounded-xl, body[data-corners="sharp"] .rounded-2xl { border-radius: 0 !important; }
+    body[data-corners="soft"] .card-surface, body[data-corners="soft"] .rounded-xl,
+    body[data-corners="soft"] .rounded-2xl { border-radius: 1.5rem !important; }
+    body[data-surface="flat"] .card-surface { background: transparent !important; border-color: transparent !important; box-shadow: none !important; }
+    body[data-banner="short"] .profile-banner { height: 8rem !important; }
+    body[data-banner="tall"] .profile-banner { height: 22rem !important; }
+    body[data-avatar="circle"] .profile-avatar { border-radius: 9999px !important; }
+    body[data-accent] .accent-solid { background: var(--accent) !important; color: var(--accent-ink) !important; }
+    body[data-accent] .accent-soft { background: color-mix(in srgb, var(--accent) 20%, transparent) !important; color: var(--accent) !important; }
+    body[data-accent] .accent-text { color: var(--accent) !important; }
+    body[data-background="gradient"] { background-image: linear-gradient(160deg, color-mix(in srgb, var(--accent, #6366f1) 24%, transparent), transparent 60%) !important; background-attachment: fixed; }
+    body[data-background="banner-blur"]::before { content: ""; position: fixed; inset: -60px; z-index: -1; background-image: var(--banner-image); background-size: cover; background-position: center; filter: blur(48px) saturate(1.2); opacity: 0.35; }
+    /* Text blocks */
+    .prose-block h2 { font-size: 1.4rem; font-weight: 700; margin: 1.1rem 0 0.5rem; }
+    .prose-block h3 { font-size: 1.2rem; font-weight: 700; margin: 1rem 0 0.4rem; }
+    .prose-block h4, .prose-block h5 { font-weight: 700; margin: 0.9rem 0 0.3rem; }
+    .prose-block p { margin: 0.5rem 0; line-height: 1.65; }
+    .prose-block ul { list-style: disc; padding-left: 1.5rem; margin: 0.5rem 0; }
+    .prose-block ol { list-style: decimal; padding-left: 1.5rem; margin: 0.5rem 0; }
+    .prose-block a { text-decoration: underline; }
+    .prose-block blockquote { border-left: 3px solid var(--accent, #6366f1); padding-left: 1rem; margin: 0.75rem 0; opacity: 0.9; }
+    .prose-block code { background: rgba(0, 0, 0, 0.25); padding: 0.1rem 0.35rem; border-radius: 0.25rem; font-size: 0.9em; }
+    .prose-block pre { background: rgba(0, 0, 0, 0.3); padding: 0.75rem 1rem; border-radius: 0.5rem; overflow-x: auto; margin: 0.75rem 0; }
+    .prose-block pre code { background: none; padding: 0; }
+    .prose-block table { width: 100%; border-collapse: collapse; margin: 0.75rem 0; font-size: 0.95em; }
+    .prose-block th, .prose-block td { border: 1px solid rgba(148, 163, 184, 0.35); padding: 0.4rem 0.65rem; text-align: left; }
+    .prose-block th { font-weight: 700; background: rgba(148, 163, 184, 0.12); }
+    .prose-block hr { border: 0; border-top: 1px solid rgba(148, 163, 184, 0.3); margin: 1rem 0; }
   </style>
 </head>
-<body class="theme-${this.escapeHtml(bundle.profile.theme)} min-h-screen antialiased pb-20">
+<body class="theme-${this.escapeHtml(bundle.profile.theme)} min-h-screen antialiased pb-20"${this.appearanceAttributes(appearance)}>
   <div id="profile-root" class="max-w-5xl mx-auto px-4 sm:px-6 pt-6"></div>
 
   <script>
@@ -340,9 +386,39 @@ export class StaticSiteGenerator {
         return '#blocked-unsafe-url';
       }
 
+      const renderMarkdown = ${markdownSource};
+      const DEFAULT_LAYOUT = ${JSON.stringify(DEFAULT_LAYOUT)};
+
+      // Look & feel (also set on <body> at publish; re-applied in case live profile.json differs)
+      function applyAppearance(a) {
+        a = a || {};
+        const body = document.body;
+        const set = (key, value) => value ? body.setAttribute('data-' + key, value) : body.removeAttribute('data-' + key);
+        set('font', a.font && a.font !== 'theme' ? a.font : '');
+        set('corners', a.corners && a.corners !== 'rounded' ? a.corners : '');
+        set('surface', a.surface === 'flat' ? 'flat' : '');
+        set('banner', a.bannerHeight && a.bannerHeight !== 'medium' ? a.bannerHeight : '');
+        set('avatar', a.avatarShape === 'circle' ? 'circle' : '');
+        set('background', a.background && a.background !== 'theme' ? a.background : '');
+        if (/^#[0-9a-fA-F]{6}$/.test(a.accent || '')) {
+          const n = parseInt(a.accent.slice(1), 16);
+          const luminance = (0.2126 * (n >> 16 & 255) + 0.7152 * (n >> 8 & 255) + 0.0722 * (n & 255)) / 255;
+          body.setAttribute('data-accent', '');
+          body.style.setProperty('--accent', a.accent);
+          body.style.setProperty('--accent-ink', luminance > 0.6 ? '#0b1020' : '#ffffff');
+        } else {
+          body.removeAttribute('data-accent');
+        }
+        const banner = String(profile.bannerUrl || '');
+        if (a.background === 'banner-blur' && /^(https?:\\/\\/|media\\/|\\.\\/)/i.test(banner) && !/["'()\\\\\\s]/.test(banner)) {
+          body.style.setProperty('--banner-image', 'url("' + banner + '")');
+        }
+      }
+
       const allowedThemes = ['neo-webring', 'minimal-zine', 'cyber-terminal', 'cozy-scrapbook'];
       const activeTheme = allowedThemes.includes(profile.theme) ? profile.theme : 'neo-webring';
       document.body.className = 'theme-' + activeTheme + ' min-h-screen antialiased pb-20';
+      applyAppearance(profile.appearance);
 
       function buildDeepLink(action, targetUrl, title, mediaUrl, category) {
         const params = new URLSearchParams();
@@ -438,7 +514,7 @@ export class StaticSiteGenerator {
         return \`
         <div class="card-surface rounded-xl px-4 py-2.5 mb-3 flex flex-wrap items-center justify-between gap-2 text-xs">
           <div class="flex items-center gap-2">
-            <span class="px-2 py-0.5 rounded-full bg-indigo-500/20 text-indigo-300 font-semibold">WEBRING</span>
+            <span class="accent-soft px-2 py-0.5 rounded-full bg-indigo-500/20 text-indigo-300 font-semibold">WEBRING</span>
             <a href="\${homeHref}" target="_blank" rel="noopener noreferrer" class="font-bold hover:underline">\${esc(ring.name)}</a>
             <span class="opacity-70 hidden sm:inline">— \${esc(ring.description || '')}</span>
           </div>
@@ -510,38 +586,42 @@ export class StaticSiteGenerator {
         if (destination && destination.charAt(0) !== '#') window.location.assign(destination);
       });
 
-      const albumsHtml = (albums.albums || []).map(album => {
-        const photosHtml = (album.photos || []).map(photo => {
-          const likes = getEndorsementsFor(photo.canonicalUrl);
-          return \`
-            <div class="card-surface rounded-xl overflow-hidden flex flex-col justify-between">
-              <div>
-                <a href="\${safeUrl(photo.url)}" target="_blank" rel="noopener noreferrer" class="block aspect-[4/3] overflow-hidden bg-black/20">
-                  <img src="\${safeUrl(photo.thumbUrl || photo.url)}" alt="\${esc(photo.altText || photo.caption)}" class="w-full h-full object-cover hover:scale-105 transition-transform duration-300" />
-                </a>
-                <div class="p-3.5">
-                  <p class="text-sm font-medium mb-1">\${esc(photo.caption || 'Untitled Photo')}</p>
-                  <div class="flex flex-wrap gap-1 mb-2">
-                    \${(photo.tags || []).map(t => \`<span class="text-[11px] opacity-70">#\${esc(t)}</span>\`).join(' ')}
+      function renderPhotoCard(photo, album, extraClass) {
+        const likes = getEndorsementsFor(photo.canonicalUrl);
+        return \`
+          <div class="card-surface rounded-xl overflow-hidden flex flex-col justify-between \${extraClass || ''}">
+            <div>
+              <a href="\${safeUrl(photo.url)}" target="_blank" rel="noopener noreferrer" class="block aspect-[4/3] overflow-hidden bg-black/20">
+                <img src="\${safeUrl(photo.thumbUrl || photo.url)}" alt="\${esc(photo.altText || photo.caption)}" class="w-full h-full object-cover hover:scale-105 transition-transform duration-300" />
+              </a>
+              <div class="p-3.5">
+                <p class="text-sm font-medium mb-1">\${esc(photo.caption || 'Untitled Photo')}</p>
+                <div class="flex flex-wrap gap-1 mb-2">
+                  \${(photo.tags || []).map(t => \`<span class="text-[11px] opacity-70">#\${esc(t)}</span>\`).join(' ')}
+                </div>
+                \${likes.length > 0 ? \`
+                  <div class="text-[11px] opacity-80 bg-pink-500/10 border border-pink-500/20 rounded px-2 py-1 mb-2">
+                    ♥ Liked/Shared by \${likes.map(l => esc(l.authorName)).join(', ')}
                   </div>
-                  \${likes.length > 0 ? \`
-                    <div class="text-[11px] opacity-80 bg-pink-500/10 border border-pink-500/20 rounded px-2 py-1 mb-2">
-                      ♥ Liked/Shared by \${likes.map(l => esc(l.authorName)).join(', ')}
-                    </div>
-                  \` : ''}
-                </div>
-              </div>
-              <div class="px-3.5 pb-3 pt-1 flex items-center justify-between border-t border-white/10 text-xs">
-                <a href="\${safeUrl(photo.canonicalUrl)}" class="opacity-60 hover:opacity-100" title="Canonical Schema Index">Index ID</a>
-                <div class="flex gap-2">
-                  <a href="\${buildDeepLink('like', photo.canonicalUrl, photo.caption || album.title, photo.url, 'photo')}" class="px-2.5 py-1 rounded bg-pink-500/20 text-pink-300 hover:bg-pink-500/30 font-medium">♥ Like</a>
-                  <a href="\${buildDeepLink('share', photo.canonicalUrl, photo.caption || album.title, photo.url, 'photo')}" class="px-2.5 py-1 rounded bg-indigo-500/20 text-indigo-300 hover:bg-indigo-500/30 font-medium">↻ Share</a>
-                </div>
+                \` : ''}
               </div>
             </div>
-          \`;
-        }).join('');
+            <div class="px-3.5 pb-3 pt-1 flex items-center justify-between border-t border-white/10 text-xs">
+              <a href="\${safeUrl(photo.canonicalUrl)}" class="opacity-60 hover:opacity-100" title="Canonical Schema Index">Index ID</a>
+              <div class="flex gap-2">
+                <a href="\${buildDeepLink('like', photo.canonicalUrl, photo.caption || album.title, photo.url, 'photo')}" class="px-2.5 py-1 rounded bg-pink-500/20 text-pink-300 hover:bg-pink-500/30 font-medium">♥ Like</a>
+                <a href="\${buildDeepLink('share', photo.canonicalUrl, photo.caption || album.title, photo.url, 'photo')}" class="accent-soft px-2.5 py-1 rounded bg-indigo-500/20 text-indigo-300 hover:bg-indigo-500/30 font-medium">↻ Share</a>
+              </div>
+            </div>
+          </div>
+        \`;
+      }
 
+      function renderAlbum(album, style) {
+        const carousel = style === 'carousel';
+        const photosHtml = (album.photos || [])
+          .map(photo => renderPhotoCard(photo, album, carousel ? 'shrink-0 w-64 snap-start' : ''))
+          .join('');
         return \`
           <div class="mb-8">
             <div class="flex items-baseline justify-between mb-3">
@@ -549,16 +629,16 @@ export class StaticSiteGenerator {
                 <h3 class="text-xl font-bold">\${esc(album.title)}</h3>
                 <p class="text-sm opacity-75">\${esc(album.description || '')}</p>
               </div>
-              <a href="\${buildDeepLink('share', album.canonicalUrl, album.title, album.coverUrl, 'photo')}" class="text-xs px-3 py-1 rounded-lg bg-indigo-500/20 text-indigo-300 hover:bg-indigo-500/30">Share Album</a>
+              <a href="\${buildDeepLink('share', album.canonicalUrl, album.title, album.coverUrl, 'photo')}" class="accent-soft text-xs px-3 py-1 rounded-lg bg-indigo-500/20 text-indigo-300 hover:bg-indigo-500/30">Share Album</a>
             </div>
-            <div class="grid grid-cols-1 sm:grid-cols-2 md:grid-cols-3 gap-4">
+            <div class="\${carousel ? 'flex gap-4 overflow-x-auto snap-x pb-2' : 'grid grid-cols-1 sm:grid-cols-2 md:grid-cols-3 gap-4'}">
               \${photosHtml}
             </div>
           </div>
         \`;
-      }).join('');
+      }
 
-      const itemsHtml = (items.items || []).map(item => {
+      function renderItem(item) {
         const badgeColor = item.type === 'post'
           ? 'bg-emerald-500/20 text-emerald-300 border border-emerald-500/30'
           : item.type === 'like'
@@ -601,7 +681,7 @@ export class StaticSiteGenerator {
                   \${comments.map(c => \`
                     <div class="p-2.5 rounded-lg bg-black/20 border border-white/10 text-xs space-y-1">
                       <div class="flex items-center justify-between">
-                        <a href="\${safeUrl(c.authorSiteUrl)}" target="_blank" rel="noopener noreferrer" class="font-bold text-indigo-300 hover:underline">\${esc(c.authorName)}</a>
+                        <a href="\${safeUrl(c.authorSiteUrl)}" target="_blank" rel="noopener noreferrer" class="accent-text font-bold text-indigo-300 hover:underline">\${esc(c.authorName)}</a>
                       </div>
                       <p class="opacity-90 whitespace-pre-line">\${esc(c.commentary || '')}</p>
                     </div>
@@ -615,26 +695,28 @@ export class StaticSiteGenerator {
               <div class="flex flex-wrap gap-2">
                 <a href="\${buildDeepLink('like', item.canonicalUrl, item.title, item.mediaUrl, item.category)}" class="px-2.5 py-1 rounded bg-pink-500/20 text-pink-300 hover:bg-pink-500/30 font-medium">♥ Like</a>
                 <a href="\${buildDeepLink('comment', item.canonicalUrl, item.title, item.mediaUrl, 'comment')}" class="px-2.5 py-1 rounded bg-emerald-500/20 text-emerald-300 hover:bg-emerald-500/30 font-medium">💬 Comment</a>
-                <a href="\${buildDeepLink('share', item.targetUrl, item.title, item.mediaUrl, item.category)}" class="px-2.5 py-1 rounded bg-indigo-500/20 text-indigo-300 hover:bg-indigo-500/30 font-medium">↻ Re-Share</a>
+                <a href="\${buildDeepLink('share', item.targetUrl, item.title, item.mediaUrl, item.category)}" class="accent-soft px-2.5 py-1 rounded bg-indigo-500/20 text-indigo-300 hover:bg-indigo-500/30 font-medium">↻ Re-Share</a>
                 \${hasLiveProvider ? \`<button data-container="\${liveContainerId}" data-canonical="\${esc(item.canonicalUrl)}" onclick="window.toggleLiveCommentThread(this.getAttribute('data-container'), this.getAttribute('data-canonical'))" class="px-2.5 py-1 rounded bg-purple-500/20 text-purple-300 hover:bg-purple-500/30 font-medium">💬 Live Thread</button>\` : ''}
               </div>
             </div>
           </div>
         \`;
-      }).join('');
+      }
 
-      const friendsHtml = (connections.friends || []).map(friend => \`
-        <a href="\${safeUrl(friend.siteUrl)}" target="_blank" rel="noopener noreferrer" class="card-surface rounded-xl p-3.5 flex items-center gap-3 hover:border-indigo-400/50 transition">
-          <img src="\${safeUrl(friend.avatarUrl || 'https://api.dicebear.com/7.x/shapes/svg?seed=' + encodeURIComponent(friend.displayName))}" class="w-12 h-12 rounded-full object-cover border border-white/20" />
-          <div class="min-w-0 flex-1">
-            <h4 class="font-bold text-sm truncate">\${esc(friend.displayName)}</h4>
-            <p class="text-xs opacity-70 truncate">\${esc(friend.siteUrl)}</p>
-            <div class="flex flex-wrap gap-1 mt-1">
-              \${(friend.relationship || []).map(rel => \`<span class="text-[10px] px-1.5 py-0.5 rounded bg-indigo-500/20 text-indigo-300">\${esc(rel)}</span>\`).join('')}
+      function renderFriend(friend) {
+        return \`
+          <a href="\${safeUrl(friend.siteUrl)}" target="_blank" rel="noopener noreferrer" class="card-surface rounded-xl p-3.5 flex items-center gap-3 hover:border-indigo-400/50 transition">
+            <img src="\${safeUrl(friend.avatarUrl || 'https://api.dicebear.com/7.x/shapes/svg?seed=' + encodeURIComponent(friend.displayName))}" class="w-12 h-12 rounded-full object-cover border border-white/20" />
+            <div class="min-w-0 flex-1">
+              <h4 class="font-bold text-sm truncate">\${esc(friend.displayName)}</h4>
+              <p class="text-xs opacity-70 truncate">\${esc(friend.siteUrl)}</p>
+              <div class="flex flex-wrap gap-1 mt-1">
+                \${(friend.relationship || []).map(rel => \`<span class="accent-soft text-[10px] px-1.5 py-0.5 rounded bg-indigo-500/20 text-indigo-300">\${esc(rel)}</span>\`).join('')}
+              </div>
             </div>
-          </div>
-        </a>
-      \`).join('');
+          </a>
+        \`;
+      }
 
       function renderAdSlot(slotId, label) {
         const adsCfg = profile.adsAddon;
@@ -660,13 +742,96 @@ export class StaticSiteGenerator {
       const inFeedAdHtml = renderAdSlot(profile.adsAddon && profile.adsAddon.inFeedSlotId, 'In-Feed Slot');
       const footerAdHtml = renderAdSlot(profile.adsAddon && profile.adsAddon.footerSlotId, 'Footer Slot');
 
+      // Page blocks (Site Design). A block's title replaces the default heading; an empty title hides it.
+      function section(block, defaultTitle, inner) {
+        const title = typeof block.title === 'string' ? block.title : defaultTitle;
+        return '<section class="mb-12" data-block="' + esc(block.type) + '">' +
+          (title ? '<h2 class="text-2xl font-bold mb-4 flex items-center gap-2">' + esc(title) + '</h2>' : '') +
+          inner + '</section>';
+      }
+      const emptyNote = (text) => '<p class="opacity-60 text-sm">' + esc(text) + '</p>';
+      const allItems = items.items || [];
+      const allAlbums = albums.albums || [];
+      const allFriends = connections.friends || [];
+      const linkButtons = (links, rel) => '<div class="flex flex-wrap gap-3">' + (links || [])
+        .filter(l => l && l.url)
+        .map(l => '<a href="' + safeUrl(l.url) + '" target="_blank" rel="noopener noreferrer' + (rel ? ' ' + rel : '') + '" class="accent-solid px-4 py-2.5 rounded-xl bg-indigo-600 hover:bg-indigo-500 text-white font-semibold text-sm shadow">' + esc(l.label || l.url) + '</a>')
+        .join('') + '</div>';
+      const commentCfg = profile.commentConfig || {};
+      const hasGuestbook = (commentCfg.provider === 'giscus' || commentCfg.provider === 'utterances') && commentCfg.giscusRepo;
+
+      // The guestbook is a page-wide comment thread, loaded only when a visitor asks for it
+      window.openGuestbook = function() {
+        window.toggleLiveCommentThread('guestbook-thread', profile.siteUrl + '#guestbook');
+      };
+
+      const blockRenderers = {
+        albums: (b) => {
+          const ids = b.options && Array.isArray(b.options.albumIds) && b.options.albumIds.length ? b.options.albumIds : null;
+          const list = ids ? allAlbums.filter(a => ids.includes(a.id)) : allAlbums;
+          const html = list.map(a => renderAlbum(a, b.options && b.options.style)).join('');
+          return section(b, '📸 Photo Albums', html || emptyNote('No photo albums published yet.'));
+        },
+        items: (b) => {
+          const kinds = b.options && Array.isArray(b.options.kinds) ? b.options.kinds : null;
+          let list = kinds ? allItems.filter(i => kinds.includes(i.type)) : allItems;
+          if (b.options && b.options.limit) list = list.slice(0, b.options.limit);
+          return section(b, '✨ Shared Items & Things I Like',
+            '<div class="grid grid-cols-1 md:grid-cols-2 gap-4">' + (list.map(renderItem).join('') || emptyNote('Nothing shared here yet.')) + '</div>');
+        },
+        friends: (b) => allFriends.length
+          ? section(b, '🤝 Friend Ring & Connections (' + allFriends.length + ')',
+              '<div class="grid grid-cols-1 sm:grid-cols-2 md:grid-cols-3 gap-4">' + allFriends.map(renderFriend).join('') + '</div>')
+          : '',
+        text: (b) => {
+          const markdown = b.options && b.options.markdown;
+          return markdown ? section(b, '', '<div class="card-surface rounded-xl p-5 prose-block">' + renderMarkdown(markdown) + '</div>') : '';
+        },
+        image: (b) => {
+          const o = b.options || {};
+          if (!o.url) return '';
+          const img = '<img src="' + safeUrl(o.url) + '" alt="' + esc(o.alt || '') + '" class="w-full rounded-xl object-cover" />';
+          const linked = o.link ? '<a href="' + safeUrl(o.link) + '" target="_blank" rel="noopener noreferrer">' + img + '</a>' : img;
+          return section(b, '', '<figure class="card-surface rounded-xl overflow-hidden p-2">' + linked +
+            (o.caption ? '<figcaption class="text-sm opacity-80 px-2 pt-2 pb-1">' + esc(o.caption) + '</figcaption>' : '') + '</figure>');
+        },
+        links: (b) => (b.options && (b.options.links || []).length) ? section(b, '', linkButtons(b.options.links, '')) : '',
+        featured: (b) => {
+          const target = b.options && b.options.canonicalUrl;
+          if (!target) return '';
+          const item = allItems.find(i => i.canonicalUrl === target);
+          if (item) return section(b, '⭐ Featured', '<div class="grid grid-cols-1 md:grid-cols-2 gap-4">' + renderItem(item) + '</div>');
+          const album = allAlbums.find(a => a.canonicalUrl === target);
+          if (album) return section(b, '⭐ Featured', renderAlbum(album, 'grid'));
+          for (const a of allAlbums) {
+            const photo = (a.photos || []).find(p => p.canonicalUrl === target);
+            if (photo) return section(b, '⭐ Featured', '<div class="grid grid-cols-1 sm:grid-cols-2 gap-4">' + renderPhotoCard(photo, a, '') + '</div>');
+          }
+          return '';
+        },
+        contact: (b) => (b.options && (b.options.entries || []).length) ? section(b, '✉️ Contact & Elsewhere', linkButtons(b.options.entries, 'me')) : '',
+        guestbook: (b) => hasGuestbook
+          ? section(b, '📖 Guestbook', '<div class="card-surface rounded-xl p-4"><button onclick="window.openGuestbook()" class="accent-solid px-4 py-2 rounded-xl bg-indigo-600 text-white text-sm font-semibold">Open Guestbook</button><div id="guestbook-thread" class="hidden mt-3"></div></div>')
+          : '',
+      };
+
+      const layout = Array.isArray(profile.layout) ? profile.layout : DEFAULT_LAYOUT;
+      const renderedBlocks = layout
+        .filter(b => b && b.visible !== false && Object.prototype.hasOwnProperty.call(blockRenderers, b.type))
+        .map(b => blockRenderers[b.type](b))
+        .filter(Boolean);
+      // The in-feed ad slot goes after the first block, as it did between albums and items
+      const blocksHtml = renderedBlocks.length
+        ? renderedBlocks[0] + inFeedAdHtml + renderedBlocks.slice(1).join('')
+        : inFeedAdHtml;
+
       root.innerHTML = \`
         \${webringBars}
         <div class="card-surface rounded-2xl overflow-hidden mb-8 shadow-xl">
-          \${profile.bannerUrl ? \`<div class="h-48 sm:h-60 w-full overflow-hidden bg-slate-800"><img src="\${safeUrl(profile.bannerUrl)}" class="w-full h-full object-cover" /></div>\` : ''}
+          \${profile.bannerUrl ? \`<div class="profile-banner h-48 sm:h-60 w-full overflow-hidden bg-slate-800"><img src="\${safeUrl(profile.bannerUrl)}" class="w-full h-full object-cover" /></div>\` : ''}
           <div class="p-6 sm:p-8 flex flex-col sm:flex-row sm:items-end justify-between gap-6 \${profile.bannerUrl ? '-mt-16' : ''}">
             <div class="flex flex-col sm:flex-row sm:items-end gap-5">
-              \${profile.avatarUrl ? \`<img src="\${safeUrl(profile.avatarUrl)}" class="w-28 h-28 rounded-2xl object-cover border-4 border-slate-900 shadow-lg bg-slate-800" />\` : ''}
+              \${profile.avatarUrl ? \`<img src="\${safeUrl(profile.avatarUrl)}" class="profile-avatar w-28 h-28 rounded-2xl object-cover border-4 border-slate-900 shadow-lg bg-slate-800" />\` : ''}
               <div>
                 <div class="flex flex-wrap items-center gap-2">
                   <h1 class="text-2xl sm:text-3xl font-extrabold">\${esc(profile.displayName)}</h1>
@@ -676,7 +841,7 @@ export class StaticSiteGenerator {
               </div>
             </div>
             <div class="flex flex-wrap gap-2">
-              <a href="\${buildDeepLink('friend', profile.siteUrl, profile.displayName, profile.avatarUrl)}" class="px-4 py-2 rounded-xl bg-indigo-600 hover:bg-indigo-500 text-white font-semibold text-sm shadow">
+              <a href="\${buildDeepLink('friend', profile.siteUrl, profile.displayName, profile.avatarUrl)}" class="accent-solid px-4 py-2 rounded-xl bg-indigo-600 hover:bg-indigo-500 text-white font-semibold text-sm shadow">
                 + Add to Friend Ring
               </a>
               <a href="./api/manifest.json" target="_blank" rel="noopener noreferrer" class="px-3 py-2 rounded-xl card-surface text-xs font-mono hover:opacity-80">
@@ -699,28 +864,7 @@ export class StaticSiteGenerator {
 
         \${headerAdHtml}
 
-        <section class="mb-12">
-          <h2 class="text-2xl font-bold mb-4 flex items-center gap-2">📸 Photo Albums</h2>
-          \${albumsHtml || '<p class="opacity-60 text-sm">No photo albums published yet.</p>'}
-        </section>
-
-        \${inFeedAdHtml}
-
-        <section class="mb-12">
-          <h2 class="text-2xl font-bold mb-4 flex items-center gap-2">✨ Shared Items & Things I Like</h2>
-          <div class="grid grid-cols-1 md:grid-cols-2 gap-4">
-            \${itemsHtml || '<p class="opacity-60 text-sm">No shared or liked items yet.</p>'}
-          </div>
-        </section>
-
-        \${(connections.friends || []).length > 0 ? \`
-        <section class="mb-12">
-          <h2 class="text-2xl font-bold mb-4 flex items-center gap-2">🤝 Friend Ring & Connections (\${(connections.friends || []).length})</h2>
-          <div class="grid grid-cols-1 sm:grid-cols-2 md:grid-cols-3 gap-4">
-            \${friendsHtml}
-          </div>
-        </section>
-        \` : ''}
+        \${blocksHtml}
 
         \${footerAdHtml}
 
@@ -751,9 +895,26 @@ export class StaticSiteGenerator {
         });
       }
     })();
-  </script>
+  </script>${preview ? PREVIEW_BRIDGE : ''}
 </body>
 </html>`;
+  }
+
+  /** Look & feel as <body> attributes, so the published page is styled before its script runs. */
+  private appearanceAttributes(appearance: Appearance): string {
+    const attrs: string[] = [];
+    if (appearance.font && appearance.font !== 'theme') attrs.push(`data-font="${appearance.font}"`);
+    if (appearance.corners && appearance.corners !== 'rounded') attrs.push(`data-corners="${appearance.corners}"`);
+    if (appearance.surface === 'flat') attrs.push('data-surface="flat"');
+    if (appearance.bannerHeight && appearance.bannerHeight !== 'medium') attrs.push(`data-banner="${appearance.bannerHeight}"`);
+    if (appearance.avatarShape === 'circle') attrs.push('data-avatar="circle"');
+    if (appearance.background && appearance.background !== 'theme') attrs.push(`data-background="${appearance.background}"`);
+    if (appearance.accent && /^#[0-9a-fA-F]{6}$/.test(appearance.accent)) {
+      const n = parseInt(appearance.accent.slice(1), 16);
+      const luminance = (0.2126 * ((n >> 16) & 255) + 0.7152 * ((n >> 8) & 255) + 0.0722 * (n & 255)) / 255;
+      attrs.push('data-accent', `style="--accent: ${appearance.accent}; --accent-ink: ${luminance > 0.6 ? '#0b1020' : '#ffffff'}"`);
+    }
+    return attrs.length ? ` ${attrs.join(' ')}` : '';
   }
 
   private escapeHtml(str: string): string {
@@ -765,6 +926,24 @@ export class StaticSiteGenerator {
   }
 }
 
+
+/**
+ * Studio preview only (sandboxed iframe): links never navigate the preview. webring:// actions
+ * open the matching form in Studio and web links open in the browser, via postMessage.
+ */
+const PREVIEW_BRIDGE = `
+  <script>
+    document.addEventListener('click', function(ev) {
+      var anchor = ev.target && ev.target.closest ? ev.target.closest('a[href]') : null;
+      if (!anchor) return;
+      var href = anchor.getAttribute('href') || '';
+      if (href.charAt(0) === '#') return;
+      ev.preventDefault();
+      ev.stopPropagation();
+      if (/^webring:/i.test(href)) parent.postMessage({ type: 'webring-preview-deeplink', href: href }, '*');
+      else if (/^https?:/i.test(anchor.href)) parent.postMessage({ type: 'webring-preview-open', href: anchor.href }, '*');
+    }, true);
+  </script>`;
 
 function escapeHtml(value: string): string {
   return value

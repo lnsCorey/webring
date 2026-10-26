@@ -322,7 +322,8 @@ if (!gotTheLock) {
       process.argv.includes('--background') ||
       (process.platform === 'darwin' && app.getLoginItemSettings().wasOpenedAtLogin);
     protocol.handle('studio-media', (request) => {
-      const relative = decodeURIComponent(new URL(request.url).pathname.replace(/^\/+/, ''));
+      // Studio uses studio-media://local/<path>; the site preview's <base> gives studio-media://local/media/<path>
+      const relative = decodeURIComponent(new URL(request.url).pathname.replace(/^\/+/, '')).replace(/^media\//, '');
       const file = personaManager.getActiveContext().mediaLibrary.resolveLocalUrl(`media/${relative}`);
       if (!file || !fs.existsSync(file)) return new Response('Not found', { status: 404 });
       return net.fetch(pathToFileURL(file).toString());
@@ -399,7 +400,7 @@ function registerIpcHandlers() {
         Boolean(profileWithSettings.publishSettings.lastPublishedFingerprint) &&
         ctx.siteGenerator.contentFingerprint(bundle) ===
           profileWithSettings.publishSettings.lastPublishedFingerprint,
-      previewHtml: ctx.siteGenerator.buildStandaloneProfileHtml(bundle),
+      previewHtml: ctx.siteGenerator.buildStandaloneProfileHtml(bundle, { preview: true }),
     };
   });
 
