@@ -27,6 +27,7 @@ import { STORED_SECRET_PLACEHOLDER, StudioDatabase } from '../electron/db/databa
 import { LEGACY_DEMO_PHOTOS, LEGACY_DEMO_PROFILE } from '../electron/db/legacyDemoContent';
 import { StaticSiteGenerator } from '../electron/services/siteGenerator';
 import { renderTemplatePage } from '../electron/services/siteTemplates';
+import { installPageEnhancements } from '../electron/services/pageEnhancements';
 import { defaultJsonFetcher, RingCrawler } from '../electron/services/ringCrawler';
 import { RingService } from '../electron/services/ringService';
 import { jobNextRunAt, nextRunAt, Scheduler } from '../electron/services/scheduler';
@@ -2589,6 +2590,54 @@ describe('Site Design (look & feel, page layout)', () => {
       });
       expect(parsed.theme).toBe('neo-webring');
       expect(ProfileDocumentSchema.parse({ ...parsed, theme: 'instapick' }).theme).toBe('instapick');
+    });
+
+    it('marks photos and posts for the interactive viewer, and can leave the extras out', async () => {
+      for (const theme of ['neo-webring', 'instapick', 'facepace'] as ProfileTheme[]) {
+        const db = setUp(`viewer-${theme}.sqlite`, theme);
+        const html = new StaticSiteGenerator(db).buildStandaloneProfileHtml(db.buildSignedSiteBundle());
+        expect(html).toContain('function installPageEnhancements');
+        const page = await renderPage(html); // no <dialog> in the harness: plain links stay
+        const photo = db.getAlbums()[0].photos[0];
+        expect(page.html).toContain(`data-lightbox data-photo-id="${photo.id}"`);
+        expect(page.html).toMatch(/data-open-post="[^"]+"/);
+        expect(page.html).not.toContain('Untitled Photo');
+        db.close();
+      }
+      const db = setUp('viewer-off.sqlite', 'neo-webring');
+      db.updateProfile({ appearance: { interactions: 'off' } });
+      expect(db.getProfile().appearance).toEqual({ interactions: 'off' });
+      const html = new StaticSiteGenerator(db).buildStandaloneProfileHtml(db.buildSignedSiteBundle());
+      expect(html).not.toContain('function installPageEnhancements');
+      expect(html).not.toContain('.wr-dialog');
+      expect((await renderPage(html)).html).toContain('Hello world');
+      db.close();
+    });
+
+    it('renders album descriptions as safe Markdown in every arrangement', async () => {
+      for (const theme of ['neo-webring', 'facepace', 'instapick'] as ProfileTheme[]) {
+        const db = new StudioDatabase(tempRoot, `album-md-${theme}.sqlite`);
+        const album = db.createAlbum({
+          title: 'Trip',
+          description: '## Day one\n\nWe saw [the lake](https://lake.example) and:\n\n- hills\n- birds\n\n<script>alert(1)</script> [bad](javascript:alert(1))',
+        });
+        db.addPhotoToAlbum({ albumId: album.id, url: 'media/albums/a1/p.jpg' });
+        db.updateProfile({ theme });
+        const page = await renderPage(new StaticSiteGenerator(db).buildStandaloneProfileHtml(db.buildSignedSiteBundle()));
+        expect(page.html).toContain('<h3>Day one</h3>');
+        expect(page.html).toContain('<a href="https://lake.example" target="_blank" rel="noopener noreferrer">the lake</a>');
+        expect(page.html).toContain('<ul><li>hills</li><li>birds</li></ul>');
+        expect(page.html).toContain('&lt;script&gt;alert(1)&lt;/script&gt;');
+        expect(page.html).not.toContain('<script>alert(1)');
+        expect(page.html).not.toContain('javascript:alert');
+        db.close();
+      }
+    });
+
+    it('embeds interactive extras that run standalone', () => {
+      const source = installPageEnhancements.toString();
+      expect(source).not.toMatch(/<\/script/i);
+      expect(typeof new Function(`return ${source}`)()).toBe('function');
     });
 
     it('embeds a template renderer that runs standalone', () => {

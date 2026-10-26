@@ -18,6 +18,7 @@ import {
   THEME_LABELS,
 } from '../shared/schema';
 import { SiteDesignPanel } from './SiteDesignPanel';
+import { MarkdownField } from './MarkdownField';
 import {
   BookOpen,
   Camera,
@@ -2353,12 +2354,11 @@ export const App: React.FC = () => {
                         placeholder="Tags, comma separated"
                         className="px-3 py-2 rounded-xl bg-slate-950 border border-slate-800 text-sm"
                       />
-                      <textarea
+                      <MarkdownField
                         value={draft.description}
-                        onChange={(e) => setAlbumDraft({ ...draft, description: e.target.value })}
-                        placeholder="Description"
-                        rows={2}
-                        className="md:col-span-2 px-3 py-2 rounded-xl bg-slate-950 border border-slate-800 text-sm"
+                        onChange={(description) => setAlbumDraft({ ...draft, description })}
+                        placeholder="Description (Markdown: headings, links, lists, tables)"
+                        className="md:col-span-2"
                       />
                     </div>
                     <div className="flex flex-wrap items-center gap-2">
@@ -6192,7 +6192,9 @@ export const App: React.FC = () => {
                           <strong>Instapick</strong> (stats, album highlights, square grid) or{' '}
                           <strong>Tik Talk</strong> (vertical reel). Your blocks keep their order; friends,
                           contact, links and guestbook go in the sidebar or rail where a template has one.
-                          Accent, font and the other options still apply.
+                          Accent, font and the other options still apply. Interactive extras (on by
+                          default) add a photo lightbox, a larger post view with shareable links, and
+                          sortable tables.
                         </p>
                         <button
                           onClick={() => setActiveTab('preview')}

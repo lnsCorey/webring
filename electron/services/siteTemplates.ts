@@ -85,7 +85,9 @@ export const TEMPLATE_CSS = String.raw`
     .tpl-tile:hover .tpl-overlay, .tpl-tile:focus-within .tpl-overlay { opacity: 1; }
     .tpl-overlay .tpl-actions a { opacity: 1; color: #fff; }
     .tpl-album { margin-bottom: 1.25rem; }
-    .tpl-album-head { display: flex; align-items: baseline; justify-content: space-between; gap: 0.5rem; margin-bottom: 0.6rem; }
+    .tpl-album-head { display: flex; align-items: flex-start; justify-content: space-between; gap: 0.75rem; margin-bottom: 0.6rem; }
+    .tpl-album-head > div { min-width: 0; flex: 1; }
+    .tpl-album-head > a { flex-shrink: 0; }
     .tpl-stats { display: flex; flex-wrap: wrap; gap: 1.25rem; font-size: 0.9rem; }
     .tpl-stats b { font-weight: 800; }
 
@@ -271,7 +273,7 @@ export function renderTemplatePage(ctx: any): string {
       '<a href="' + link('like', item.canonicalUrl, item.title, item.mediaUrl, item.category) + '">♥ ' + (labels ? 'Like' : '') + '</a>' +
       '<a href="' + link('comment', item.canonicalUrl, item.title, item.mediaUrl, 'comment') + '">💬 ' + (labels ? 'Comment' : '') + '</a>' +
       '<a href="' + link('share', item.targetUrl, item.title, item.mediaUrl, item.category) + '">↻ ' + (labels ? 'Share' : '') + '</a>' +
-      live + '</div>';
+      live + '<button type="button" data-open-post="' + esc(item.id) + '" aria-label="Open post">⤢ ' + (labels ? 'Open' : '') + '</button></div>';
   };
   const itemBody = (item: any) => {
     const isSelfPost = item.type === 'post' && (!item.targetUrl || item.targetUrl === item.canonicalUrl);
@@ -311,7 +313,7 @@ export function renderTemplatePage(ctx: any): string {
         : '<div class="tpl-tile-text"><strong>' + esc(item.title) + '</strong><span>' + esc(String(item.commentary || '').slice(0, 160)) + '</span></div>') +
       '<div class="tpl-overlay"><span>♥ ' + r.endorsements.length + ' · 💬 ' + r.comments.length + '</span><span>' + esc(item.title) + '</span>' + itemActions(item, false) + '</div></div>';
   };
-  const reelCard = (media: string, title: string, text: string, tags: string[], counts: { likes: number; comments: number }, actions: { like: string; comment?: string; share: string }) =>
+  const reelCard = (media: string, title: string, text: string, tags: string[], counts: { likes: number; comments: number }, actions: { like: string; comment?: string; share: string; open?: string }) =>
     '<div class="tt-card">' +
     (media ? '<img src="' + safeUrl(media) + '" alt="' + esc(title) + '" />' : '<div class="tt-text">' + esc(text || title) + '</div>') +
     '<div class="tt-caption"><p class="font-bold">' + esc(handle || profile.displayName) + '</p>' +
@@ -320,23 +322,26 @@ export function renderTemplatePage(ctx: any): string {
     '<div class="tt-rail">' +
     '<a href="' + actions.like + '"><span class="tt-icon">♥</span>' + counts.likes + '</a>' +
     (actions.comment ? '<a href="' + actions.comment + '"><span class="tt-icon">💬</span>' + counts.comments + '</a>' : '') +
-    '<a href="' + actions.share + '"><span class="tt-icon">↻</span>Share</a></div></div>';
+    '<a href="' + actions.share + '"><span class="tt-icon">↻</span>Share</a>' +
+    (actions.open ? '<button type="button" ' + actions.open + ' aria-label="Open"><span class="tt-icon">⤢</span>Open</button>' : '') + '</div></div>';
   const itemReel = (item: any) => {
     const r = reactions(item.canonicalUrl);
     return reelCard(item.mediaUrl, item.title, item.commentary, item.tags, { likes: r.endorsements.length, comments: r.comments.length }, {
       like: link('like', item.canonicalUrl, item.title, item.mediaUrl, item.category),
       comment: link('comment', item.canonicalUrl, item.title, item.mediaUrl, 'comment'),
       share: link('share', item.targetUrl, item.title, item.mediaUrl, item.category),
+      open: 'data-open-post="' + esc(item.id) + '"',
     });
   };
   const photoTile = (photo: any, album: any) =>
-    '<div class="tpl-tile"><a href="' + safeUrl(photo.url) + '" target="_blank" rel="noopener noreferrer"><img src="' + safeUrl(photo.thumbUrl || photo.url) + '" alt="' + esc(photo.altText || photo.caption) + '" /></a>' +
+    '<div class="tpl-tile"><a href="' + safeUrl(photo.url) + '" target="_blank" rel="noopener noreferrer" data-lightbox data-photo-id="' + esc(photo.id) + '"><img src="' + safeUrl(photo.thumbUrl || photo.url) + '" alt="' + esc(photo.altText || photo.caption) + '" /></a>' +
     '<div class="tpl-overlay"><span>♥ ' + ctx.getEndorsementsFor(photo.canonicalUrl).length + '</span>' + (photo.caption ? '<span>' + esc(photo.caption) + '</span>' : '') +
     '<div class="tpl-actions"><a href="' + link('like', photo.canonicalUrl, photo.caption || album.title, photo.url, 'photo') + '">♥ Like</a><a href="' + link('share', photo.canonicalUrl, photo.caption || album.title, photo.url, 'photo') + '">↻ Share</a></div></div></div>';
   const photoReel = (photo: any, album: any) =>
     reelCard(photo.url, photo.caption || album.title, album.title, photo.tags, { likes: ctx.getEndorsementsFor(photo.canonicalUrl).length, comments: 0 }, {
       like: link('like', photo.canonicalUrl, photo.caption || album.title, photo.url, 'photo'),
       share: link('share', photo.canonicalUrl, photo.caption || album.title, photo.url, 'photo'),
+      open: 'data-lightbox data-photo-id="' + esc(photo.id) + '"',
     });
 
   // Blocks: albums and items take the template's style, the rest reuse the page's renderers
@@ -350,7 +355,7 @@ export function renderTemplatePage(ctx: any): string {
     const carousel = b.options && b.options.style === 'carousel';
     return ctx.section(b, '📸 Photos', list.map((a: any) =>
       '<div class="tpl-album" id="tpl-album-' + esc(a.id) + '"><div class="tpl-album-head"><div><h3 class="font-bold">' + esc(a.title) + '</h3>' +
-      (a.description ? '<p class="text-sm tpl-muted">' + esc(a.description) + '</p>' : '') + '</div>' +
+      (a.description ? '<div class="prose-block album-description text-sm">' + ctx.renderMarkdown(a.description) + '</div>' : '') + '</div>' +
       '<a href="' + link('share', a.canonicalUrl, a.title, a.coverUrl, 'photo') + '" class="text-xs font-semibold tpl-accent">↻ Share album</a></div>' +
       '<div class="' + (carousel ? 'tpl-carousel' : 'tpl-grid') + '">' + (a.photos || []).map((p: any) => photoTile(p, a)).join('') + '</div></div>'
     ).join(''));

@@ -246,7 +246,7 @@ export class WebringMcpServer {
             appearance: {
               type: 'object',
               description:
-                'Look & feel: { accent: "#rrggbb", font: theme|sans|serif|rounded|mono, corners: sharp|rounded|soft, surface: card|flat, bannerHeight: short|medium|tall, avatarShape: rounded|circle, background: theme|gradient|banner-blur }. Invalid fields are ignored.',
+                'Look & feel: { accent: "#rrggbb", font: theme|sans|serif|rounded|mono, corners: sharp|rounded|soft, surface: card|flat, bannerHeight: short|medium|tall, avatarShape: rounded|circle, background: theme|gradient|banner-blur, interactions: on|off (photo lightbox, post view, sortable tables; default on) }. Invalid fields are ignored.',
             },
             layout: {
               type: 'array',
@@ -410,7 +410,7 @@ export class WebringMcpServer {
           properties: {
             personaId: personaIdProp,
             title: { type: 'string', description: 'Album title.' },
-            description: { type: 'string', description: 'Album description.' },
+            description: { type: 'string', description: 'Album description, in Markdown (headings, links, lists, tables; no HTML).' },
             coverUrl: { type: 'string', description: 'Optional cover image URL.' },
             tags: { type: 'array', items: { type: 'string' } },
           },
