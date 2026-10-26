@@ -19,6 +19,7 @@ import {
 } from '../shared/schema';
 import { SiteDesignPanel } from './SiteDesignPanel';
 import { MarkdownField } from './MarkdownField';
+import { ProfileImagePicker } from './ProfileImagePicker';
 import {
   BookOpen,
   Camera,
@@ -360,6 +361,7 @@ declare global {
         filePaths?: string[]
       ) => Promise<{ added: string[]; failed: Array<{ file: string; error: string }> }>;
       importImage: () => Promise<{ url: string; fileName: string } | null>;
+      setProfileImage: (kind: 'avatar' | 'banner', filePath?: string) => Promise<{ url: string } | null>;
       replacePhoto: (photoId: string) => Promise<{ replaced: boolean }>;
       updatePhoto: (photoId: string, updates: { caption?: string; altText?: string; tags?: string[] }) => Promise<unknown>;
       movePhoto: (photoId: string, direction: 'up' | 'down') => Promise<unknown>;
@@ -959,6 +961,22 @@ export const App: React.FC = () => {
           action.title || action.targetUrl
         }"`
       );
+    }
+  };
+
+  // Uploads are saved on the profile immediately; only this field changes, so other unsaved
+  // edits in the form stay as they are
+  const handleUploadProfileImage = async (kind: 'avatar' | 'banner', filePath?: string) => {
+    if (!window.studioApi) return;
+    try {
+      const result = await window.studioApi.setProfileImage(kind, filePath);
+      if (!result) return;
+      if (kind === 'avatar') setAvatarUrl(result.url);
+      else setBannerUrl(result.url);
+      setBundle((prev) => (prev ? { ...prev, profile: { ...prev.profile, [kind === 'avatar' ? 'avatarUrl' : 'bannerUrl']: result.url } } : prev));
+      notify(kind === 'avatar' ? 'Profile photo uploaded and saved.' : 'Banner image uploaded and saved.');
+    } catch (err) {
+      notify(`Couldn't use that image: ${err instanceof Error ? err.message.replace(/^Error invoking remote method '[^']+': (Error: )?/, '') : String(err)}`);
     }
   };
 
@@ -2102,29 +2120,27 @@ export const App: React.FC = () => {
                 </div>
 
                 <div className="grid grid-cols-1 md:grid-cols-2 gap-4">
-                  <div>
-                    <label className="block text-xs font-semibold uppercase tracking-wider text-slate-400 mb-1.5">
-                      Avatar URL
-                    </label>
-                    <input
-                      type="text"
-                      value={avatarUrl}
-                      onChange={(e) => setAvatarUrl(e.target.value)}
-                      className="w-full px-3.5 py-2 rounded-xl bg-slate-950 border border-slate-800 text-sm focus:border-indigo-500 focus:outline-none"
-                    />
-                  </div>
+                  <ProfileImagePicker
+                    kind="avatar"
+                    label="Profile Photo"
+                    value={avatarUrl}
+                    savedValue={bundle.profile.avatarUrl || ''}
+                    albums={bundle.albums.albums}
+                    mediaSrc={mediaSrc}
+                    onChange={setAvatarUrl}
+                    onUpload={(filePath) => handleUploadProfileImage('avatar', filePath)}
+                  />
 
-                  <div>
-                    <label className="block text-xs font-semibold uppercase tracking-wider text-slate-400 mb-1.5">
-                      Banner Image URL
-                    </label>
-                    <input
-                      type="text"
-                      value={bannerUrl}
-                      onChange={(e) => setBannerUrl(e.target.value)}
-                      className="w-full px-3.5 py-2 rounded-xl bg-slate-950 border border-slate-800 text-sm focus:border-indigo-500 focus:outline-none"
-                    />
-                  </div>
+                  <ProfileImagePicker
+                    kind="banner"
+                    label="Banner Image"
+                    value={bannerUrl}
+                    savedValue={bundle.profile.bannerUrl || ''}
+                    albums={bundle.albums.albums}
+                    mediaSrc={mediaSrc}
+                    onChange={setBannerUrl}
+                    onUpload={(filePath) => handleUploadProfileImage('banner', filePath)}
+                  />
 
                   <div>
                     <label className="block text-xs font-semibold uppercase tracking-wider text-slate-400 mb-1.5">

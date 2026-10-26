@@ -2,7 +2,7 @@ import * as path from 'path';
 import * as fs from 'fs';
 import { PersonaManager, ActivePersonaContext } from '../services/personaManager';
 import { LocalPreviewServer } from '../services/localPreviewServer';
-import { deleteAlbumWithFiles, deletePhotoWithFiles } from '../services/mediaLibrary';
+import { cleanUpLibrary, deleteAlbumWithFiles, deletePhotoWithFiles, setProfileImageFromFile } from '../services/mediaLibrary';
 import { jobNextRunAt, Scheduler, SchedulePreset } from '../services/scheduler';
 import {
   FriendVisibility,
@@ -434,6 +434,22 @@ export class WebringMcpServer {
             tags: { type: 'array', items: { type: 'string' } },
           },
           required: ['albumId', 'urlOrLocalPath'],
+        },
+      },
+      {
+        name: 'webring_set_profile_image',
+        description:
+          'Set the profile photo (avatar) or banner from a local JPEG/PNG (uploaded: resized, metadata removed, published with the site), an existing album photo, or a web address. There is only one of each: a new one replaces the old, and a previously uploaded file is deleted. url "" removes the image.',
+        inputSchema: {
+          type: 'object',
+          properties: {
+            personaId: personaIdProp,
+            kind: { type: 'string', enum: ['avatar', 'banner'] },
+            localPath: { type: 'string', description: 'Absolute path of a local JPEG or PNG to upload.' },
+            photoId: { type: 'string', description: 'ID of an album photo to use.' },
+            url: { type: 'string', description: 'An http(s) image address, or "" to remove.' },
+          },
+          required: ['kind'],
         },
       },
       {
@@ -1016,7 +1032,35 @@ export class WebringMcpServer {
                 ? { ...current.publishSettings, ...publishUpdates }
                 : undefined,
           });
+          if (args.avatarUrl !== undefined || args.bannerUrl !== undefined) cleanUpLibrary(ctx.db, ctx.mediaLibrary);
           summary = `Updated profile for ${ctx.persona.displayName}`;
+          break;
+        }
+
+        case 'webring_set_profile_image': {
+          const ctx = this.resolveContext(args);
+          const kind = args.kind === 'banner' ? 'banner' : args.kind === 'avatar' ? 'avatar' : null;
+          if (!kind) throw new Error('kind must be "avatar" or "banner".');
+          const field = kind === 'avatar' ? 'avatarUrl' : 'bannerUrl';
+          let url: string;
+          if (args.localPath) {
+            url = setProfileImageFromFile(ctx.db, ctx.mediaLibrary, kind, String(args.localPath));
+          } else if (args.photoId) {
+            const photo = ctx.db.getAlbums().flatMap((a) => a.photos).find((p) => p.id === String(args.photoId));
+            if (!photo) throw new Error(`Photo "${String(args.photoId)}" not found.`);
+            url = kind === 'avatar' ? photo.thumbUrl || photo.url : photo.url;
+            ctx.db.updateProfile({ [field]: url });
+            cleanUpLibrary(ctx.db, ctx.mediaLibrary);
+          } else if (args.url !== undefined) {
+            url = String(args.url);
+            if (url && !/^https?:\/\//i.test(url)) throw new Error('url must be an http(s) address, or "" to remove the image.');
+            ctx.db.updateProfile({ [field]: url });
+            cleanUpLibrary(ctx.db, ctx.mediaLibrary);
+          } else {
+            throw new Error('Give one of localPath, photoId or url.');
+          }
+          resultData = { kind, url };
+          summary = url ? `Set the ${kind === 'avatar' ? 'profile photo' : 'banner'} to ${url}` : `Removed the ${kind === 'avatar' ? 'profile photo' : 'banner'}`;
           break;
         }
 

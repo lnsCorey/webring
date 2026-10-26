@@ -18,6 +18,8 @@ contextBridge.exposeInMainWorld('studioApi', {
     ipcRenderer.invoke('studio:media-import-photos', albumId, filePaths),
   replacePhoto: (photoId: string) => ipcRenderer.invoke('studio:media-replace-photo', photoId),
   importImage: () => ipcRenderer.invoke('studio:media-import-image'),
+  setProfileImage: (kind: 'avatar' | 'banner', filePath?: string) =>
+    ipcRenderer.invoke('studio:profile-set-image', kind, filePath),
   updatePhoto: (photoId: string, updates: unknown) => ipcRenderer.invoke('studio:media-update-photo', photoId, updates),
   movePhoto: (photoId: string, direction: 'up' | 'down') =>
     ipcRenderer.invoke('studio:media-move-photo', photoId, direction),
