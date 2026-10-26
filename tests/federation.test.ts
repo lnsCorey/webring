@@ -16,6 +16,7 @@ import {
   ProfileDocumentSchema,
   type Appearance,
   type LayoutBlock,
+  type ProfileTheme,
   parseWebringUri,
   signDocument,
   siteUrlToDidWeb,
@@ -25,6 +26,7 @@ import {
 import { STORED_SECRET_PLACEHOLDER, StudioDatabase } from '../electron/db/database';
 import { LEGACY_DEMO_PHOTOS, LEGACY_DEMO_PROFILE } from '../electron/db/legacyDemoContent';
 import { StaticSiteGenerator } from '../electron/services/siteGenerator';
+import { renderTemplatePage } from '../electron/services/siteTemplates';
 import { defaultJsonFetcher, RingCrawler } from '../electron/services/ringCrawler';
 import { RingService } from '../electron/services/ringService';
 import { jobNextRunAt, nextRunAt, Scheduler } from '../electron/services/scheduler';
@@ -2498,5 +2500,101 @@ describe('Site Design (look & feel, page layout)', () => {
     // It must work as embedded, standalone source
     const standalone = new Function(`return ${renderMarkdown.toString()}`)() as (s: string) => string;
     expect(standalone('**b**')).toBe('<p><strong>b</strong></p>');
+  });
+
+  describe('social-style templates', () => {
+    const XSS = '<img src=x onerror=alert(1)>';
+    const setUp = (file: string, theme: ProfileTheme) => {
+      const db = new StudioDatabase(tempRoot, file);
+      const album = db.createAlbum({ title: 'Trips' });
+      db.addPhotoToAlbum({ albumId: album.id, url: 'media/albums/a1/p.jpg' });
+      db.createItem({ type: 'post', title: 'Hello world', commentary: XSS, mediaUrl: 'media/albums/wall-posts/x.jpg' });
+      db.createItem({ type: 'recommendation', title: 'A great book', commentary: 'Read it' });
+      db.updateProfile({
+        theme,
+        bio: XSS,
+        layout: [
+          { id: 'links', type: 'links', visible: true, title: 'Find me', options: { links: [{ label: 'Blog', url: 'https://blog.example' }] } },
+          { id: 'albums', type: 'albums', visible: true, options: { style: 'grid' } },
+          { id: 'items', type: 'items', visible: true, options: { kinds: ['post', 'recommendation'] } },
+          { id: 'hidden', type: 'text', visible: false, options: { markdown: 'secret block' } },
+        ],
+      });
+      return db;
+    };
+    const shellMarkers: Array<[ProfileTheme, string, string[]]> = [
+      ['facepace', 'sidebar', ['fp-topbar', 'fp-post', 'data-region="aside"', '+ Add friend']],
+      ['tweetdeck', 'deck', ['td-deck', 'data-region="column"', 'tw-row']],
+      ['xtraspecial', 'rails', ['xs-left', 'xs-right', 'tw-row', 'data-region="nav"']],
+      ['instapick', 'grid', ['ip-highlights', 'tpl-grid', 'tpl-tile']],
+      ['tiktalk', 'reel', ['tt-reel', 'tt-card', 'tt-rail']],
+    ];
+
+    for (const [theme, shell, markers] of shellMarkers) {
+      it(`renders ${theme} as the ${shell} arrangement, safely`, async () => {
+        const db = setUp(`${theme}.sqlite`, theme);
+        const html = new StaticSiteGenerator(db).buildStandaloneProfileHtml(db.buildSignedSiteBundle());
+        expect(html).toMatch(new RegExp(`<body class="theme-${theme} shell-${shell}`));
+        const page = await renderPage(html);
+        expect(page.html).toContain(`data-shell="${shell}"`);
+        for (const marker of markers) expect(page.html).toContain(marker);
+        // Sidebar and deck show "links" first; the others place sidebar blocks after the main column
+        const sideFirst = shell === 'sidebar' || shell === 'deck';
+        expect(blockOrder(page.html)).toEqual(sideFirst ? ['links', 'albums', 'items'] : ['albums', 'items', 'links']);
+        expect(page.html).toContain('Hello world');
+        expect(page.html).toContain('A great book');
+        expect(page.html).toContain('https://blog.example');
+        expect(page.html).not.toContain('secret block');
+        expect(page.html).not.toContain('<img src=x');
+        expect(page.html).toContain('&lt;img src=x onerror=alert(1)&gt;');
+        db.close();
+      });
+    }
+
+    it('puts sidebar blocks in the sidebar and the rest in the main column', async () => {
+      const db = setUp('regions.sqlite', 'facepace');
+      const page = await renderPage(new StaticSiteGenerator(db).buildStandaloneProfileHtml(db.buildSignedSiteBundle()));
+      const aside = page.html.slice(page.html.indexOf('data-region="aside"'), page.html.indexOf('data-region="main"'));
+      expect(blockOrder(aside)).toEqual(['links']);
+      expect(blockOrder(page.html.slice(page.html.indexOf('data-region="main"')))).toEqual(['albums', 'items']);
+      db.close();
+    });
+
+    it('keeps the classic themes on the standard page', async () => {
+      const db = setUp('classic.sqlite', 'minimal-zine');
+      const page = await renderPage(new StaticSiteGenerator(db).buildStandaloneProfileHtml(db.buildSignedSiteBundle()));
+      expect(page.html).not.toContain('data-shell=');
+      expect(page.html).toContain('+ Add to Friend Ring');
+      expect(blockOrder(page.html)).toEqual(['links', 'albums', 'items']);
+      db.close();
+    });
+
+    it('falls back to Neo-Webring for an unknown theme, on the page and in a friend’s profile', async () => {
+      const db = setUp('unknown.sqlite', 'tiktalk');
+      const bundle = db.buildSignedSiteBundle();
+      const odd = { ...bundle, profile: { ...bundle.profile, theme: 'hologram' as ProfileTheme } };
+      const html = new StaticSiteGenerator(db).buildStandaloneProfileHtml(odd);
+      expect(html).toContain('<body class="theme-neo-webring shell-stack');
+      const page = await renderPage(html);
+      expect(page.html).not.toContain('data-shell=');
+      db.close();
+
+      const parsed = ProfileDocumentSchema.parse({
+        did: 'did:web:x.example',
+        siteUrl: 'https://x.example',
+        handle: 'x',
+        displayName: 'X',
+        updatedAt: new Date().toISOString(),
+        theme: 'from-the-future',
+      });
+      expect(parsed.theme).toBe('neo-webring');
+      expect(ProfileDocumentSchema.parse({ ...parsed, theme: 'instapick' }).theme).toBe('instapick');
+    });
+
+    it('embeds a template renderer that runs standalone', () => {
+      const standalone = new Function(`return ${renderTemplatePage.toString()}`)();
+      expect(typeof standalone).toBe('function');
+      expect(renderTemplatePage.toString()).not.toMatch(/<\/script/i);
+    });
   });
 });

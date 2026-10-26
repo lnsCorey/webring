@@ -13,6 +13,7 @@ import {
   LayoutBlock,
   ProfileTheme,
   SharedItemType,
+  ProfileThemeSchema,
 } from '../../src/shared/schema';
 
 export interface JsonRpcRequest {
@@ -191,8 +192,8 @@ export class WebringMcpServer {
             bio: { type: 'string', description: 'About / biography text.' },
             theme: {
               type: 'string',
-              enum: ['neo-webring', 'minimal-zine', 'cyber-terminal', 'cozy-scrapbook'],
-              description: 'Visual theme for the exported profile site.',
+              enum: [...ProfileThemeSchema.options],
+              description: 'Visual theme for the exported profile site. facepace, tweetdeck, xtraspecial, instapick and tiktalk also rearrange the page.',
             },
           },
           required: ['label', 'displayName'],
@@ -239,7 +240,8 @@ export class WebringMcpServer {
             interests: { type: 'array', items: { type: 'string' } },
             theme: {
               type: 'string',
-              enum: ['neo-webring', 'minimal-zine', 'cyber-terminal', 'cozy-scrapbook'],
+              enum: [...ProfileThemeSchema.options],
+              description: 'Visual theme. facepace, tweetdeck, xtraspecial, instapick and tiktalk also rearrange the page.',
             },
             appearance: {
               type: 'object',

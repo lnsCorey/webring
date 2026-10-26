@@ -4,6 +4,7 @@ import * as crypto from 'crypto';
 import { StudioDatabase } from '../db/database';
 import { MediaLibrary } from './mediaLibrary';
 import { renderMarkdown } from '../../src/shared/markdown';
+import { renderTemplatePage, TEMPLATE_CONFIG, TEMPLATE_CSS, templateBodyClasses } from './siteTemplates';
 import {
   Appearance,
   CompleteSiteBundle,
@@ -11,6 +12,7 @@ import {
   isValidAdSlotId,
   isValidGa4MeasurementId,
   normalizeAdSensePublisherId,
+  ProfileThemeSchema,
   WebringHubDocument,
   WEBRING_SCHEMA_VERSION,
 } from '../../src/shared/schema';
@@ -221,7 +223,8 @@ export class StaticSiteGenerator {
   public buildStandaloneProfileHtml(bundle: CompleteSiteBundle, options: { preview?: boolean } = {}): string {
     const preview = options.preview === true;
     const markdownSource = renderMarkdown.toString();
-    if (/<\/script/i.test(markdownSource)) throw new Error('Markdown renderer source cannot be embedded safely.');
+    const templateSource = renderTemplatePage.toString();
+    if (/<\/script/i.test(markdownSource + templateSource)) throw new Error('Page renderer source cannot be embedded safely.');
     const appearance = bundle.profile.appearance || {};
     const safeJson = JSON.stringify(bundle)
       .replace(/</g, '\\u003c')
@@ -332,9 +335,10 @@ export class StaticSiteGenerator {
     .prose-block th, .prose-block td { border: 1px solid rgba(148, 163, 184, 0.35); padding: 0.4rem 0.65rem; text-align: left; }
     .prose-block th { font-weight: 700; background: rgba(148, 163, 184, 0.12); }
     .prose-block hr { border: 0; border-top: 1px solid rgba(148, 163, 184, 0.3); margin: 1rem 0; }
+${TEMPLATE_CSS}
   </style>
 </head>
-<body class="theme-${this.escapeHtml(bundle.profile.theme)} min-h-screen antialiased pb-20"${this.appearanceAttributes(appearance)}>
+<body class="${templateBodyClasses(bundle.profile.theme)} min-h-screen antialiased pb-20"${this.appearanceAttributes(appearance)}>
   <div id="profile-root" class="max-w-5xl mx-auto px-4 sm:px-6 pt-6"></div>
 
   <script>
@@ -415,9 +419,13 @@ export class StaticSiteGenerator {
         }
       }
 
-      const allowedThemes = ['neo-webring', 'minimal-zine', 'cyber-terminal', 'cozy-scrapbook'];
-      const activeTheme = allowedThemes.includes(profile.theme) ? profile.theme : 'neo-webring';
-      document.body.className = 'theme-' + activeTheme + ' min-h-screen antialiased pb-20';
+      // Templates (siteTemplates.ts): the theme picks the page arrangement as well as the skin
+      const TEMPLATES = ${JSON.stringify(TEMPLATE_CONFIG)};
+      const renderTemplatePage = ${templateSource};
+      const allowedThemes = ${JSON.stringify(ProfileThemeSchema.options)};
+      const activeTheme = allowedThemes.includes(profile.theme) && TEMPLATES[profile.theme] ? profile.theme : 'neo-webring';
+      const template = TEMPLATES[activeTheme];
+      document.body.className = 'theme-' + activeTheme + ' shell-' + template.shell + (template.light ? ' tpl-light' : '') + ' min-h-screen antialiased pb-20';
       applyAppearance(profile.appearance);
 
       function buildDeepLink(action, targetUrl, title, mediaUrl, category) {
@@ -476,7 +484,7 @@ export class StaticSiteGenerator {
           script.setAttribute('data-term', canonicalUrl);
           script.setAttribute('data-reactions-enabled', '1');
           script.setAttribute('data-emit-metadata', '0');
-          script.setAttribute('data-theme', 'dark');
+          script.setAttribute('data-theme', template.light ? 'light' : 'dark');
           script.crossOrigin = 'anonymous';
           script.async = true;
           el.innerHTML = '';
@@ -486,7 +494,7 @@ export class StaticSiteGenerator {
           script.src = 'https://utteranc.es/client.js';
           script.setAttribute('repo', cfg.giscusRepo);
           script.setAttribute('issue-term', canonicalUrl);
-          script.setAttribute('theme', 'github-dark');
+          script.setAttribute('theme', template.light ? 'github-light' : 'github-dark');
           script.crossOrigin = 'anonymous';
           script.async = true;
           el.innerHTML = '';
@@ -816,8 +824,9 @@ export class StaticSiteGenerator {
       };
 
       const layout = Array.isArray(profile.layout) ? profile.layout : DEFAULT_LAYOUT;
-      const renderedBlocks = layout
-        .filter(b => b && b.visible !== false && Object.prototype.hasOwnProperty.call(blockRenderers, b.type))
+      const visibleBlocks = layout
+        .filter(b => b && b.visible !== false && Object.prototype.hasOwnProperty.call(blockRenderers, b.type));
+      const renderedBlocks = visibleBlocks
         .map(b => blockRenderers[b.type](b))
         .filter(Boolean);
       // The in-feed ad slot goes after the first block, as it did between albums and items
@@ -825,7 +834,20 @@ export class StaticSiteGenerator {
         ? renderedBlocks[0] + inFeedAdHtml + renderedBlocks.slice(1).join('')
         : inFeedAdHtml;
 
-      root.innerHTML = \`
+      const footerHtml = \`
+        <footer class="text-center text-xs opacity-60 pt-8 border-t border-white/10">
+          <p>Self-contained static profile powered by <strong>Webring Studio JSON Protocol v\${esc(data.manifest.schemaVersion)}</strong> • Cryptographically signed via <code>\${esc(profile.did)}</code></p>
+        </footer>\`;
+
+      if (template.shell !== 'stack') {
+        root.innerHTML = renderTemplatePage({
+          shell: template.shell, profile, albums: allAlbums, items: allItems, friends: allFriends,
+          endorsementCount: (connections.endorsements || []).length, layout: visibleBlocks,
+          blockRenderers, section, emptyNote, esc, safeUrl, buildDeepLink, getEndorsementsFor, getCommentsFor,
+          hasLiveProvider: Boolean(commentCfg.provider && commentCfg.provider !== 'none'),
+          webringBars, headerAdHtml, inFeedAdHtml, footerAdHtml, footerHtml
+        });
+      } else root.innerHTML = \`
         \${webringBars}
         <div class="card-surface rounded-2xl overflow-hidden mb-8 shadow-xl">
           \${profile.bannerUrl ? \`<div class="profile-banner h-48 sm:h-60 w-full overflow-hidden bg-slate-800"><img src="\${safeUrl(profile.bannerUrl)}" class="w-full h-full object-cover" /></div>\` : ''}
@@ -867,10 +889,7 @@ export class StaticSiteGenerator {
         \${blocksHtml}
 
         \${footerAdHtml}
-
-        <footer class="text-center text-xs opacity-60 pt-8 border-t border-white/10">
-          <p>Self-contained static profile powered by <strong>Webring Studio JSON Protocol v\${esc(data.manifest.schemaVersion)}</strong> • Cryptographically signed via <code>\${esc(profile.did)}</code></p>
-        </footer>
+        \${footerHtml}
       \`;
 
       // Initialize any rendered AdSense slots

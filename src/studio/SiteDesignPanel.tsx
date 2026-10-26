@@ -10,6 +10,7 @@ import {
   MAX_LAYOUT_BLOCKS,
   ProfileTheme,
   SharedItem,
+  THEME_LABELS,
 } from '../shared/schema';
 
 /**
@@ -31,12 +32,97 @@ interface SiteDesignPanelProps {
   onSave: (updates: DesignUpdate) => Promise<void>;
 }
 
-const THEMES: Array<{ id: ProfileTheme; label: string; background: string }> = [
-  { id: 'neo-webring', label: 'Neo-Webring (dark slate)', background: '#0f172a' },
-  { id: 'minimal-zine', label: 'Minimal Zine (paper & serif)', background: '#fafaf9' },
-  { id: 'cyber-terminal', label: 'Cyber Terminal (black & green)', background: '#050505' },
-  { id: 'cozy-scrapbook', label: 'Cozy Scrapbook (warm amber)', background: '#fef3c7' },
+type ThumbShape = 'stack' | 'sidebar' | 'deck' | 'rails' | 'grid' | 'reel';
+
+interface ThemeOption {
+  id: ProfileTheme;
+  group: 'classic' | 'social';
+  hint: string;
+  shape: ThumbShape;
+  /** Page background (also used for the accent contrast check), card surface, accent and text. */
+  background: string;
+  surface: string;
+  accent: string;
+  ink: string;
+  /** "Use suggested block order": block types in this order, anything else keeps its place after. */
+  suggestedOrder?: LayoutBlockType[];
+}
+
+const THEMES: ThemeOption[] = [
+  { id: 'neo-webring', group: 'classic', hint: 'Dark slate cards', shape: 'stack', background: '#0f172a', surface: '#1e293b', accent: '#6366f1', ink: '#f8fafc' },
+  { id: 'minimal-zine', group: 'classic', hint: 'Paper & serif', shape: 'stack', background: '#fafaf9', surface: '#ffffff', accent: '#1c1917', ink: '#1c1917' },
+  { id: 'cyber-terminal', group: 'classic', hint: 'Black & green', shape: 'stack', background: '#050505', surface: '#0a0f0d', accent: '#22c55e', ink: '#4ade80' },
+  { id: 'cozy-scrapbook', group: 'classic', hint: 'Warm amber', shape: 'stack', background: '#fef3c7', surface: '#fffbeb', accent: '#d97706', ink: '#451a03' },
+  {
+    id: 'facepace', group: 'social', hint: 'Cover photo, intro sidebar, post cards', shape: 'sidebar',
+    background: '#eef1f6', surface: '#ffffff', accent: '#3460d4', ink: '#1c2433',
+    suggestedOrder: ['text', 'items', 'albums', 'featured', 'image', 'friends', 'contact', 'links', 'guestbook'],
+  },
+  {
+    id: 'tweetdeck', group: 'social', hint: 'Sky blue, a column per block', shape: 'deck',
+    background: '#c6e2f4', surface: '#ffffff', accent: '#2b8fd6', ink: '#22303c',
+    suggestedOrder: ['items', 'albums', 'friends', 'featured', 'text', 'image', 'links', 'contact', 'guestbook'],
+  },
+  {
+    id: 'xtraspecial', group: 'social', hint: 'Black timeline between rails', shape: 'rails',
+    background: '#000000', surface: '#16181c', accent: '#3d9df2', ink: '#e9ecef',
+    suggestedOrder: ['featured', 'items', 'albums', 'text', 'image', 'friends', 'links', 'contact', 'guestbook'],
+  },
+  {
+    id: 'instapick', group: 'social', hint: 'Stats, highlights, square grid', shape: 'grid',
+    background: '#ffffff', surface: '#efefef', accent: '#d6337a', ink: '#1f1f1f',
+    suggestedOrder: ['albums', 'items', 'featured', 'text', 'image', 'links', 'contact', 'friends', 'guestbook'],
+  },
+  {
+    id: 'tiktalk', group: 'social', hint: 'Dark vertical reel', shape: 'reel',
+    background: '#0b0b0f', surface: '#1c1c22', accent: '#ff3b6b', ink: '#f2f2f2',
+    suggestedOrder: ['items', 'albums', 'featured', 'text', 'image', 'links', 'contact', 'friends', 'guestbook'],
+  },
 ];
+
+/** A tiny wireframe of a theme's page arrangement, in its colours. */
+function ThemeThumb({ option }: { option: ThemeOption }) {
+  const box = (style: React.CSSProperties, key?: string) => (
+    <div key={key} style={{ position: 'absolute', borderRadius: 2, background: option.surface, ...style }} />
+  );
+  const accent = (style: React.CSSProperties) => box({ background: option.accent, ...style });
+  const parts: React.ReactNode[] = [];
+  switch (option.shape) {
+    case 'sidebar':
+      parts.push(accent({ left: 0, right: 0, top: 0, height: 5, borderRadius: 0 }), box({ left: 6, right: 6, top: 8, height: 14 }));
+      parts.push(<div key="av" style={{ position: 'absolute', left: 10, top: 16, width: 10, height: 10, borderRadius: 99, background: option.accent, border: `2px solid ${option.surface}` }} />);
+      parts.push(box({ left: 6, width: 24, top: 25, bottom: 4 }), box({ left: 33, right: 6, top: 25, height: 16 }), box({ left: 33, right: 6, top: 44, bottom: 4 }));
+      break;
+    case 'deck':
+      [0, 1, 2, 3].forEach((i) => parts.push(box({ left: 4 + i * 23, width: 20, top: 4, bottom: 4 }, `c${i}`)));
+      parts.push(accent({ left: 4, width: 20, top: 4, height: 8 }));
+      break;
+    case 'rails':
+      parts.push(accent({ left: 5, width: 6, top: 6, height: 6, borderRadius: 99 }), box({ left: 5, width: 14, top: 16, height: 3 }), box({ left: 5, width: 14, top: 22, height: 3 }));
+      parts.push(<div key="ln" style={{ position: 'absolute', left: 24, right: 30, top: 0, bottom: 0, borderLeft: `1px solid ${option.surface}`, borderRight: `1px solid ${option.surface}` }} />);
+      [0, 1, 2, 3].forEach((i) => parts.push(box({ left: 28, right: 34, top: 6 + i * 13, height: 9 }, `r${i}`)));
+      parts.push(box({ right: 4, width: 22, top: 6, height: 20 }), box({ right: 4, width: 22, top: 30, height: 16 }));
+      break;
+    case 'grid':
+      parts.push(<div key="av" style={{ position: 'absolute', left: 22, top: 5, width: 14, height: 14, borderRadius: 99, border: `2px solid ${option.accent}` }} />);
+      parts.push(box({ left: 42, width: 36, top: 7, height: 3 }), box({ left: 42, width: 26, top: 13, height: 3 }));
+      [0, 1, 2, 3, 4, 5].forEach((i) => parts.push(box({ left: 22 + (i % 3) * 19, width: 17, top: 24 + Math.floor(i / 3) * 19, height: 17, borderRadius: 0 }, `g${i}`)));
+      break;
+    case 'reel':
+      parts.push(<div key="av" style={{ position: 'absolute', left: 44, top: 4, width: 10, height: 10, borderRadius: 99, background: option.accent }} />);
+      parts.push(<div key="reel" style={{ position: 'absolute', left: 34, width: 30, top: 18, bottom: 3, borderRadius: 3, background: `linear-gradient(160deg, ${option.accent}, #2ee6e6)` }} />);
+      [0, 1, 2].forEach((i) => parts.push(<div key={`d${i}`} style={{ position: 'absolute', left: 58, top: 36 + i * 7, width: 4, height: 4, borderRadius: 99, background: '#fff' }} />));
+      break;
+    default:
+      parts.push(accent({ left: 6, right: 6, top: 5, height: 12 }), box({ left: 6, right: 6, top: 20, height: 10 }));
+      parts.push(box({ left: 6, width: 42, top: 33, bottom: 4 }), box({ left: 50, right: 6, top: 33, bottom: 4 }));
+  }
+  return (
+    <div className="relative w-full h-16 rounded-md overflow-hidden" style={{ background: option.background }} aria-hidden="true">
+      {parts}
+    </div>
+  );
+}
 
 const ACCENTS = ['#6366f1', '#22d3ee', '#a855f7', '#ec4899', '#f97316', '#eab308', '#22c55e', '#ef4444'];
 
@@ -158,7 +244,25 @@ export function SiteDesignPanel(props: SiteDesignPanelProps) {
     updateLayout(next, 200);
   };
 
-  const themeBackground = THEMES.find((t) => t.id === theme)?.background || '#0f172a';
+  const themeOption = THEMES.find((t) => t.id === theme) || THEMES[0];
+  const themeBackground = themeOption.background;
+
+  const chooseTheme = (id: ProfileTheme) => {
+    setTheme(id);
+    queueSave({ theme: id }, 100);
+  };
+
+  // Reorders blocks by the template's suggestion; nothing is added, removed or hidden
+  const applySuggestedOrder = () => {
+    const order = themeOption.suggestedOrder;
+    if (!order) return;
+    const rank = (b: LayoutBlock) => {
+      const i = order.indexOf(b.type);
+      return i === -1 ? order.length : i;
+    };
+    const next = layout.map((b, i) => ({ b, i })).sort((x, y) => rank(x.b) - rank(y.b) || x.i - y.i).map((x) => x.b);
+    updateLayout(next, 200);
+  };
   const accentContrast = appearance.accent ? contrastRatio(appearance.accent, themeBackground) : null;
 
   const featuredOptions = [
@@ -350,21 +454,42 @@ export function SiteDesignPanel(props: SiteDesignPanelProps) {
           <h3 className="font-bold text-sm">Look &amp; feel</h3>
           {saving && <span className="text-[10px] text-slate-500">Saving…</span>}
         </div>
-        <label className="block text-xs text-slate-400">
-          Theme
-          <select
-            className={`${selectClass} w-full mt-1 text-slate-100`}
-            value={theme}
-            onChange={(e) => {
-              setTheme(e.target.value as ProfileTheme);
-              queueSave({ theme: e.target.value as ProfileTheme }, 100);
-            }}
+        {(
+          [
+            ['classic', 'Classic themes', 'Colours and fonts over the standard page.'],
+            ['social', 'Social-style templates', 'These also rearrange the page. Your blocks keep their order within it.'],
+          ] as const
+        ).map(([group, heading, note]) => (
+          <div key={group}>
+            <p className="text-xs text-slate-400">{heading}</p>
+            <p className="text-[11px] text-slate-500 mb-1.5">{note}</p>
+            <div className="grid grid-cols-2 sm:grid-cols-3 gap-2" role="radiogroup" aria-label={heading}>
+              {THEMES.filter((t) => t.group === group).map((t) => (
+                <button
+                  key={t.id}
+                  type="button"
+                  role="radio"
+                  aria-checked={theme === t.id}
+                  onClick={() => chooseTheme(t.id)}
+                  className={`text-left p-1.5 rounded-lg border ${theme === t.id ? 'border-indigo-400 bg-indigo-500/10' : 'border-slate-800 hover:border-slate-600'}`}
+                >
+                  <ThemeThumb option={t} />
+                  <span className="block text-xs font-semibold text-slate-100 mt-1">{THEME_LABELS[t.id]}</span>
+                  <span className="block text-[10px] text-slate-400 leading-tight">{t.hint}</span>
+                </button>
+              ))}
+            </div>
+          </div>
+        ))}
+        {themeOption.suggestedOrder && (
+          <button
+            type="button"
+            onClick={applySuggestedOrder}
+            className="text-[11px] px-2.5 py-1 rounded-lg border border-slate-700 hover:border-slate-500 text-slate-300"
           >
-            {THEMES.map((t) => (
-              <option key={t.id} value={t.id}>{t.label}</option>
-            ))}
-          </select>
-        </label>
+            Use {THEME_LABELS[theme]}'s suggested block order
+          </button>
+        )}
         <div>
           <p className="text-xs text-slate-400 mb-1.5">Accent colour</p>
           <div className="flex flex-wrap items-center gap-1.5">
@@ -396,7 +521,7 @@ export function SiteDesignPanel(props: SiteDesignPanelProps) {
           {accentContrast !== null && accentContrast < 3 && (
             <p className="text-[11px] text-amber-300 mt-1.5">
               This colour is hard to see on this theme's background (contrast {accentContrast.toFixed(1)}:1). Try a
-              {themeBackground === '#fafaf9' || themeBackground === '#fef3c7' ? ' darker' : ' lighter'} shade.
+              {contrastRatio(themeBackground, '#000000') > contrastRatio(themeBackground, '#ffffff') ? ' darker' : ' lighter'} shade.
             </p>
           )}
         </div>
