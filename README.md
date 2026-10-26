@@ -91,6 +91,15 @@ A persona is a separate online identity: its own SQLite database, Ed25519 key, `
 
 If the keychain entry is lost, your signing key can't be recovered: you'd need a new key, and friends would see a key-changed warning.
 
+### Site Design
+
+The **Site Design** tab sets how your published page looks, with a live preview beside the controls:
+
+- **Look & feel:** theme, accent colour (with a warning if it's hard to read on your theme), font, corner style, card or flat sections, background (theme, accent glow or blurred banner), banner height and profile photo shape.
+- **Page layout:** your banner, photo, name, bio and links always stay at the top. Below them, arrange **blocks** by dragging (or with the arrow buttons): photo albums (grid or carousel, all or chosen albums), posts and shares (filter by kind, limit the count), friends, **text** (Markdown, including tables), an image, link buttons, a featured post or album, contact links and a guestbook. Hide a block without deleting it, rename its heading, or reset to the default layout.
+
+Your design is saved in your signed `profile.json`, so it travels with your site. The published page and the preview come from the same code, so what you see is what gets published. Text blocks are rendered safely: HTML and unsafe links are never passed through.
+
 ### Media Library
 
 The **Media Library** tab holds your photo albums. Add JPEG or PNG photos with **Add Photos** or by dropping them on an album, then caption them, add alt text, reorder them, pick a cover, or replace and delete photos.
@@ -182,7 +191,8 @@ Then configure your MCP client to run:
 | `electron/security/` | Keychain encryption, private-network guard |
 | `src/shared/schema.ts` | Data schemas (zod), signing and verification, `did:web` |
 | `src/studio/App.tsx` | The Studio UI |
-| `src/profile-site/` | Profile site preview |
+| `src/studio/SiteDesignPanel.tsx` | Site Design: look & feel options and page layout blocks |
+| `src/shared/markdown.ts` | Safe Markdown renderer for text blocks (also embedded in published pages) |
 | `docs/architecture/federation.md` | How federation, signing and webrings fit together |
 
 `AGENTS.md` and `SPEC.md` describe the project's goals and conventions for contributors, human or AI.

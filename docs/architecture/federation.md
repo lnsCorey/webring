@@ -25,6 +25,10 @@ friend's /api/*.json ──crawl+verify──▶ SQLite (internal state) ──c
 - **Exchange format** is the set of signed documents that `buildSignedSiteBundle()` produces (`did.json`, `manifest`, `profile`, `albums`, `items`, `connections`). Everything that gets published goes through this one function. The network feed itself is never published; only endorsements of the user's own content and (optionally) the public friends list are.
 - **The published site is a snapshot.** Each successful publish records `lastPublishedAt` and what it contained, and the Publish tab shows it with a count of changes made since. Anything that arrives after a publish shows up publicly only after the next one.
 
+## Site Design data
+
+`profile.json` can carry `appearance` (look & feel options) and `layout` (the ordered content blocks below the profile header). Both are parsed leniently: invalid appearance fields and unknown or malformed blocks are dropped rather than failing the whole profile, so newer block types never break older readers. A missing `layout` means the default page; an empty array means no blocks. Text blocks hold Markdown source, rendered on the page by the self-contained renderer in `src/shared/markdown.ts`, which escapes everything and allows only safe links.
+
 ## Media Library and album manifests
 
 - **Published files.** Each album's photos are content-addressed web copies and thumbnails under `media/albums/<albumId>/` (metadata stripped), described by a signed `media/albums/<albumId>/manifest.json` (type `webring-album-manifest`: album details, and per photo the image and thumbnail URL, SHA-256, size, MIME type and dimensions). `api/albums.json` links each album's `manifestUrl`, and photo entries carry the same hashes.

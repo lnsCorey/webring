@@ -1,4 +1,4 @@
-import React, { useEffect, useState } from 'react';
+import React, { useEffect, useRef, useState } from 'react';
 import {
   CompleteSiteBundle,
   CreatePersonaInput,
@@ -16,7 +16,7 @@ import {
   WebringDeepLinkAction,
   WebringMembership,
 } from '../shared/schema';
-import { ProfileSiteApp } from '../profile-site/ProfileSiteApp';
+import { SiteDesignPanel } from './SiteDesignPanel';
 import {
   BookOpen,
   Camera,
@@ -570,6 +570,8 @@ export const App: React.FC = () => {
   const [bannerUrl, setBannerUrl] = useState('');
   const [interestsInput, setInterestsInput] = useState('');
   const [theme, setTheme] = useState<ProfileTheme>('neo-webring');
+  const [previewHtml, setPreviewHtml] = useState('');
+  const previewFrameRef = useRef<HTMLIFrameElement | null>(null);
   const [atprotoHandle, setAtprotoHandle] = useState('');
   const [customLinks, setCustomLinks] = useState<Array<{ label: string; url: string }>>([]);
 
@@ -765,6 +767,7 @@ export const App: React.FC = () => {
     setBannerUrl(p.bannerUrl);
     setInterestsInput((p.interests || []).join(', '));
     setTheme(p.theme);
+    setPreviewHtml(data.previewHtml || '');
     setAtprotoHandle(p.atprotoHandle || '');
     setCustomLinks((p.customLinks || []).map((l) => ({ label: l.label, url: l.url })));
     if (p.publishSettings) {
@@ -861,6 +864,23 @@ export const App: React.FC = () => {
     await refreshStudioData();
     notify(`Deleted persona "${label}".`);
   };
+
+  // The site preview runs sandboxed; its links arrive here instead of navigating the preview
+  useEffect(() => {
+    const onMessage = (event: MessageEvent) => {
+      if (!previewFrameRef.current || event.source !== previewFrameRef.current.contentWindow) return;
+      const data = event.data as { type?: string; href?: string } | null;
+      if (!data || typeof data.href !== 'string') return;
+      if (data.type === 'webring-preview-deeplink') {
+        const parsed = parseWebringUri(data.href);
+        if (parsed) handleIncomingDeepLink(parsed);
+      } else if (data.type === 'webring-preview-open' && /^https?:/i.test(data.href)) {
+        window.studioApi?.openExternal(data.href);
+      }
+    };
+    window.addEventListener('message', onMessage);
+    return () => window.removeEventListener('message', onMessage);
+  });
 
   useEffect(() => {
     refreshStudioData();
@@ -1762,7 +1782,7 @@ export const App: React.FC = () => {
       icon: <Radio className="w-4 h-4" />,
       badge: networkFeed.length,
     },
-    { id: 'preview', label: 'Live Site Preview', icon: <Compass className="w-4 h-4" /> },
+    { id: 'preview', label: 'Site Design', icon: <Compass className="w-4 h-4" /> },
     { id: 'schemas', label: 'JSON Schema Output', icon: <Code2 className="w-4 h-4" /> },
     { id: 'publish', label: 'Publish & SFTP', icon: <UploadCloud className="w-4 h-4" /> },
     {
@@ -2058,20 +2078,12 @@ export const App: React.FC = () => {
                     />
                   </div>
 
-                  <div>
-                    <label className="block text-xs font-semibold uppercase tracking-wider text-slate-400 mb-1.5">
-                      Profile Website Theme
-                    </label>
-                    <select
-                      value={theme}
-                      onChange={(e) => setTheme(e.target.value as ProfileTheme)}
-                      className="w-full px-3.5 py-2 rounded-xl bg-slate-950 border border-slate-800 text-sm focus:border-indigo-500 focus:outline-none"
-                    >
-                      <option value="neo-webring">Neo-Webring (Dark Slate & Indigo)</option>
-                      <option value="minimal-zine">Minimalist Zine (Editorial Paper & Serif)</option>
-                      <option value="cyber-terminal">Cyber Terminal (Black & Phosphor Green)</option>
-                      <option value="cozy-scrapbook">Cozy Scrapbook (Warm Amber & Polaroid)</option>
-                    </select>
+                  <div className="text-xs text-slate-400 self-end pb-2">
+                    Theme, colours and page layout are in{' '}
+                    <button type="button" onClick={() => setActiveTab('preview')} className="text-indigo-300 hover:underline">
+                      Site Design
+                    </button>
+                    .
                   </div>
                 </div>
 
@@ -4125,7 +4137,23 @@ export const App: React.FC = () => {
 
           {/* TAB 6: LIVE SITE PREVIEW */}
           {activeTab === 'preview' && (
-            <div className="space-y-4">
+            <div className="grid grid-cols-1 xl:grid-cols-[22rem_1fr] gap-5 items-start">
+              <SiteDesignPanel
+                theme={bundle.profile.theme}
+                appearance={bundle.profile.appearance}
+                layout={bundle.profile.layout}
+                albums={bundle.albums.albums}
+                items={bundle.items.items}
+                publishFriendsList={Boolean(publishSettings.publishFriendsList)}
+                guestbookConfigured={Boolean(bundle.profile.commentConfig && bundle.profile.commentConfig.provider !== 'none')}
+                mediaSrc={mediaSrc}
+                onSave={async (updates) => {
+                  if (!window.studioApi) return;
+                  await window.studioApi.updateProfile(updates);
+                  await refreshStudioData();
+                }}
+              />
+            <div className="space-y-4 min-w-0">
               {/* Top Preview Mode & Local Test Export Bar */}
               <div className="bg-slate-900 border border-slate-800 rounded-2xl p-4 space-y-3">
                 <div className="flex flex-wrap items-center justify-between gap-3">
@@ -4292,15 +4320,16 @@ export const App: React.FC = () => {
                     className="w-full h-[75vh] border-0 bg-slate-950"
                   />
                 ) : (
-                  <ProfileSiteApp
-                    bundleOverride={bundle}
-                    onSimulateDeepLink={(uri) => {
-                      const parsed = parseWebringUri(uri);
-                      if (parsed) handleIncomingDeepLink(parsed);
-                    }}
+                  <iframe
+                    ref={previewFrameRef}
+                    srcDoc={previewHtml}
+                    sandbox="allow-scripts"
+                    title="Site preview"
+                    className="w-full h-[75vh] border-0 bg-slate-950"
                   />
                 )}
               </div>
+            </div>
             </div>
           )}
 
@@ -6135,7 +6164,7 @@ export const App: React.FC = () => {
                         </div>
                         <h4 className="font-bold text-sm">Test Export on Localhost Before Live</h4>
                         <p className="text-xs text-slate-400 leading-relaxed">
-                          In <strong>Live Site Preview</strong> or <strong>Publish & SFTP</strong>,
+                          In <strong>Site Design</strong> or <strong>Publish & SFTP</strong>,
                           click <strong>Run Local Test Export & Preview</strong>. Webring Studio writes
                           your complete static bundle to a local sandbox folder, runs pre-flight
                           verification checks, and serves it over a real local HTTP server (
@@ -6145,7 +6174,7 @@ export const App: React.FC = () => {
                           onClick={() => setActiveTab('preview')}
                           className="text-xs text-cyan-400 hover:underline font-medium pt-1 inline-block"
                         >
-                          Open Live Site Preview →
+                          Open Site Design →
                         </button>
                       </div>
 
@@ -6309,7 +6338,7 @@ export const App: React.FC = () => {
                       </h4>
                       <p className="text-xs text-slate-300 leading-relaxed">
                         You can first test your build using <strong>Run Local Test Export & Preview</strong>{' '}
-                        in the <strong>Live Site Preview</strong> tab. When ready, go to the{' '}
+                        in the <strong>Site Design</strong> tab. When ready, go to the{' '}
                         <strong>Publish & SFTP</strong> tab (or click <em>Quick Export Static Site</em>{' '}
                         in the bottom-left sidebar) and export your site to a local folder on your
                         computer—for example, <code>C:\Users\you\my-webring-site</code>.
@@ -6651,7 +6680,7 @@ git push -u origin main --force`}
                         </li>
                         <li>
                           Click <strong>Save AdSense Add-On Settings</strong> and preview the slot
-                          placements directly in the <strong>Live Site Preview</strong> tab!
+                          placements directly in the <strong>Site Design</strong> tab!
                         </li>
                       </ol>
                     </div>
