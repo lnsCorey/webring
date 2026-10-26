@@ -103,7 +103,8 @@ The **Site Design** tab sets how your published page looks, with a live preview 
   - **Tik Talk:** a dark vertical reel of tall media cards.
 
   Your blocks keep their order in every template. Friends, contact, links and the guestbook go in the sidebar or rail where a template has one. Each template offers a suggested block order you can apply with one click.
-- **Look & feel:** accent colour (with a warning if it's hard to read on your theme), font, corner style, card or flat sections, background (theme, accent glow or blurred banner), banner height and profile photo shape.
+- **Look & feel:** accent colour (with a warning if it's hard to read on your theme), font, corner style, card or flat sections, background (theme, accent glow or blurred banner), banner height, profile photo shape and interactive extras.
+- **Interactive extras** (on by default, in every theme and template): clicking a photo opens it full size, with previous/next (arrow keys or swipe) and its caption. **⤢ Open** shows a post in a larger view, and the address (`#post-…`, `#photo-…`) links straight to it. Tables in text blocks sort when you click a column heading. It's a few KB of built-in script with no library and nothing loaded from elsewhere. Turn it off in Site Design for a page with no extras.
 - **Page layout:** your banner, photo, name, bio and links always stay at the top. Below them, arrange **blocks** by dragging (or with the arrow buttons): photo albums (grid or carousel, all or chosen albums), posts and shares (filter by kind, limit the count), friends, **text** (Markdown, including tables), an image, link buttons, a featured post or album, contact links and a guestbook. Hide a block without deleting it, rename its heading, or reset to the default layout.
 
 Your design is saved in your signed `profile.json`, so it travels with your site. The published page and the preview come from the same code, so what you see is what gets published. Text blocks are rendered safely: HTML and unsafe links are never passed through.
@@ -111,6 +112,8 @@ Your design is saved in your signed `profile.json`, so it travels with your site
 ### Media Library
 
 The **Media Library** tab holds your photo albums. Add JPEG or PNG photos with **Add Photos** or by dropping them on an album, then caption them, add alt text, reorder them, pick a cover, or replace and delete photos.
+
+Album descriptions are written in **Markdown** (headings, links, lists, quotes and tables), with a Write / Preview switch. They're rendered safely on your page: HTML and unsafe links are never passed through. Site Design text blocks use the same editor.
 
 - **What gets published:** a web copy of each photo (longest side up to 2048 px) and a 480 px thumbnail, rotated upright, with all camera metadata, including GPS location, removed. Your originals stay on your computer.
 - **Signed album manifests:** each album is published with `media/albums/<album>/manifest.json`, signed with your key, listing every photo and the exact file behind it (URL, SHA-256 hash, size, dimensions). File names are based on the content, so a replaced photo gets a new URL and nobody sees a stale copy.

@@ -176,6 +176,8 @@ export const AppearanceSchema = z
     bannerHeight: z.enum(['short', 'medium', 'tall']).optional().catch(undefined),
     avatarShape: z.enum(['rounded', 'circle']).optional().catch(undefined),
     background: z.enum(['theme', 'gradient', 'banner-blur']).optional().catch(undefined),
+    /** Lightbox, post view and sortable tables on the published page; missing means on. */
+    interactions: z.enum(['on', 'off']).optional().catch(undefined),
   })
   .catch({});
 export type Appearance = z.infer<typeof AppearanceSchema>;

@@ -12,6 +12,7 @@ import {
   SharedItem,
   THEME_LABELS,
 } from '../shared/schema';
+import { MarkdownField } from './MarkdownField';
 
 /**
  * Site Design: the look & feel options and the ordered content blocks of the published page.
@@ -354,12 +355,10 @@ export function SiteDesignPanel(props: SiteDesignPanelProps) {
       case 'text':
         return (
           <div className="space-y-1">
-            <textarea
-              rows={6}
-              className={inputClass}
+            <MarkdownField
               value={block.options.markdown}
               placeholder={'Write in Markdown: **bold**, *italic*, [links](https://...), lists, and tables:\n| Year | Event |\n|---|---|\n| 2026 | Joined the ring |'}
-              onChange={(e) => updateBlock(block.id, () => ({ ...block, options: { markdown: e.target.value.slice(0, 10000) } }), 900)}
+              onChange={(markdown) => updateBlock(block.id, () => ({ ...block, options: { markdown } }), 900)}
             />
             <p className="text-[10px] text-slate-500">Markdown, with headings, lists, links, quotes, code and tables. HTML isn't allowed.</p>
           </div>
@@ -534,6 +533,7 @@ export function SiteDesignPanel(props: SiteDesignPanelProps) {
               ['background', 'Background', [['theme', 'As theme'], ['gradient', 'Accent glow'], ['banner-blur', 'Blurred banner']]],
               ['bannerHeight', 'Banner height', [['medium', 'Medium'], ['short', 'Short'], ['tall', 'Tall']]],
               ['avatarShape', 'Profile photo', [['rounded', 'Rounded square'], ['circle', 'Circle']]],
+              ['interactions', 'Interactive extras', [['on', 'On (lightbox, post view)'], ['off', 'Off']]],
             ] as const
           ).map(([key, label, choices]) => (
             <label key={key} className="block">

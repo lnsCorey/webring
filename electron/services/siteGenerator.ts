@@ -5,6 +5,7 @@ import { StudioDatabase } from '../db/database';
 import { MediaLibrary } from './mediaLibrary';
 import { renderMarkdown } from '../../src/shared/markdown';
 import { renderTemplatePage, TEMPLATE_CONFIG, TEMPLATE_CSS, templateBodyClasses } from './siteTemplates';
+import { ENHANCEMENTS_CSS, installPageEnhancements } from './pageEnhancements';
 import {
   Appearance,
   CompleteSiteBundle,
@@ -224,8 +225,12 @@ export class StaticSiteGenerator {
     const preview = options.preview === true;
     const markdownSource = renderMarkdown.toString();
     const templateSource = renderTemplatePage.toString();
-    if (/<\/script/i.test(markdownSource + templateSource)) throw new Error('Page renderer source cannot be embedded safely.');
     const appearance = bundle.profile.appearance || {};
+    // Interactive extras are on unless turned off in Site Design; when off they aren't embedded
+    const enhancementsSource = appearance.interactions === 'off' ? 'null' : installPageEnhancements.toString();
+    if (/<\/script/i.test(markdownSource + templateSource + enhancementsSource)) {
+      throw new Error('Page renderer source cannot be embedded safely.');
+    }
     const safeJson = JSON.stringify(bundle)
       .replace(/</g, '\\u003c')
       .replace(/>/g, '\\u003e')
@@ -335,7 +340,9 @@ export class StaticSiteGenerator {
     .prose-block th, .prose-block td { border: 1px solid rgba(148, 163, 184, 0.35); padding: 0.4rem 0.65rem; text-align: left; }
     .prose-block th { font-weight: 700; background: rgba(148, 163, 184, 0.12); }
     .prose-block hr { border: 0; border-top: 1px solid rgba(148, 163, 184, 0.3); margin: 1rem 0; }
-${TEMPLATE_CSS}
+    .album-description { max-width: 48rem; }
+    .album-description p:first-child, .album-description h2:first-child, .album-description h3:first-child { margin-top: 0.25rem; }
+${TEMPLATE_CSS}${appearance.interactions === 'off' ? '' : ENHANCEMENTS_CSS}
   </style>
 </head>
 <body class="${templateBodyClasses(bundle.profile.theme)} min-h-screen antialiased pb-20"${this.appearanceAttributes(appearance)}>
@@ -599,11 +606,11 @@ ${TEMPLATE_CSS}
         return \`
           <div class="card-surface rounded-xl overflow-hidden flex flex-col justify-between \${extraClass || ''}">
             <div>
-              <a href="\${safeUrl(photo.url)}" target="_blank" rel="noopener noreferrer" class="block aspect-[4/3] overflow-hidden bg-black/20">
+              <a href="\${safeUrl(photo.url)}" target="_blank" rel="noopener noreferrer" data-lightbox data-photo-id="\${esc(photo.id)}" class="block aspect-[4/3] overflow-hidden bg-black/20">
                 <img src="\${safeUrl(photo.thumbUrl || photo.url)}" alt="\${esc(photo.altText || photo.caption)}" class="w-full h-full object-cover hover:scale-105 transition-transform duration-300" />
               </a>
               <div class="p-3.5">
-                <p class="text-sm font-medium mb-1">\${esc(photo.caption || 'Untitled Photo')}</p>
+                \${photo.caption ? \`<p class="text-sm font-medium mb-1">\${esc(photo.caption)}</p>\` : ''}
                 <div class="flex flex-wrap gap-1 mb-2">
                   \${(photo.tags || []).map(t => \`<span class="text-[11px] opacity-70">#\${esc(t)}</span>\`).join(' ')}
                 </div>
@@ -632,12 +639,12 @@ ${TEMPLATE_CSS}
           .join('');
         return \`
           <div class="mb-8">
-            <div class="flex items-baseline justify-between mb-3">
-              <div>
+            <div class="flex items-start justify-between gap-4 mb-3">
+              <div class="min-w-0 flex-1">
                 <h3 class="text-xl font-bold">\${esc(album.title)}</h3>
-                <p class="text-sm opacity-75">\${esc(album.description || '')}</p>
+                \${album.description ? \`<div class="prose-block album-description text-sm opacity-90">\${renderMarkdown(album.description)}</div>\` : ''}
               </div>
-              <a href="\${buildDeepLink('share', album.canonicalUrl, album.title, album.coverUrl, 'photo')}" class="accent-soft text-xs px-3 py-1 rounded-lg bg-indigo-500/20 text-indigo-300 hover:bg-indigo-500/30">Share Album</a>
+              <a href="\${buildDeepLink('share', album.canonicalUrl, album.title, album.coverUrl, 'photo')}" class="accent-soft shrink-0 text-xs px-3 py-1 rounded-lg bg-indigo-500/20 text-indigo-300 hover:bg-indigo-500/30">Share Album</a>
             </div>
             <div class="\${carousel ? 'flex gap-4 overflow-x-auto snap-x pb-2' : 'grid grid-cols-1 sm:grid-cols-2 md:grid-cols-3 gap-4'}">
               \${photosHtml}
@@ -699,7 +706,10 @@ ${TEMPLATE_CSS}
               <div id="\${liveContainerId}" class="hidden mt-3 mb-3 p-3 rounded-xl bg-black/30 border border-indigo-500/30"></div>
             </div>
             <div class="pt-2 border-t border-white/10 flex flex-wrap items-center justify-between gap-2 text-xs">
-              <a href="\${safeUrl(item.canonicalUrl)}" class="opacity-60 hover:opacity-100">Schema URI</a>
+              <span class="flex items-center gap-3">
+                <a href="\${safeUrl(item.canonicalUrl)}" class="opacity-60 hover:opacity-100">Schema URI</a>
+                <button type="button" data-open-post="\${esc(item.id)}" class="opacity-70 hover:opacity-100 font-medium" aria-label="Open post">⤢ Open</button>
+              </span>
               <div class="flex flex-wrap gap-2">
                 <a href="\${buildDeepLink('like', item.canonicalUrl, item.title, item.mediaUrl, item.category)}" class="px-2.5 py-1 rounded bg-pink-500/20 text-pink-300 hover:bg-pink-500/30 font-medium">♥ Like</a>
                 <a href="\${buildDeepLink('comment', item.canonicalUrl, item.title, item.mediaUrl, 'comment')}" class="px-2.5 py-1 rounded bg-emerald-500/20 text-emerald-300 hover:bg-emerald-500/30 font-medium">💬 Comment</a>
@@ -843,7 +853,7 @@ ${TEMPLATE_CSS}
         root.innerHTML = renderTemplatePage({
           shell: template.shell, profile, albums: allAlbums, items: allItems, friends: allFriends,
           endorsementCount: (connections.endorsements || []).length, layout: visibleBlocks,
-          blockRenderers, section, emptyNote, esc, safeUrl, buildDeepLink, getEndorsementsFor, getCommentsFor,
+          blockRenderers, section, emptyNote, esc, safeUrl, buildDeepLink, getEndorsementsFor, getCommentsFor, renderMarkdown,
           hasLiveProvider: Boolean(commentCfg.provider && commentCfg.provider !== 'none'),
           webringBars, headerAdHtml, inFeedAdHtml, footerAdHtml, footerHtml
         });
@@ -891,6 +901,16 @@ ${TEMPLATE_CSS}
         \${footerAdHtml}
         \${footerHtml}
       \`;
+
+      // Interactive extras: lightbox, post view, sortable tables (pageEnhancements.ts)
+      const installPageEnhancements = ${enhancementsSource};
+      if (installPageEnhancements && !(profile.appearance && profile.appearance.interactions === 'off')) {
+        try {
+          installPageEnhancements({ root, profile, albums: allAlbums, items: allItems, esc, safeUrl, buildDeepLink, renderItem });
+        } catch (err) {
+          console.warn('Interactive extras unavailable:', err);
+        }
+      }
 
       // Initialize any rendered AdSense slots
       if (profile.adsAddon && profile.adsAddon.enabled && typeof window !== 'undefined') {
@@ -957,6 +977,7 @@ const PREVIEW_BRIDGE = `
       if (!anchor) return;
       var href = anchor.getAttribute('href') || '';
       if (href.charAt(0) === '#') return;
+      if (anchor.closest('[data-lightbox], [data-open-post]')) return; // opens in the page's own viewer
       ev.preventDefault();
       ev.stopPropagation();
       if (/^webring:/i.test(href)) parent.postMessage({ type: 'webring-preview-deeplink', href: href }, '*');
