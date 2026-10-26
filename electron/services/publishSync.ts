@@ -8,12 +8,12 @@ import { StudioDatabase } from '../db/database';
  * has a ledger of the files Studio last put there and their hashes. A publish uploads only new or
  * changed files and deletes only files Studio itself created that are no longer part of the
  * site, never anything else the user keeps at the destination (README, CNAME, other pages).
- * Files under media/albums/ are always Studio's (the Media Library writes them), so stale photos
+ * Files under media/albums/ and media/profile/ are always Studio's (the Media Library writes them), so stale photos
  * from before the ledger existed are cleaned up too.
  */
 
 /** Paths that only the Media Library ever writes; safe to delete when no longer published. */
-export const STUDIO_OWNED_PREFIXES = ['media/albums/'];
+export const STUDIO_OWNED_PREFIXES = ['media/albums/', 'media/profile/'];
 
 export interface SyncPlan {
   /** path -> sha256 for every file in the generated site */

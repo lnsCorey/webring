@@ -38,6 +38,7 @@ import {
   deletePhotoWithFiles,
   importPhotosIntoAlbum,
   replacePhotoImage,
+  setProfileImageFromFile,
 } from './services/mediaLibrary';
 
 // Lets the Studio window show Media Library images: studio-media://local/<path> maps to the
@@ -425,7 +426,31 @@ function registerIpcHandlers() {
   });
 
   ipcMain.handle('studio:update-profile', (_e, updates) => {
-    return personaManager.getActiveContext().db.updateProfile(updates);
+    const ctx = personaManager.getActiveContext();
+    const profile = ctx.db.updateProfile(updates);
+    // A replaced profile photo or banner that was uploaded to the library is deleted here
+    if (updates && typeof updates === 'object' && ('avatarUrl' in updates || 'bannerUrl' in updates)) {
+      cleanUpLibrary(ctx.db, ctx.mediaLibrary);
+    }
+    return profile;
+  });
+
+  // Upload a local image as the profile photo or banner (picked here, or dropped in Studio)
+  ipcMain.handle('studio:profile-set-image', async (_e, kind: 'avatar' | 'banner', filePath?: string) => {
+    if (kind !== 'avatar' && kind !== 'banner') throw new Error('Unknown profile image.');
+    let file = filePath;
+    if (!file) {
+      if (!mainWindow) return null;
+      const result = await dialog.showOpenDialog(mainWindow, {
+        title: kind === 'avatar' ? 'Choose Profile Photo' : 'Choose Banner Image',
+        properties: ['openFile'],
+        filters: [{ name: 'Images (JPEG, PNG)', extensions: ['jpg', 'jpeg', 'png'] }],
+      });
+      if (result.canceled || result.filePaths.length === 0) return null;
+      file = result.filePaths[0];
+    }
+    const ctx = personaManager.getActiveContext();
+    return { url: setProfileImageFromFile(ctx.db, ctx.mediaLibrary, kind, file) };
   });
 
   ipcMain.handle('studio:create-album', (_e, input) => {

@@ -67,6 +67,8 @@ The first launch creates an empty primary persona. Start by setting your site's 
 ## Getting started
 
 1. **Set up your profile.** In **Profile & Identity**, set your site's public URL (for example `https://yourname.github.io` or your own domain), name, bio and links. Your `did:web` identity comes from that URL.
+
+   For the **profile photo** and **banner**, upload a JPEG or PNG from your computer (or drop it on the preview), pick a photo from one of your albums, or enter an image address. Uploads are resized, have camera and GPS data removed, and are published with your site. There's only ever one of each: a new one replaces the old, and a replaced upload is deleted, from Studio and from your host at the next publish.
 2. **Add content.** Write wall posts, create albums and add photos.
 3. **Preview.** **Test Export & Preview** builds the site into a scratch folder and serves it on `127.0.0.1`, so you can check it in a browser before publishing.
 4. **Publish.** In **Publish & SFTP**, export to a folder, upload over SFTP/FTP, or push to GitHub Pages. The Publish tab shows when you last published and whether anything has changed since.

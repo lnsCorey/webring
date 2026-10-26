@@ -42,6 +42,7 @@ import {
   MediaLibrary,
   optimizeLegacyPhotos,
   replacePhotoImage,
+  setProfileImageFromFile,
   sha256Hex,
 } from '../electron/services/mediaLibrary';
 import { readJpegOrientation, UnsupportedImageError } from '../electron/services/imagePipeline';
@@ -2044,6 +2045,44 @@ describe('Media Library', () => {
     const generator = new StaticSiteGenerator(db, mediaDir);
     return { db, library, generator, publisher: new SitePublisher(generator), dir };
   };
+
+  it('keeps exactly one uploaded profile photo and banner, replacing the old file', () => {
+    const site = makeSite('prof');
+    const write = (name: string, jpeg: Buffer) => {
+      const file = path.join(tempRoot, name);
+      fs.writeFileSync(file, jpeg);
+      return file;
+    };
+    const firstAvatar = setProfileImageFromFile(site.db, site.library, 'avatar', write('a1.jpg', makePhoneJpeg(1600, 1200, 6, 1)));
+    expect(firstAvatar).toMatch(/^media\/profile\/avatar-[0-9a-f]{20}\.jpg$/);
+    const firstFile = site.library.resolveLocalUrl(firstAvatar)!;
+    const decoded = jpegJs.decode(fs.readFileSync(firstFile));
+    expect([decoded.width, decoded.height]).toEqual([600, 800]); // upright (orientation 6), fits 800
+    expect(fs.readFileSync(firstFile).includes(Buffer.from('GPS-SECRET'))).toBe(false);
+
+    const banner = setProfileImageFromFile(site.db, site.library, 'banner', write('b.jpg', makePhoneJpeg(3000, 1000, 1, 3)));
+    const avatar = setProfileImageFromFile(site.db, site.library, 'avatar', write('a2.jpg', makePhoneJpeg(1600, 1200, 1, 2)));
+    expect(avatar).not.toBe(firstAvatar);
+    expect(fs.existsSync(firstFile)).toBe(false); // the old upload is gone
+    expect(site.db.getProfile()).toMatchObject({ avatarUrl: avatar, bannerUrl: banner });
+    expect(fs.readdirSync(path.join(site.dir, 'media-store', 'profile'))).toHaveLength(2);
+
+    const out = path.join(tempRoot, 'out');
+    site.generator.generateToDirectory(out);
+    expect(fs.existsSync(path.join(out, avatar))).toBe(true);
+    expect(fs.existsSync(path.join(out, banner))).toBe(true);
+
+    // Switching to an album photo removes the uploaded file; the photo stays while it's in use
+    const album = site.db.createAlbum({ title: 'Me' });
+    const report = importPhotosIntoAlbum(site.db, site.library, album.id, [write('me.jpg', makePhoneJpeg(900, 900, 1, 4))]);
+    const photo = site.db.getAlbums()[0].photos[0];
+    site.db.updateProfile({ avatarUrl: photo.thumbUrl });
+    cleanUpLibrary(site.db, site.library);
+    expect(fs.existsSync(site.library.resolveLocalUrl(avatar)!)).toBe(false);
+    deletePhotoWithFiles(site.db, site.library, report.added[0]);
+    expect(fs.existsSync(site.library.resolveLocalUrl(photo.thumbUrl)!)).toBe(true);
+    site.db.close();
+  });
 
   it('publishes upright, resized, metadata-free copies and keeps the original locally', () => {
     const source = path.join(tempRoot, 'phone.jpg');

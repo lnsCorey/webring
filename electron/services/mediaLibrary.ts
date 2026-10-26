@@ -1,7 +1,7 @@
 import * as fs from 'fs';
 import * as path from 'path';
 import * as crypto from 'crypto';
-import { makeWebImages } from './imagePipeline';
+import { decodeImage, encodeImage, makeWebImages, resizeToFit } from './imagePipeline';
 
 /**
  * The persona's local photo library (its media store folder):
@@ -9,6 +9,7 @@ import { makeWebImages } from './imagePipeline';
  *   albums/<albumId>/<hash>.<ext>        web copy, published as media/albums/<albumId>/<hash>.<ext>
  *   albums/<albumId>/<hash>.thumb.<ext>  thumbnail, published the same way
  *   originals/<hash>.<ext>               the imported original, kept locally and never published
+ *   profile/<avatar|banner>-<hash>.<ext> the uploaded profile photo and banner, one of each
  *
  * Web files are named by a hash of their content, so a changed photo gets a new URL (no stale
  * caches on hosts or in friends' feeds) and the album manifest can list exact hashes.
@@ -30,6 +31,9 @@ export interface ImportedMedia {
 }
 
 const PUBLISHED_PREFIX = 'media/';
+
+export type ProfileImageKind = 'avatar' | 'banner';
+const PROFILE_IMAGE_MAX_SIDE: Record<ProfileImageKind, number> = { avatar: 800, banner: 2048 };
 const MAX_SOURCE_BYTES = 200 * 1024 * 1024;
 
 export function sha256Hex(buffer: Buffer): string {
@@ -90,6 +94,24 @@ export class MediaLibrary {
     };
   }
 
+  /**
+   * Imports a local JPEG or PNG as the profile photo or banner: upright, resized and with all
+   * metadata stripped. The file is named by its content, so a new image gets a new URL; the
+   * previous one is removed by the next clean-up once the profile stops pointing at it.
+   */
+  public importProfileImage(sourcePath: string, kind: ProfileImageKind): string {
+    const stat = fs.statSync(sourcePath);
+    if (!stat.isFile()) throw new Error(`Not a file: ${sourcePath}`);
+    if (stat.size > MAX_SOURCE_BYTES) throw new Error('This file is larger than 200 MB.');
+    const { image, format } = decodeImage(fs.readFileSync(sourcePath));
+    const encoded = encodeImage(resizeToFit(image, PROFILE_IMAGE_MAX_SIDE[kind]), format);
+    const dir = path.join(this.mediaStoreDir, 'profile');
+    fs.mkdirSync(dir, { recursive: true });
+    const file = `${kind}-${sha256Hex(encoded.buffer).slice(0, 20)}.${encoded.extension}`;
+    fs.writeFileSync(path.join(dir, file), encoded.buffer);
+    return `${PUBLISHED_PREFIX}profile/${file}`;
+  }
+
   /** True for a photo URL that points at a file in this library (rather than the web). */
   public static isLocalUrl(url: string): boolean {
     return url.startsWith(PUBLISHED_PREFIX);
@@ -134,6 +156,7 @@ export class MediaLibrary {
     };
     walk(path.join(this.mediaStoreDir, 'albums'));
     walk(path.join(this.mediaStoreDir, 'originals'));
+    walk(path.join(this.mediaStoreDir, 'profile'));
     return removed;
   }
 
@@ -169,6 +192,7 @@ export interface MediaLibraryDb {
   getLocalMediaReferences(): { urls: Set<string>; originals: Set<string> };
   getLegacyLocalPhotos(): Array<{ id: string; albumId: string; url: string }>;
   getPhotoAlbumId(photoId: string): string | undefined;
+  updateProfile(updates: { avatarUrl?: string; bannerUrl?: string }): unknown;
 }
 
 export interface ImportReport {
@@ -211,6 +235,18 @@ export function deletePhotoWithFiles(db: MediaLibraryDb, library: MediaLibrary, 
 export function deleteAlbumWithFiles(db: MediaLibraryDb, library: MediaLibrary, albumId: string): void {
   db.deleteAlbum(albumId);
   cleanUpLibrary(db, library);
+}
+
+/**
+ * Uploads a local image as the profile photo or banner and saves it on the profile straight away
+ * (so the clean-up keeps it). The previous uploaded one, if any, is deleted: there is only ever one
+ * of each.
+ */
+export function setProfileImageFromFile(db: MediaLibraryDb, library: MediaLibrary, kind: ProfileImageKind, file: string): string {
+  const url = library.importProfileImage(file, kind);
+  db.updateProfile(kind === 'avatar' ? { avatarUrl: url } : { bannerUrl: url });
+  cleanUpLibrary(db, library);
+  return url;
 }
 
 /** Removes library files no photo uses any more. */
