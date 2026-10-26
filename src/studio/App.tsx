@@ -6193,8 +6193,9 @@ export const App: React.FC = () => {
                           <strong>Tik Talk</strong> (vertical reel). Your blocks keep their order; friends,
                           contact, links and guestbook go in the sidebar or rail where a template has one.
                           Accent, font and the other options still apply. Interactive extras (on by
-                          default) add a photo lightbox, a larger post view with shareable links, and
-                          sortable tables.
+                          default) add a photo lightbox, a larger post view with shareable links,
+                          sortable tables, and a short note before Like, Share and other actions open
+                          Webring Studio (the browser's own "Open …?" prompt can't be changed).
                         </p>
                         <button
                           onClick={() => setActiveTab('preview')}

@@ -1,6 +1,7 @@
 /**
  * Interactive extras for the published page: a photo lightbox, opening a post in a larger view
- * (linkable as #post-<id>, photos as #photo-<id>) and sortable tables in text blocks.
+ * (linkable as #post-<id>, photos as #photo-<id>), sortable tables in text blocks, and a short
+ * explanation before a webring:// link hands over to Webring Studio.
  *
  * Plain DOM code with no library. The site generator embeds it with
  * `installPageEnhancements.toString()`, so it must stay self-contained: no imports and no outside
@@ -122,6 +123,80 @@ export function installPageEnhancements(ctx: any): void {
     return true;
   };
 
+  // Hand-off to Webring Studio: explain the step and offer web fallbacks before the browser's own
+  // "open this application?" prompt, which pages can't change. "Don't ask again" skips this sheet.
+  const HANDOFF_KEY = 'webring-studio-handoff';
+  const askFirst = () => {
+    try {
+      return localStorage.getItem(HANDOFF_KEY) !== 'direct';
+    } catch (e) {
+      return true;
+    }
+  };
+  let handoffUrl = '';
+  const showHandoff = (href: string) => {
+    let params: URLSearchParams;
+    try {
+      params = new URL(href).searchParams;
+    } catch (e) {
+      return false;
+    }
+    const action = params.get('action') || '';
+    const title = params.get('title') || '';
+    const target = params.get('targetUrl') || '';
+    const quoted = title ? ' “' + esc(title) + '”' : '';
+    const heading =
+      action === 'like' ? 'Like' + quoted
+      : action === 'share' ? 'Share' + quoted
+      : action === 'comment' ? 'Comment on' + quoted
+      : action === 'friend' ? 'Add ' + esc(title || 'this site') + ' as a friend'
+      : action === 'join-ring' ? 'Join the' + quoted + ' webring'
+      : 'Open in Webring Studio';
+    const isWeb = /^https?:\/\//i.test(target);
+    // A post or photo on this page: copy its page link (#post-…, #photo-…), not the JSON address
+    const pageBase = /^https?:$/.test(location.protocol)
+      ? location.href.split('#')[0]
+      : String(ctx.profile.siteUrl || '').replace(/\/?$/, '/');
+    let webLink = target;
+    const item = (ctx.items || []).find((i: any) => i.canonicalUrl === target);
+    const photoId = Object.keys(photoIndex).find((id) => {
+      const entry = photoIndex[id];
+      return entry.album.photos[entry.index].canonicalUrl === target;
+    });
+    if (item) webLink = pageBase + '#post-' + encodeURIComponent(item.id);
+    else if (photoId) webLink = pageBase + '#photo-' + encodeURIComponent(photoId);
+    handoffUrl = isWeb ? webLink : '';
+    current = null;
+    dialog.setAttribute('aria-label', heading.replace(/&[^;]+;/g, ''));
+    dialog.innerHTML =
+      '<div class="wr-sheet card-surface"><div class="wr-sheet-head"><h2>' + heading + '</h2>' +
+      '<button type="button" class="wr-close" data-wr="close" aria-label="Close">✕</button></div>' +
+      '<p class="wr-sheet-note">This happens in <strong>Webring Studio</strong>, the free desktop app behind this site. Your browser will ask before opening it; choose <em>Always allow</em>, where offered, to skip that next time.</p>' +
+      '<a class="wr-go" data-wr-go href="' + esc(href) + '">Open in Webring Studio</a>' +
+      '<label class="wr-sheet-check"><input type="checkbox" data-wr-remember /> Don’t ask again on this site</label>' +
+      (isWeb
+        ? '<div class="wr-sheet-alt"><p>No app? ' + (action === 'join-ring' ? 'Copy the ring’s address:' : action === 'friend' ? 'Copy the site’s address:' : 'Copy the link:') + '</p>' +
+          '<div class="wr-sheet-copy"><input type="text" readonly value="' + esc(handoffUrl) + '" aria-label="Link" />' +
+          '<button type="button" data-wr="copy">Copy</button>' +
+          (typeof navigator.share === 'function' && action !== 'join-ring' ? '<button type="button" data-wr="share">Share…</button>' : '') +
+          '</div></div>'
+        : '') +
+      '<a class="wr-sheet-about" href="' + safeUrl(ctx.projectUrl) + '" target="_blank" rel="noopener noreferrer">What’s Webring Studio?</a></div>';
+    show();
+    return true;
+  };
+  const isHandoffLink = (el: any) => el && /^webring:/i.test(el.getAttribute('href') || '') && !el.hasAttribute('data-wr-go');
+  const maybeHandoff = (ev: any) => {
+    if (ev.defaultPrevented || ev.button > 0 || ev.metaKey || ev.ctrlKey || ev.shiftKey || ev.altKey) return false;
+    const anchor = ev.target && ev.target.closest ? ev.target.closest('a[href]') : null;
+    if (!isHandoffLink(anchor) || !askFirst()) return false;
+    if (!showHandoff(anchor.getAttribute('href'))) return false;
+    ev.preventDefault();
+    if (!opener) opener = anchor;
+    return true;
+  };
+  root.addEventListener('click', maybeHandoff);
+
   const step = (delta: number) => {
     if (!current) return;
     const photos = current.album.photos;
@@ -143,11 +218,46 @@ export function installPageEnhancements(ctx: any): void {
 
   dialog.addEventListener('click', (ev: any) => {
     if (ev.target === dialog) return dialog.close(); // backdrop
+    if (maybeHandoff(ev)) return; // Like / Share in the lightbox or post view
+    const go = ev.target && ev.target.closest ? ev.target.closest('[data-wr-go]') : null;
+    if (go) {
+      const remember = dialog.querySelector('[data-wr-remember]') as HTMLInputElement | null;
+      if (remember && remember.checked) {
+        try {
+          localStorage.setItem(HANDOFF_KEY, 'direct');
+        } catch (e) {
+          // private mode: the sheet will simply show again
+        }
+      }
+      setTimeout(() => dialog.close(), 300); // let the browser start the hand-off first
+      return;
+    }
     const button = ev.target && ev.target.closest ? ev.target.closest('[data-wr]') : null;
     if (!button) return;
     const action = button.getAttribute('data-wr');
     if (action === 'close') dialog.close();
-    else step(action === 'prev' ? -1 : 1);
+    else if (action === 'copy') {
+      const field = dialog.querySelector('.wr-sheet-copy input') as HTMLInputElement | null;
+      const done = () => {
+        button.textContent = 'Copied ✓';
+      };
+      const fallback = () => {
+        if (!field) return;
+        field.select();
+        let copied = false;
+        try {
+          copied = doc.execCommand('copy');
+        } catch (e) {
+          copied = false;
+        }
+        if (copied) done();
+        else button.textContent = 'Press Ctrl/⌘+C';
+      };
+      if (navigator.clipboard && navigator.clipboard.writeText) navigator.clipboard.writeText(handoffUrl).then(done, fallback);
+      else fallback();
+    } else if (action === 'share') {
+      navigator.share({ url: handoffUrl }).catch(() => undefined);
+    } else step(action === 'prev' ? -1 : 1);
   });
   dialog.addEventListener('keydown', (ev: any) => {
     if (!current) return;
@@ -213,6 +323,20 @@ export const ENHANCEMENTS_CSS = `
     .wr-post img { max-height: 70vh !important; object-fit: contain !important; }
     .wr-dialog [data-open-post], .wr-dialog [data-container] { display: none !important; }
     [data-lightbox] { cursor: zoom-in; }
+    .wr-sheet { width: min(92vw, 27rem); margin: 0 auto; padding: 1.1rem 1.2rem 1rem; border-radius: 1rem; backdrop-filter: blur(14px); box-shadow: 0 20px 60px rgba(0, 0, 0, 0.45); font-size: 0.9rem; }
+    .wr-sheet-head { display: flex; align-items: flex-start; justify-content: space-between; gap: 0.75rem; }
+    .wr-sheet-head h2 { font-size: 1.1rem; font-weight: 800; line-height: 1.3; padding-top: 0.35rem; }
+    .wr-sheet .wr-close { flex-shrink: 0; background: color-mix(in srgb, currentColor 12%, transparent); color: inherit; }
+    .wr-sheet-note { margin: 0.6rem 0 0.9rem; opacity: 0.8; line-height: 1.5; }
+    .wr-go { display: block; text-align: center; padding: 0.65rem 1rem; border-radius: 0.75rem; font-weight: 700; background: var(--accent, var(--tpl-accent, #4f46e5)); color: var(--accent-ink, #fff); }
+    .wr-go:hover { filter: brightness(1.08); }
+    .wr-sheet-check { display: flex; align-items: center; gap: 0.45rem; margin-top: 0.6rem; font-size: 0.8rem; opacity: 0.85; }
+    .wr-sheet-alt { margin-top: 0.9rem; padding-top: 0.8rem; border-top: 1px solid color-mix(in srgb, currentColor 15%, transparent); }
+    .wr-sheet-alt p { font-size: 0.8rem; opacity: 0.8; margin-bottom: 0.4rem; }
+    .wr-sheet-copy { display: flex; gap: 0.4rem; }
+    .wr-sheet-copy input { flex: 1; min-width: 0; padding: 0.4rem 0.6rem; border-radius: 0.5rem; font-size: 0.8rem; color: inherit; background: color-mix(in srgb, currentColor 7%, transparent); border: 1px solid color-mix(in srgb, currentColor 18%, transparent); }
+    .wr-sheet-copy button { padding: 0.4rem 0.75rem; border-radius: 0.5rem; font-size: 0.8rem; font-weight: 600; border: 1px solid color-mix(in srgb, currentColor 25%, transparent); white-space: nowrap; }
+    .wr-sheet-about { display: inline-block; margin-top: 0.8rem; font-size: 0.8rem; text-decoration: underline; opacity: 0.8; }
     .wr-sort { display: inline-flex; align-items: center; gap: 0.35rem; font: inherit; font-weight: 700; color: inherit; background: none; padding: 0; cursor: pointer; }
     .wr-sort-icon::after { content: "↕"; opacity: 0.4; font-size: 0.8em; }
     th[aria-sort="ascending"] .wr-sort-icon::after { content: "▲"; opacity: 0.8; }

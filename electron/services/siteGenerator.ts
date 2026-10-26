@@ -906,7 +906,7 @@ ${TEMPLATE_CSS}${appearance.interactions === 'off' ? '' : ENHANCEMENTS_CSS}
       const installPageEnhancements = ${enhancementsSource};
       if (installPageEnhancements && !(profile.appearance && profile.appearance.interactions === 'off')) {
         try {
-          installPageEnhancements({ root, profile, albums: allAlbums, items: allItems, esc, safeUrl, buildDeepLink, renderItem });
+          installPageEnhancements({ root, profile, albums: allAlbums, items: allItems, esc, safeUrl, buildDeepLink, renderItem, projectUrl: ${JSON.stringify(WEBRING_STUDIO_URL)} });
         } catch (err) {
           console.warn('Interactive extras unavailable:', err);
         }
@@ -965,6 +965,9 @@ ${TEMPLATE_CSS}${appearance.interactions === 'off' ? '' : ENHANCEMENTS_CSS}
   }
 }
 
+
+/** Where "What's Webring Studio?" on a published page points. */
+const WEBRING_STUDIO_URL = 'https://github.com/lnsCorey/webring';
 
 /**
  * Studio preview only (sandboxed iframe): links never navigate the preview. webring:// actions
