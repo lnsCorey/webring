@@ -40,6 +40,7 @@ import {
   replacePhotoImage,
   setProfileImageFromFile,
 } from './services/mediaLibrary';
+import { showSplash } from './splash';
 
 // Lets the Studio window show Media Library images: studio-media://local/<path> maps to the
 // active persona's library file for media/<path>. Must be registered before the app is ready.
@@ -316,12 +317,21 @@ if (!gotTheLock) {
   });
 
   app.whenReady().then(async () => {
-    await initServices();
-    registerIpcHandlers();
     // Launched at login: start quietly in the tray
     const startHidden =
       process.argv.includes('--background') ||
       (process.platform === 'darwin' && app.getLoginItemSettings().wasOpenedAtLogin);
+    // Opening the personas reads their keys from the OS keychain, which can block on a macOS
+    // Keychain prompt, so this comes before the splash
+    await initServices();
+    registerIpcHandlers();
+    // The splash plays while the main window loads; skipped in the background, for a webring://
+    // link launch, or with --no-splash
+    const launchedByLink = process.argv.some((arg) => arg.startsWith('webring://'));
+    const splashDone =
+      startHidden || launchedByLink || process.argv.includes('--no-splash')
+        ? null
+        : showSplash(assetPath('splash.html'));
     protocol.handle('studio-media', (request) => {
       // Studio uses studio-media://local/<path>; the site preview's <base> gives studio-media://local/media/<path>
       const relative = decodeURIComponent(new URL(request.url).pathname.replace(/^\/+/, '')).replace(/^media\//, '');
@@ -335,7 +345,14 @@ if (!gotTheLock) {
       app.dock?.setIcon(nativeImage.createFromPath(assetPath('dock-icon.png')));
     }
     app.setAboutPanelOptions({ applicationName: 'Webring Studio', iconPath: assetPath('app-icon.png') });
-    createWindow(!startHidden);
+    createWindow(!startHidden && !splashDone);
+    if (splashDone) {
+      // Show the main window in the splash's place once it has played (unless the tray or a
+      // second launch already showed it)
+      void splashDone.then(() => {
+        if (mainWindow && !mainWindow.isDestroyed() && !mainWindow.isVisible()) showMainWindow();
+      });
+    }
     createTray();
     scheduler.start();
     // Catch up after sleep; the 60-second tick handles everything else
