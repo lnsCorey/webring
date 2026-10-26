@@ -216,4 +216,8 @@ You are responsible for:
 - **Third-party terms:** your hosting provider (GitHub, your SFTP/FTP host) and any add-on you enable (Google Analytics, Google AdSense, Giscus/Utterances) has its own terms and privacy obligations. For example, analytics and ads may require a cookie notice or consent in your region.
 - **Other people's data:** friends' content you sync stays on your computer, but treat it with the same care you'd want for yours.
 
-This repository doesn't include an open-source license yet, so standard copyright applies until one is added.
+### License
+
+Webring Studio is free software, licensed under the [GNU General Public License v3.0 or later](LICENSE) (GPL-3.0-or-later). You may use, study, share and modify it. If you distribute it or a modified version, you must do so under the same license and make the source code available. See [LICENSE](LICENSE) for the full terms.
+
+Your own content (profile, posts, photos and links) stays yours; the license covers the program, not what you write or upload with it.

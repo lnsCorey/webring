@@ -1,6 +1,7 @@
 {
   "name": "webring-studio",
   "version": "1.0.0",
+  "license": "GPL-3.0-or-later",
   "description": "Self-contained federated personal profile & webring studio with static JSON generation and ATProto did:web identity",
   "main": "dist-electron/electron/main.js",
   "engines": {
