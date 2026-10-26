@@ -95,7 +95,15 @@ If the keychain entry is lost, your signing key can't be recovered: you'd need a
 
 The **Site Design** tab sets how your published page looks, with a live preview beside the controls:
 
-- **Look & feel:** theme, accent colour (with a warning if it's hard to read on your theme), font, corner style, card or flat sections, background (theme, accent glow or blurred banner), banner height and profile photo shape.
+- **Themes and templates:** four classic themes (Neo-Webring, Minimal Zine, Cyber Terminal, Cozy Scrapbook) change colours and fonts. Five social-style templates also rearrange the page, each echoing a familiar site without copying it:
+  - **Facepace:** cover photo, an intro sidebar and a feed of post cards.
+  - **Tweetdeck:** old-school sky blue, with every block in its own column.
+  - **XtraSpecial:** a black timeline between a navigation rail and a widgets rail.
+  - **Instapick:** a stats header, album highlights and a square photo grid.
+  - **Tik Talk:** a dark vertical reel of tall media cards.
+
+  Your blocks keep their order in every template. Friends, contact, links and the guestbook go in the sidebar or rail where a template has one. Each template offers a suggested block order you can apply with one click.
+- **Look & feel:** accent colour (with a warning if it's hard to read on your theme), font, corner style, card or flat sections, background (theme, accent glow or blurred banner), banner height and profile photo shape.
 - **Page layout:** your banner, photo, name, bio and links always stay at the top. Below them, arrange **blocks** by dragging (or with the arrow buttons): photo albums (grid or carousel, all or chosen albums), posts and shares (filter by kind, limit the count), friends, **text** (Markdown, including tables), an image, link buttons, a featured post or album, contact links and a guestbook. Hide a block without deleting it, rename its heading, or reset to the default layout.
 
 Your design is saved in your signed `profile.json`, so it travels with your site. The published page and the preview come from the same code, so what you see is what gets published. Text blocks are rendered safely: HTML and unsafe links are never passed through.

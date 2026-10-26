@@ -85,8 +85,27 @@ export const ProfileThemeSchema = z.enum([
   'minimal-zine',    // Editorial serif typography & clean whitespace
   'cyber-terminal',  // High-contrast dark neon retro terminal
   'cozy-scrapbook',  // Warm paper tones & polaroid photo frames
+  // Social-style templates: each also rearranges the page (see electron/services/siteTemplates.ts)
+  'facepace',        // Cover photo, intro sidebar and a feed of post cards
+  'tweetdeck',       // Old-school sky blue, every block in its own column
+  'xtraspecial',     // Black timeline between a navigation rail and a widgets rail
+  'instapick',       // Stats header, album highlights and a square photo grid
+  'tiktalk',         // Dark vertical reel of tall media cards
 ]);
 export type ProfileTheme = z.infer<typeof ProfileThemeSchema>;
+
+/** Display names for every theme, used by Studio and the MCP tools. */
+export const THEME_LABELS: Record<ProfileTheme, string> = {
+  'neo-webring': 'Neo-Webring',
+  'minimal-zine': 'Minimal Zine',
+  'cyber-terminal': 'Cyber Terminal',
+  'cozy-scrapbook': 'Cozy Scrapbook',
+  facepace: 'Facepace',
+  tweetdeck: 'Tweetdeck',
+  xtraspecial: 'XtraSpecial',
+  instapick: 'Instapick',
+  tiktalk: 'Tik Talk',
+};
 
 /**
  * Profile Document (/api/profile.json)
@@ -275,7 +294,8 @@ export const ProfileDocumentSchema = z.object({
       })
     )
     .default([]),
-  theme: ProfileThemeSchema.default('neo-webring'),
+  // An unknown theme (e.g. from a newer version) falls back instead of rejecting the profile
+  theme: ProfileThemeSchema.default('neo-webring').catch('neo-webring'),
   appearance: AppearanceSchema.optional(),
   layout: z.array(z.unknown()).transform(parseLayout).optional().catch(undefined),
   atprotoHandle: z.string().optional(),

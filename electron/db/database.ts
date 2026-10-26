@@ -41,6 +41,7 @@ import {
   WebringHubDocument,
   WebringManifest,
   WebringMembership,
+  ProfileThemeSchema,
 } from '../../src/shared/schema';
 import {
   isEncryptedKey,
@@ -994,7 +995,7 @@ export class StudioDatabase {
       bannerUrl: String(row.banner_url || ''),
       interests: JSON.parse(String(row.interests_json || '[]')),
       customLinks: JSON.parse(String(row.custom_links_json || '[]')),
-      theme: (row.theme as ProfileTheme) || 'neo-webring',
+      theme: ProfileThemeSchema.catch('neo-webring').parse(row.theme),
       ...readDesign(row),
       atprotoHandle: String(row.atproto_handle || ''),
       commentConfig,

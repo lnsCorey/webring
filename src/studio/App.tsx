@@ -15,6 +15,7 @@ import {
   WEBRING_SCHEMA_VERSION,
   WebringDeepLinkAction,
   WebringMembership,
+  THEME_LABELS,
 } from '../shared/schema';
 import { SiteDesignPanel } from './SiteDesignPanel';
 import {
@@ -6179,6 +6180,29 @@ export const App: React.FC = () => {
                       </div>
 
                       <div className="p-4 rounded-xl bg-slate-950 border border-slate-800 space-y-2">
+                        <div className="text-xs font-bold uppercase tracking-wider text-pink-400">
+                          Design • Themes & Templates
+                        </div>
+                        <h4 className="font-bold text-sm">Pick a Look for Your Page</h4>
+                        <p className="text-xs text-slate-400 leading-relaxed">
+                          In <strong>Site Design</strong>, choose a classic theme (colours and fonts) or a
+                          social-style template that also rearranges the page: <strong>Facepace</strong>{' '}
+                          (cover photo, intro sidebar, post cards), <strong>Tweetdeck</strong> (a column per
+                          block), <strong>XtraSpecial</strong> (timeline between two rails),{' '}
+                          <strong>Instapick</strong> (stats, album highlights, square grid) or{' '}
+                          <strong>Tik Talk</strong> (vertical reel). Your blocks keep their order; friends,
+                          contact, links and guestbook go in the sidebar or rail where a template has one.
+                          Accent, font and the other options still apply.
+                        </p>
+                        <button
+                          onClick={() => setActiveTab('preview')}
+                          className="text-xs text-pink-400 hover:underline font-medium pt-1 inline-block"
+                        >
+                          Choose a template →
+                        </button>
+                      </div>
+
+                      <div className="p-4 rounded-xl bg-slate-950 border border-slate-800 space-y-2">
                         <div className="text-xs font-bold uppercase tracking-wider text-purple-400">
                           Step 5 • Optional Profile Add-Ons
                         </div>
@@ -7491,10 +7515,9 @@ git push -u origin main --force`}
                       onChange={(e) => setNewPersonaTheme(e.target.value as ProfileTheme)}
                       className="w-full px-3 py-2 rounded-xl bg-slate-900 border border-slate-700 text-sm text-white"
                     >
-                      <option value="neo-webring">Neo-Webring (Dark Indigo)</option>
-                      <option value="cyber-terminal">Cyber Terminal (Phosphor Green)</option>
-                      <option value="minimal-zine">Minimal Zine (Editorial Print)</option>
-                      <option value="cozy-scrapbook">Cozy Scrapbook (Warm Amber)</option>
+                      {(Object.keys(THEME_LABELS) as ProfileTheme[]).map((id) => (
+                        <option key={id} value={id}>{THEME_LABELS[id]}</option>
+                      ))}
                     </select>
                   </div>
 
