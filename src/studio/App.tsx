@@ -7258,6 +7258,24 @@ git push -u origin main --force`}
                   </div>
                 </div>
               )}
+
+              {/* Credits, under every Help section */}
+              <div className="bg-slate-900 border border-slate-800 rounded-2xl p-5 flex flex-col sm:flex-row sm:items-center gap-4">
+                <img src="./logo-mark.png" alt="" className="w-12 h-12 shrink-0" />
+                <div className="flex-1 min-w-0">
+                  <h3 className="text-sm font-bold text-white">Credits</h3>
+                  <p className="text-xs text-slate-400 mt-0.5">
+                    Webring Studio · Envisioned &amp; Orchestrated by <strong className="text-slate-200">Corey Lines</strong> · Oct 2026
+                  </p>
+                </div>
+                <button
+                  type="button"
+                  onClick={() => window.studioApi?.openExternal('https://github.com/lnsCorey/webring')}
+                  className="text-xs text-indigo-400 hover:underline font-medium text-left"
+                >
+                  github.com/lnsCorey/webring →
+                </button>
+              </div>
             </div>
           )}
         </div>

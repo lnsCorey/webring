@@ -10,6 +10,7 @@ Outputs (all committed, so builds don't need macOS):
   build/icon.icns, build/icon.ico, build/icon.png      app icons for packagers (macOS, Windows, Linux)
   build/icons/<size>x<size>.png                        Linux icon set
   electron/assets/app-icon.png                         window / taskbar / dev dock icon
+  electron/assets/splash-logo.png                      start-up splash logo
   electron/assets/trayTemplate.png, @2x               macOS menu bar (monochrome template)
   electron/assets/trayIcon.png, @2x                   Windows / Linux tray (colour)
   public/favicon.png, public/logo-mark.png             Studio window favicon and sidebar logo
@@ -185,6 +186,7 @@ def main():
 
         # Running from source: window/taskbar icon and macOS dock icon
         resize(SOURCE, 512, os.path.join(assets, 'app-icon.png'))
+        resize(SOURCE, 560, os.path.join(assets, 'splash-logo.png'))  # shown at 280 px on the splash
         shutil.copy(mac_master, os.path.join(assets, 'dock-icon.png'))
 
         # Tray / menu bar

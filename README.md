@@ -53,6 +53,8 @@ npm install
 npm run dev          # builds the UI and app, then opens Webring Studio (the first run downloads Electron)
 ```
 
+Studio opens with a short splash (under 3 seconds) while it starts up. It's skipped when Studio starts at login in the background, when a `webring://` link opens it, or with `--no-splash`.
+
 The first launch creates an empty primary persona. Start by setting your site's address and name in **Profile & Identity**. Your data lives in the app's data folder:
 
 - macOS: `~/Library/Application Support/webring-studio`
