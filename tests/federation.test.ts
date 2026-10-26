@@ -46,7 +46,7 @@ import {
   sha256Hex,
 } from '../electron/services/mediaLibrary';
 import { readJpegOrientation, UnsupportedImageError } from '../electron/services/imagePipeline';
-import { renderMarkdown } from '../src/shared/markdown';
+import { markdownToPlainText, renderMarkdown } from '../src/shared/markdown';
 import { applySyncPlan, hashStagedFiles, planSync } from '../electron/services/publishSync';
 import { KeyCipher, KeyVaultUnavailableError } from '../electron/security/keyVault';
 import { LocalPreviewServer } from '../electron/services/localPreviewServer';
@@ -131,6 +131,56 @@ describe('Two-Peer Pull Federation, Static Site Generation & Endorsement Discove
     if (fs.existsSync(tempRoot)) {
       fs.rmSync(tempRoot, { recursive: true, force: true });
     }
+  });
+
+  it('edits a published post in place: same address, friends get the new text, comments stay attached', async () => {
+    const aliceDir = path.join(tempRoot, 'alice');
+    const bobDir = path.join(tempRoot, 'bob');
+    const aliceDb = new StudioDatabase(aliceDir, 'alice.sqlite');
+    const bobDb = new StudioDatabase(bobDir, 'bob.sqlite');
+    aliceDb.updateProfile({ siteUrl: 'https://alice.ring.test', displayName: 'Alice' });
+    bobDb.updateProfile({ siteUrl: 'https://bob.ring.test', displayName: 'Bob' });
+
+    const post = aliceDb.createItem({ type: 'post', commentary: 'Frist post!\nMore to come.' });
+    expect(post.title).toBe('Frist post!');
+    const aliceOut = path.join(aliceDir, 'out');
+    const aliceGenerator = new StaticSiteGenerator(aliceDb);
+    aliceGenerator.generateToDirectory(aliceOut);
+    const publishedAt = new Date().toISOString();
+    const fingerprint = aliceGenerator.contentFingerprint();
+
+    // Bob syncs Alice and comments on the post
+    await new RingCrawler(bobDb).crawlFriendSite('https://alice.ring.test', aliceOut);
+    bobDb.createItem({ type: 'comment', targetUrl: post.canonicalUrl, targetAuthorName: 'Alice', commentary: 'Welcome!' });
+    const bobOut = path.join(bobDir, 'out');
+    new StaticSiteGenerator(bobDb).generateToDirectory(bobOut);
+
+    await new Promise((r) => setTimeout(r, 5));
+    const edited = aliceDb.updateItem(post.id, { commentary: 'First post!\nMore to come.', tags: ['hello', ' '] });
+    expect(edited).toMatchObject({ id: post.id, canonicalUrl: post.canonicalUrl, createdAt: post.createdAt, title: 'First post!', tags: ['hello'] });
+    expect(edited.updatedAt! > post.createdAt).toBe(true);
+    expect(aliceDb.countChangesSince(publishedAt)).toBe(1);
+    expect(aliceGenerator.contentFingerprint()).not.toBe(fingerprint);
+    // A title the user typed is kept when only the text changes
+    expect(aliceDb.updateItem(post.id, { title: 'Hello, ring' }).title).toBe('Hello, ring');
+    expect(aliceDb.updateItem(post.id, { commentary: 'First post, edited again.' }).title).toBe('Hello, ring');
+
+    aliceGenerator.generateToDirectory(aliceOut);
+    const items = JSON.parse(fs.readFileSync(path.join(aliceOut, 'api/items.json'), 'utf8'));
+    const didDoc = JSON.parse(fs.readFileSync(path.join(aliceOut, '.well-known/did.json'), 'utf8'));
+    expect(verifyDocumentSignature(items, didDoc.verificationMethod[0].publicKeyPem)).toBe(true);
+    expect(items.items[0]).toMatchObject({ id: post.id, commentary: 'First post, edited again.' });
+    expect(items.items[0].updatedAt).toBeDefined();
+
+    // Bob's next sync replaces his copy; Alice still sees Bob's comment on the same post
+    await new RingCrawler(bobDb).crawlFriendSite('https://alice.ring.test', aliceOut);
+    const inFeed = bobDb.getNetworkFeed().filter((f) => f.canonicalUrl === post.canonicalUrl);
+    expect(inFeed).toHaveLength(1);
+    expect(inFeed[0].commentary).toBe('First post, edited again.');
+    await new RingCrawler(aliceDb).crawlFriendSite('https://bob.ring.test', bobOut);
+    expect(aliceDb.getEndorsements().some((e) => e.type === 'comment' && e.targetCanonicalUrl === post.canonicalUrl)).toBe(true);
+    aliceDb.close();
+    bobDb.close();
   });
 
   it('exports Alice and Bob static JSON sites and indexes mutual likes/shares across the ring', async () => {
@@ -2046,6 +2096,26 @@ describe('Media Library', () => {
     return { db, library, generator, publisher: new SitePublisher(generator), dir };
   };
 
+  it('cleans up a post image that was replaced, removed or deleted with its post', () => {
+    const site = makeSite('posts');
+    const image = (name: string, seed: number) => {
+      const file = path.join(tempRoot, name);
+      fs.writeFileSync(file, makePhoneJpeg(600, 400, 1, seed));
+      return site.library.importPhoto(file, 'wall-posts').url;
+    };
+    const first = image('one.jpg', 1);
+    const post = site.db.createItem({ type: 'post', commentary: 'Look', mediaUrl: first });
+    const second = image('two.jpg', 2);
+    site.db.updateItem(post.id, { mediaUrl: second });
+    cleanUpLibrary(site.db, site.library);
+    expect(fs.existsSync(site.library.resolveLocalUrl(first)!)).toBe(false);
+    expect(fs.existsSync(site.library.resolveLocalUrl(second)!)).toBe(true);
+    site.db.deleteItem(post.id);
+    cleanUpLibrary(site.db, site.library);
+    expect(fs.existsSync(site.library.resolveLocalUrl(second)!)).toBe(false);
+    site.db.close();
+  });
+
   it('keeps exactly one uploaded profile photo and banner, replacing the old file', () => {
     const site = makeSite('prof');
     const write = (name: string, jpeg: Buffer) => {
@@ -2669,6 +2739,66 @@ describe('Site Design (look & feel, page layout)', () => {
         expect(page.html).toContain('&lt;script&gt;alert(1)&lt;/script&gt;');
         expect(page.html).not.toContain('<script>alert(1)');
         expect(page.html).not.toContain('javascript:alert');
+        db.close();
+      }
+    });
+
+    it('renders wall posts as safe Markdown, with plain-text titles and snippets', async () => {
+      const body = '# Big news\n\nRead [the write-up](https://news.example) — it is **great**.\n\n- one\n- two\n\n<script>alert(1)</script> [x](javascript:alert(1))';
+      for (const theme of ['neo-webring', 'xtraspecial', 'instapick'] as ProfileTheme[]) {
+        const db = new StudioDatabase(tempRoot, `md-post-${theme}.sqlite`);
+        db.updateProfile({ theme });
+        const post = db.createItem({ type: 'post', commentary: body });
+        expect(post.title).toBe('Big news');
+        db.createItem({ type: 'like', title: 'A *starred* thing', targetUrl: 'https://thing.example', commentary: 'Plain **notes**' });
+        const page = await renderPage(new StaticSiteGenerator(db).buildStandaloneProfileHtml(db.buildSignedSiteBundle()));
+        expect(page.html).not.toContain('<script>alert(1)');
+        expect(page.html).not.toContain('javascript:alert');
+        if (theme === 'instapick') {
+          // Tiles show a plain-text snippet
+          expect(page.html).toContain('Read the write-up — it is great.');
+        } else {
+          // The heading is shown once, not repeated as a separate title
+          expect(page.html).toContain('<h2>Big news</h2>');
+          expect(page.html).not.toMatch(/<h4[^>]*>\s*<span>Big news<\/span>|<p class="font-bold">Big news<\/p>/);
+          expect(page.html).toContain('<a href="https://news.example" target="_blank" rel="noopener noreferrer">the write-up</a>');
+          expect(page.html).toContain('<ul><li>one</li><li>two</li></ul>');
+          expect(page.html).toContain('&lt;script&gt;alert(1)&lt;/script&gt;');
+          expect(page.html).toContain('Plain **notes**'); // only wall posts are Markdown
+        }
+        db.close();
+      }
+      expect(markdownToPlainText('> **Hello** [there](https://x.example)\n\n| a | b |\n|---|---|\n| 1 | 2 |')).toBe('Hello there\n\n a b \n 1 2');
+      const standalone = new Function(`return ${markdownToPlainText.toString()}`)() as (s: string) => string;
+      expect(standalone('*hi*')).toBe('hi');
+    });
+
+    it('treats a post written before the site URL was set as the user\'s own post', async () => {
+      const db = new StudioDatabase(tempRoot, 'placeholder.sqlite'); // starts on the placeholder URL
+      const post = db.createItem({ type: 'post', title: 'Early post', commentary: 'Hi' });
+      const like = db.createItem({ type: 'like', title: 'Elsewhere', targetUrl: 'https://other.example/x' });
+      db.updateProfile({ siteUrl: 'https://me.example' });
+      const items = db.getItems();
+      const mine = items.find((i) => i.id === post.id)!;
+      expect(mine.canonicalUrl).toBe(`https://me.example/api/items.json#item-${post.id}`);
+      expect(mine.targetUrl).toBe(mine.canonicalUrl);
+      expect(items.find((i) => i.id === like.id)!.targetUrl).toBe('https://other.example/x');
+      const page = await renderPage(new StaticSiteGenerator(db).buildStandaloneProfileHtml(db.buildSignedSiteBundle()));
+      expect(page.html).not.toContain('Early post ↗');
+      db.close();
+    });
+
+    it('marks edited items on the page, in a classic theme and a template', async () => {
+      for (const theme of ['neo-webring', 'facepace'] as ProfileTheme[]) {
+        const db = new StudioDatabase(tempRoot, `edited-${theme}.sqlite`);
+        db.updateProfile({ theme });
+        db.createItem({ type: 'post', commentary: 'Untouched post' });
+        const changed = db.createItem({ type: 'post', commentary: 'Old text' });
+        db.updateItem(changed.id, { commentary: 'New <b>text</b>' });
+        const page = await renderPage(new StaticSiteGenerator(db).buildStandaloneProfileHtml(db.buildSignedSiteBundle()));
+        expect(page.html.match(/class="item-edited"/g)).toHaveLength(1);
+        expect(page.html).toContain('New &lt;b&gt;text&lt;/b&gt;');
+        expect(page.html).not.toContain('Old text');
         db.close();
       }
     });

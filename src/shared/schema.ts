@@ -435,6 +435,8 @@ export const SharedItemSchema = z.object({
   rating: z.number().min(1).max(5).optional(),
   tags: z.array(z.string()).default([]),
   createdAt: z.string(),
+  /** Set when the item has been edited since it was first published. */
+  updatedAt: z.string().optional().catch(undefined),
 });
 export type SharedItem = z.infer<typeof SharedItemSchema>;
 

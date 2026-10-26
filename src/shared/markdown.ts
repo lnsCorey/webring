@@ -130,3 +130,23 @@ export function renderMarkdown(source: string): string {
   }
   return html.join('\n');
 }
+
+/**
+ * Markdown as plain text, for places that show a short snippet (a post's derived title, a grid
+ * tile, a reel card): markers are dropped and links keep their label. Self-contained for the same
+ * reason as renderMarkdown; the result still needs escaping before it goes into HTML.
+ */
+export function markdownToPlainText(source: string): string {
+  return String(source || '')
+    .replace(/\r\n?/g, '\n')
+    .replace(/^```.*$/gm, '')
+    .replace(/^[ \t]*\|?[ \t]*:?-{3,}:?[ \t]*(\|[ \t]*:?-{3,}:?[ \t]*)*\|?[ \t]*(\n|$)/gm, '')
+    .replace(/^\s{0,3}(#{1,6}\s+|>\s?|[-*+]\s+|\d+\.\s+)/gm, '')
+    .replace(/!?\[([^\]]*)\]\([^)]*\)/g, '$1')
+    .replace(/(\*\*|__|~~|`)/g, '')
+    .replace(/(^|[\s(])[*_]([^*_\s][^*_]*)[*_](?=[\s).,!?:;]|$)/gm, '$1$2')
+    .replace(/\|/g, ' ')
+    .replace(/[ \t]+/g, ' ')
+    .replace(/\n{3,}/g, '\n\n')
+    .trim();
+}

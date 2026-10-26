@@ -278,7 +278,9 @@ export function renderTemplatePage(ctx: any): string {
   const itemBody = (item: any) => {
     const isSelfPost = item.type === 'post' && (!item.targetUrl || item.targetUrl === item.canonicalUrl);
     const r = reactions(item.canonicalUrl);
-    const title = item.title
+    const first = String(item.commentary || '').trim().split('\n')[0];
+    const titleIsHeading = item.type === 'post' && /^#{1,6}\s/.test(first) && ctx.markdownToPlainText(first) === item.title;
+    const title = item.title && !titleIsHeading
       ? isSelfPost
         ? '<p class="font-bold">' + esc(item.title) + '</p>'
         : '<a href="' + safeUrl(item.targetUrl) + '" target="_blank" rel="noopener noreferrer" class="font-bold hover:underline">' + esc(item.title) + ' ↗</a>'
@@ -288,7 +290,9 @@ export function renderTemplatePage(ctx: any): string {
       : '';
     const stars = item.rating && item.type !== 'post' && item.type !== 'comment' ? ' ' + '★'.repeat(Math.min(5, Math.max(1, Number(item.rating) || 5))) : '';
     return title + source +
-      (item.commentary ? '<p class="text-sm mt-1 whitespace-pre-line">' + esc(item.commentary) + stars + '</p>' : stars ? '<p class="text-sm">' + stars + '</p>' : '') +
+      (item.type === 'post' && item.commentary
+        ? '<div class="prose-block post-body text-sm mt-1">' + ctx.renderMarkdown(item.commentary) + '</div>'
+        : item.commentary ? '<p class="text-sm mt-1 whitespace-pre-line">' + esc(item.commentary) + stars + '</p>' : stars ? '<p class="text-sm">' + stars + '</p>' : '') +
       (item.mediaUrl ? '<img src="' + safeUrl(item.mediaUrl) + '" alt="" class="tpl-media" />' : '') +
       ((item.tags || []).length ? '<p class="text-xs tpl-accent mt-1">' + item.tags.map((t: string) => '#' + esc(t)).join(' ') + '</p>' : '') +
       (r.endorsements.length ? '<p class="text-xs tpl-muted mt-1">↻ ' + r.endorsements.map((e: any) => esc(e.authorName)).join(', ') + '</p>' : '') +
@@ -298,19 +302,25 @@ export function renderTemplatePage(ctx: any): string {
       '<div id="live-comments-' + esc(item.id) + '" class="hidden mt-2"></div>';
   };
   const typeLabel = (item: any) => esc(TYPE_LABELS[item.type] || item.type);
+  // Short text for tiles and reel cards: posts are Markdown, so drop the markers
+  const snippet = (item: any) => (item.type === 'post' ? ctx.markdownToPlainText(item.commentary || '') : String(item.commentary || ''));
+  const edited = (item: any) => {
+    const d = item.updatedAt ? new Date(item.updatedAt) : null;
+    return d && !isNaN(d.getTime()) ? ' · <span class="item-edited" title="Edited ' + esc(d.toLocaleString()) + '">edited</span>' : '';
+  };
   const postCard = (item: any) =>
     '<article class="card-surface fp-post"><div class="fp-post-head">' + avatar('w-10 h-10 text-base') +
-    '<div><p class="font-bold text-sm">' + name + '</p><p class="text-xs tpl-muted">' + esc(formatDate(item.createdAt)) + ' · ' + typeLabel(item) + (item.category && item.category !== 'general' ? ' · ' + esc(item.category) : '') + '</p></div></div>' +
+    '<div><p class="font-bold text-sm">' + name + '</p><p class="text-xs tpl-muted">' + esc(formatDate(item.createdAt)) + ' · ' + typeLabel(item) + (item.category && item.category !== 'general' ? ' · ' + esc(item.category) : '') + edited(item) + '</p></div></div>' +
     '<div class="fp-post-body">' + itemBody(item) + '</div>' + itemActions(item, true) + '</article>';
   const tweetRow = (item: any) =>
-    '<article class="tw-row">' + avatar('') + '<div class="tw-main"><div class="tw-head"><span class="font-bold">' + name + '</span><span class="tpl-muted">' + esc(handle) + ' · ' + esc(formatDate(item.createdAt)) + '</span>' +
+    '<article class="tw-row">' + avatar('') + '<div class="tw-main"><div class="tw-head"><span class="font-bold">' + name + '</span><span class="tpl-muted">' + esc(handle) + ' · ' + esc(formatDate(item.createdAt)) + edited(item) + '</span>' +
     (item.type !== 'post' ? '<span class="tpl-chip">' + typeLabel(item) + '</span>' : '') + '</div>' + itemBody(item) + itemActions(item, false) + '</div></article>';
   const itemTile = (item: any) => {
     const r = reactions(item.canonicalUrl);
     return '<div class="tpl-tile">' +
       (item.mediaUrl
         ? '<img src="' + safeUrl(item.mediaUrl) + '" alt="' + esc(item.title) + '" />'
-        : '<div class="tpl-tile-text"><strong>' + esc(item.title) + '</strong><span>' + esc(String(item.commentary || '').slice(0, 160)) + '</span></div>') +
+        : '<div class="tpl-tile-text"><strong>' + esc(item.title) + '</strong><span>' + esc(snippet(item).slice(0, 160)) + '</span></div>') +
       '<div class="tpl-overlay"><span>♥ ' + r.endorsements.length + ' · 💬 ' + r.comments.length + '</span><span>' + esc(item.title) + '</span>' + itemActions(item, false) + '</div></div>';
   };
   const reelCard = (media: string, title: string, text: string, tags: string[], counts: { likes: number; comments: number }, actions: { like: string; comment?: string; share: string; open?: string }) =>
@@ -326,7 +336,7 @@ export function renderTemplatePage(ctx: any): string {
     (actions.open ? '<button type="button" ' + actions.open + ' aria-label="Open"><span class="tt-icon">⤢</span>Open</button>' : '') + '</div></div>';
   const itemReel = (item: any) => {
     const r = reactions(item.canonicalUrl);
-    return reelCard(item.mediaUrl, item.title, item.commentary, item.tags, { likes: r.endorsements.length, comments: r.comments.length }, {
+    return reelCard(item.mediaUrl, item.title, snippet(item), item.tags, { likes: r.endorsements.length, comments: r.comments.length }, {
       like: link('like', item.canonicalUrl, item.title, item.mediaUrl, item.category),
       comment: link('comment', item.canonicalUrl, item.title, item.mediaUrl, 'comment'),
       share: link('share', item.targetUrl, item.title, item.mediaUrl, item.category),

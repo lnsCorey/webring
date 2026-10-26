@@ -24,7 +24,7 @@
 ### Layout
 
 - `electron/main.ts`, `electron/preload.ts`: IPC handlers and the renderer API.
-- `electron/db/database.ts`: SQLite schema, queries and the signed site bundle.
+- `electron/db/database.ts`: SQLite schema, queries and the signed site bundle. Editing an item (`updateItem`) keeps its id, canonical URL, type and `createdAt` (friends' endorsements point at the canonical URL) and sets the optional `updatedAt`, which the page shows as "edited". Wall post bodies (`type: 'post'`) are Markdown, rendered with `renderMarkdown`; other items' commentary stays plain text. Derived titles and snippets use `markdownToPlainText`.
 - `electron/services/`: ring crawler (friends), ring service (webrings: hubs, join requests, sync), static site generator, publisher, persona manager.
 - `electron/mcp/`: MCP server (stdio CLI and loopback HTTP/SSE).
 - `electron/security/`: private key encryption at rest.
