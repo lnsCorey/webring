@@ -126,6 +126,15 @@ Album descriptions are written in **Markdown** (headings, links, lists, quotes a
 - **Publishing only sends changes:** to a local folder, SFTP/FTP or GitHub Pages, Studio uploads only new or changed files and removes photos you deleted. It only ever removes files it published itself; anything else on your server or in your repo is left alone. If files there were changed by hand, use **Re-upload everything at next publish**.
 - **Friends see changes on their next sync:** replaced photos update, and removed ones disappear from their feed.
 
+### Feed window, saved posts and older posts
+
+History grows forever, so Studio keeps syncing small on both sides:
+
+- **Your feed keeps a window.** On the Neighborhood Feed, **Keep** sets how long friends' posts stay: 1 week, 1 month, 3 months (the default), 1 year or forever. Older posts aren't synced and are cleared from your feed. Friends' likes and comments on *your* posts are always kept.
+- **Save what matters.** **☆ Save** on a friend's post or photo keeps a private copy under **Saved**, with a local copy of its image (re-encoded without metadata) and your own note. Saved posts stay after they leave your feed window or your friend removes them, and they're never published.
+- **Unchanged files aren't downloaded.** Syncing asks each host whether a friend's `items.json` and `albums.json` changed since last time (ETag / Last-Modified); if not, nothing is downloaded or reprocessed.
+- **You publish recent posts, with archives.** Your `items.json` holds the last 90 days of posts (at least your 50 newest). Older ones move to signed monthly archives (`api/archive/items-YYYY-MM.json`), so friends download less. Your page lists them under **Older posts**, and each month loads when a visitor opens it. Studio itself still shows all your posts.
+
 ### Webrings
 
 A webring is a circle of sites linked by **← Prev**, **Next →** and **Random**. Each ring has a **maintainer** who decides who's in it. Everything still runs on static files:

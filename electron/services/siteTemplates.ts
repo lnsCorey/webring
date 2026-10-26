@@ -388,7 +388,14 @@ export function renderTemplatePage(ctx: any): string {
     .filter(Boolean);
   const main = rendered.filter((r: any) => !r.aside);
   const aside = rendered.filter((r: any) => r.aside);
-  const mainHtml = main.length ? main[0].html + ctx.inFeedAdHtml + main.slice(1).map((r: any) => r.html).join('') : ctx.inFeedAdHtml;
+  const mainHtml =
+    (main.length ? main[0].html + ctx.inFeedAdHtml + main.slice(1).map((r: any) => r.html).join('') : ctx.inFeedAdHtml) +
+    (ctx.olderPostsHtml || '');
+  // Older posts loaded from archives use this layout's item style
+  if (ctx.archiveView) {
+    ctx.archiveView.renderItem = shell === 'sidebar' ? postCard : shell === 'grid' ? itemTile : shell === 'reel' ? itemReel : tweetRow;
+    ctx.archiveView.wrapClass = shell === 'grid' ? 'tpl-grid' : shell === 'reel' ? 'tt-reel' : 'xs-feed';
+  }
   const asideHtml = aside.map((r: any) => r.html).join('');
   const tabs = (cls: string, list: any[]) =>
     list.length
@@ -422,7 +429,8 @@ export function renderTemplatePage(ctx: any): string {
       ctx.headerAdHtml + ctx.inFeedAdHtml + ctx.footerAdHtml + '</div></div>';
     return wrap(
       ctx.webringBars + '<div class="td-deck">' + profileColumn +
-      rendered.map((r: any) => '<div class="td-col" data-region="column">' + r.html + '</div>').join('') + '</div>' + ctx.footerHtml
+      rendered.map((r: any) => '<div class="td-col" data-region="column">' + r.html + '</div>').join('') +
+      (ctx.olderPostsHtml ? '<div class="td-col" data-region="column">' + ctx.olderPostsHtml + '</div>' : '') + '</div>' + ctx.footerHtml
     );
   }
 

@@ -1,7 +1,7 @@
 import * as fs from 'fs';
 import * as path from 'path';
 import * as crypto from 'crypto';
-import { decodeImage, encodeImage, makeWebImages, resizeToFit } from './imagePipeline';
+import { decodeImage, detectImageFormat, encodeImage, makeWebImages, resizeToFit, WEB_MAX_SIDE } from './imagePipeline';
 
 /**
  * The persona's local photo library (its media store folder):
@@ -10,6 +10,7 @@ import { decodeImage, encodeImage, makeWebImages, resizeToFit } from './imagePip
  *   albums/<albumId>/<hash>.thumb.<ext>  thumbnail, published the same way
  *   originals/<hash>.<ext>               the imported original, kept locally and never published
  *   profile/<avatar|banner>-<hash>.<ext> the uploaded profile photo and banner, one of each
+ *   saved/<hash>.<ext>                   images of friends' posts the user saved; never published
  *
  * Web files are named by a hash of their content, so a changed photo gets a new URL (no stale
  * caches on hosts or in friends' feeds) and the album manifest can list exact hashes.
@@ -112,6 +113,31 @@ export class MediaLibrary {
     return `${PUBLISHED_PREFIX}profile/${file}`;
   }
 
+  /**
+   * Stores the image of a saved post. JPEG and PNG are re-encoded (upright, ≤ 2048 px, metadata
+   * removed); GIF, WebP and AVIF are kept as they are. Returns its library URL (media/saved/...).
+   */
+  public importSavedImage(buffer: Buffer, contentType = ''): string {
+    let data = buffer;
+    let extension: string;
+    if (detectImageFormat(buffer)) {
+      const { image, format } = decodeImage(buffer);
+      const encoded = encodeImage(resizeToFit(image, WEB_MAX_SIDE), format);
+      data = encoded.buffer;
+      extension = encoded.extension;
+    } else {
+      const kept: Record<string, string> = { 'image/gif': 'gif', 'image/webp': 'webp', 'image/avif': 'avif' };
+      const type = contentType.split(';')[0].trim().toLowerCase();
+      if (!kept[type]) throw new Error(`Unsupported image type: ${type || 'unknown'}`);
+      extension = kept[type];
+    }
+    const dir = path.join(this.mediaStoreDir, 'saved');
+    fs.mkdirSync(dir, { recursive: true });
+    const file = `${sha256Hex(data).slice(0, 20)}.${extension}`;
+    fs.writeFileSync(path.join(dir, file), data);
+    return `${PUBLISHED_PREFIX}saved/${file}`;
+  }
+
   /** True for a photo URL that points at a file in this library (rather than the web). */
   public static isLocalUrl(url: string): boolean {
     return url.startsWith(PUBLISHED_PREFIX);
@@ -157,6 +183,7 @@ export class MediaLibrary {
     walk(path.join(this.mediaStoreDir, 'albums'));
     walk(path.join(this.mediaStoreDir, 'originals'));
     walk(path.join(this.mediaStoreDir, 'profile'));
+    walk(path.join(this.mediaStoreDir, 'saved'));
     return removed;
   }
 
@@ -193,6 +220,8 @@ export interface MediaLibraryDb {
   getLegacyLocalPhotos(): Array<{ id: string; albumId: string; url: string }>;
   getPhotoAlbumId(photoId: string): string | undefined;
   updateProfile(updates: { avatarUrl?: string; bannerUrl?: string }): unknown;
+  /** Saved posts' images: kept by clean-up, never published. */
+  getSavedMediaReferences?(): Set<string>;
 }
 
 export interface ImportReport {
@@ -252,6 +281,7 @@ export function setProfileImageFromFile(db: MediaLibraryDb, library: MediaLibrar
 /** Removes library files no photo uses any more. */
 export function cleanUpLibrary(db: MediaLibraryDb, library: MediaLibrary): number {
   const { urls, originals } = db.getLocalMediaReferences();
+  for (const url of db.getSavedMediaReferences?.() || []) urls.add(url);
   return library.collectGarbage(urls, originals);
 }
 

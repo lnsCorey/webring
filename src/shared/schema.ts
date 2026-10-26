@@ -440,12 +440,24 @@ export const SharedItemSchema = z.object({
 });
 export type SharedItem = z.infer<typeof SharedItemSchema>;
 
+/**
+ * When a site publishes only its recent items, `items.json` says so: `since` is the oldest
+ * `createdAt` it contains, and `months` lists the signed monthly archives of everything older.
+ * Readers must not treat items older than `since` as deleted just because they're missing.
+ */
+export const ItemsArchiveIndexSchema = z.object({
+  since: z.string(),
+  months: z.array(z.object({ month: z.string().regex(/^\d{4}-\d{2}$/), url: z.string(), count: z.number() })),
+});
+export type ItemsArchiveIndex = z.infer<typeof ItemsArchiveIndexSchema>;
+
 export const ItemsDocumentSchema = z.object({
   schemaVersion: z.string().default(WEBRING_SCHEMA_VERSION),
   siteUrl: z.string(),
   did: z.string(),
   updatedAt: z.string(),
   items: z.array(SharedItemSchema),
+  archive: ItemsArchiveIndexSchema.optional().catch(undefined),
   proof: SignatureProofSchema.optional(),
 });
 export type ItemsDocument = z.infer<typeof ItemsDocumentSchema>;
@@ -644,6 +656,8 @@ export interface CompleteSiteBundle {
   albums: AlbumsDocument;
   items: ItemsDocument;
   connections: ConnectionsDocument;
+  /** Published bundles only: signed monthly archives of items older than the recent window. */
+  archives?: Array<{ path: string; doc: ItemsDocument }>;
 }
 
 /**
@@ -791,14 +805,16 @@ export function canonicalizeJson(obj: Record<string, unknown>): string {
 export function signDocument<T extends Record<string, unknown>>(
   doc: T,
   did: string,
-  privateKeyPem: string
+  privateKeyPem: string,
+  /** A fixed signing time gives identical bytes for identical content (Ed25519 is deterministic). */
+  created?: string
 ): T & { proof: SignatureProof } {
   const nodeCrypto = getNodeCrypto();
   const canonicalPayload = canonicalizeJson(doc);
   const signature = nodeCrypto.sign(null, Buffer.from(canonicalPayload, 'utf8'), privateKeyPem);
   const proof: SignatureProof = {
     type: 'Ed25519Signature2020',
-    created: new Date().toISOString(),
+    created: created || new Date().toISOString(),
     verificationMethod: `${did}#key-1`,
     signatureValue: signature.toString('base64url'),
   };

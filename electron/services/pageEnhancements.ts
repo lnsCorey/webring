@@ -10,7 +10,7 @@
  * its plain links (a photo opens the image file).
  */
 // eslint-disable-next-line @typescript-eslint/no-explicit-any
-export function installPageEnhancements(ctx: any): void {
+export function installPageEnhancements(ctx: any): { addItems: (items: any[]) => void } | null {
   const doc = document;
   const root = ctx.root;
   const esc = ctx.esc;
@@ -47,7 +47,7 @@ export function installPageEnhancements(ctx: any): void {
     });
   });
 
-  if (typeof HTMLDialogElement === 'undefined') return;
+  if (typeof HTMLDialogElement === 'undefined') return null;
 
   const photoIndex: Record<string, { album: any; index: number }> = {};
   (ctx.albums || []).forEach((album: any) => {
@@ -295,6 +295,15 @@ export function installPageEnhancements(ctx: any): void {
   };
   window.addEventListener('hashchange', openFromHash);
   openFromHash();
+
+  // Older posts loaded later (archives) can be opened in the post view too
+  return {
+    addItems: (items: any[]) => {
+      (items || []).forEach((item: any) => {
+        itemIndex[item.id] = item;
+      });
+    },
+  };
 }
 
 export const ENHANCEMENTS_CSS = `

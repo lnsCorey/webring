@@ -41,6 +41,7 @@ import {
   setProfileImageFromFile,
 } from './services/mediaLibrary';
 import { showSplash } from './splash';
+import { savePost, unsavePost } from './services/savedPosts';
 
 // Lets the Studio window show Media Library images: studio-media://local/<path> maps to the
 // active persona's library file for media/<path>. Must be registered before the app is ready.
@@ -407,6 +408,7 @@ function registerIpcHandlers() {
   ipcMain.handle('studio:get-bundle', () => {
     const ctx = personaManager.getActiveContext();
     const bundle = ctx.db.buildSignedSiteBundle();
+    const publishedBundle = ctx.db.buildSignedSiteBundle({ publish: true });
     const personaList = personaManager.listPersonas();
     const profileWithSettings = ctx.db.getProfile();
     const curatedFeed = ctx.db.getCuratedNetworkFeed();
@@ -430,10 +432,31 @@ function registerIpcHandlers() {
       ),
       publishedUpToDate:
         Boolean(profileWithSettings.publishSettings.lastPublishedFingerprint) &&
-        ctx.siteGenerator.contentFingerprint(bundle) ===
+        ctx.siteGenerator.contentFingerprint(publishedBundle) ===
           profileWithSettings.publishSettings.lastPublishedFingerprint,
-      previewHtml: ctx.siteGenerator.buildStandaloneProfileHtml(bundle, { preview: true }),
+      // The preview shows the published page: recent items, with older ones under "Older posts"
+      previewHtml: ctx.siteGenerator.buildStandaloneProfileHtml(publishedBundle, { preview: true }),
+      savedPosts: ctx.db.getSavedPosts(),
+      feedRetentionDays: ctx.db.getFeedRetentionDays(),
     };
+  });
+
+  // Saved posts and the feed window (both local only)
+  ipcMain.handle('studio:save-post', async (_e, canonicalUrl: string) => {
+    const ctx = personaManager.getActiveContext();
+    return savePost(ctx.db, ctx.mediaLibrary, String(canonicalUrl));
+  });
+  ipcMain.handle('studio:unsave-post', (_e, savedId: string) => {
+    const ctx = personaManager.getActiveContext();
+    unsavePost(ctx.db, ctx.mediaLibrary, String(savedId));
+    return { ok: true };
+  });
+  ipcMain.handle('studio:saved-note', (_e, savedId: string, note: string) => {
+    personaManager.getActiveContext().db.updateSavedNote(String(savedId), String(note || ''));
+    return { ok: true };
+  });
+  ipcMain.handle('studio:set-feed-retention', (_e, days: number) => {
+    return personaManager.getActiveContext().db.setFeedRetentionDays(Number(days));
   });
 
   ipcMain.handle('studio:list-personas', () => {
