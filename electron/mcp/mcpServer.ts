@@ -9,6 +9,8 @@ import {
   isValidAdSlotId,
   isValidGa4MeasurementId,
   normalizeAdSensePublisherId,
+  Appearance,
+  LayoutBlock,
   ProfileTheme,
   SharedItemType,
 } from '../../src/shared/schema';
@@ -222,7 +224,7 @@ export class WebringMcpServer {
       {
         name: 'webring_update_profile',
         description:
-          'Update profile metadata (displayName, siteUrl, tagline, bio, theme, interests, customLinks, atprotoHandle) and/or Social Graph Privacy Shield & Comment settings.',
+          'Update profile metadata (displayName, siteUrl, tagline, bio, theme, interests, customLinks, atprotoHandle), Site Design (appearance, layout) and/or Social Graph Privacy Shield & Comment settings.',
         inputSchema: {
           type: 'object',
           properties: {
@@ -238,6 +240,17 @@ export class WebringMcpServer {
             theme: {
               type: 'string',
               enum: ['neo-webring', 'minimal-zine', 'cyber-terminal', 'cozy-scrapbook'],
+            },
+            appearance: {
+              type: 'object',
+              description:
+                'Look & feel: { accent: "#rrggbb", font: theme|sans|serif|rounded|mono, corners: sharp|rounded|soft, surface: card|flat, bannerHeight: short|medium|tall, avatarShape: rounded|circle, background: theme|gradient|banner-blur }. Invalid fields are ignored.',
+            },
+            layout: {
+              type: 'array',
+              description:
+                'Page blocks below the profile header, in order: [{ id, type, title?, visible, options }]. Types: albums {albumIds?, style: grid|carousel}, items {kinds: [post|like|share|recommendation|comment], limit?}, friends, text {markdown}, image {url, alt, caption, link?}, links {links: [{label,url}]}, featured {canonicalUrl}, contact {entries: [{label,url}]}, guestbook. Invalid blocks are dropped. Use [] for an empty page.',
+              items: { type: 'object' },
             },
             atprotoHandle: { type: 'string' },
             publishFriendsList: {
@@ -992,6 +1005,8 @@ export class WebringMcpServer {
               ? args.interests.map(String)
               : undefined,
             theme: args.theme ? (String(args.theme) as ProfileTheme) : undefined,
+            ...(args.appearance !== undefined ? { appearance: args.appearance as Appearance } : {}),
+            ...(Array.isArray(args.layout) ? { layout: args.layout as LayoutBlock[] } : {}),
             atprotoHandle:
               args.atprotoHandle !== undefined ? String(args.atprotoHandle) : undefined,
             publishSettings:

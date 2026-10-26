@@ -5,6 +5,10 @@ import {
   AdsAddon,
   AlbumItem,
   AlbumManifest,
+  Appearance,
+  AppearanceSchema,
+  LayoutBlock,
+  parseLayout,
   AlbumsDocument,
   AnalyticsAddon,
   buildCanonicalUrl,
@@ -80,6 +84,23 @@ export interface LocalPhotoMedia {
   thumbWidth: number;
   thumbHeight: number;
   originalPath: string;
+}
+
+/** Reads the stored Site Design columns; anything invalid is dropped rather than failing. */
+function readDesign(row: Record<string, unknown>): { appearance?: Appearance; layout?: LayoutBlock[] } {
+  const parse = (value: unknown) => {
+    try {
+      return value ? JSON.parse(String(value)) : undefined;
+    } catch {
+      return undefined;
+    }
+  };
+  const appearance = AppearanceSchema.parse(parse(row.appearance_json) ?? {});
+  const layoutRaw = parse(row.layout_json);
+  return {
+    ...(Object.keys(appearance).some((k) => appearance[k as keyof Appearance] !== undefined) ? { appearance } : {}),
+    ...(Array.isArray(layoutRaw) ? { layout: parseLayout(layoutRaw) } : {}),
+  };
 }
 
 export function albumManifestPath(albumId: string): string {
@@ -724,6 +745,14 @@ export class StudioDatabase {
     addRingColumn('request_token', "TEXT NOT NULL DEFAULT ''");
     addRingColumn('sync_warning', "TEXT NOT NULL DEFAULT ''");
 
+    // Site Design: look & feel options and the page's content blocks (JSON; empty = defaults)
+    const profileColumns = this.db.prepare('PRAGMA table_info(profile)').all() as Array<{ name: string }>;
+    for (const column of ['appearance_json', 'layout_json']) {
+      if (!profileColumns.some((c) => c.name === column)) {
+        this.db.exec(`ALTER TABLE profile ADD COLUMN ${column} TEXT NOT NULL DEFAULT ''`);
+      }
+    }
+
     // Media Library: the exact published files behind each local photo
     const photoColumns = this.db
       .prepare('PRAGMA table_info(photos)')
@@ -966,6 +995,7 @@ export class StudioDatabase {
       interests: JSON.parse(String(row.interests_json || '[]')),
       customLinks: JSON.parse(String(row.custom_links_json || '[]')),
       theme: (row.theme as ProfileTheme) || 'neo-webring',
+      ...readDesign(row),
       atprotoHandle: String(row.atproto_handle || ''),
       commentConfig,
       analyticsAddon,
@@ -1022,6 +1052,8 @@ export class StudioDatabase {
           theme = ?,
           atproto_handle = ?,
           publish_settings_json = ?,
+          appearance_json = ?,
+          layout_json = ?,
           updated_at = ?
         WHERE id = 1`
       )
@@ -1039,6 +1071,15 @@ export class StudioDatabase {
         updates.theme ?? current.theme,
         updates.atprotoHandle ?? current.atprotoHandle ?? '',
         JSON.stringify(mergedPublish),
+        // Validated here, so whatever the UI or an MCP agent sends, only known, valid options are stored
+        JSON.stringify(
+          updates.appearance !== undefined ? AppearanceSchema.parse(updates.appearance) : current.appearance ?? {}
+        ),
+        updates.layout !== undefined
+          ? JSON.stringify(parseLayout(updates.layout))
+          : current.layout
+            ? JSON.stringify(current.layout)
+            : '',
         now
       );
 
@@ -2444,6 +2485,8 @@ export class StudioDatabase {
       interests: rawProfile.interests,
       customLinks: rawProfile.customLinks,
       theme: rawProfile.theme,
+      ...(rawProfile.appearance && Object.keys(rawProfile.appearance).length ? { appearance: rawProfile.appearance } : {}),
+      ...(rawProfile.layout ? { layout: rawProfile.layout } : {}),
       atprotoHandle: rawProfile.atprotoHandle,
       ...(rawProfile.commentConfig ? { commentConfig: rawProfile.commentConfig } : {}),
       ...(rawProfile.analyticsAddon ? { analyticsAddon: rawProfile.analyticsAddon } : {}),

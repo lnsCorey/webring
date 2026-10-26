@@ -144,6 +144,117 @@ export function isValidAdSlotId(rawSlotId?: string): boolean {
   return /^\d{5,20}$/.test(rawSlotId.trim());
 }
 
+/**
+ * Look & feel options layered over the theme palette. Every field is optional and invalid values
+ * are simply dropped (a friend's odd profile never fails to parse); missing means "as the theme".
+ */
+export const AppearanceSchema = z
+  .object({
+    accent: z.string().regex(/^#[0-9a-fA-F]{6}$/).optional().catch(undefined),
+    font: z.enum(['theme', 'sans', 'serif', 'rounded', 'mono']).optional().catch(undefined),
+    corners: z.enum(['sharp', 'rounded', 'soft']).optional().catch(undefined),
+    surface: z.enum(['card', 'flat']).optional().catch(undefined),
+    bannerHeight: z.enum(['short', 'medium', 'tall']).optional().catch(undefined),
+    avatarShape: z.enum(['rounded', 'circle']).optional().catch(undefined),
+    background: z.enum(['theme', 'gradient', 'banner-blur']).optional().catch(undefined),
+  })
+  .catch({});
+export type Appearance = z.infer<typeof AppearanceSchema>;
+
+const LinkEntrySchema = z.object({ label: z.string().max(80), url: z.string().max(2048) });
+const blockBase = {
+  id: z.string().min(1).max(64),
+  title: z.string().max(120).optional(),
+  visible: z.boolean().default(true),
+};
+export const ITEM_BLOCK_KINDS = ['post', 'like', 'share', 'recommendation', 'comment'] as const;
+
+/** Content blocks that make up the page below the fixed profile header. */
+export const LayoutBlockSchema = z.discriminatedUnion('type', [
+  z.object({
+    ...blockBase,
+    type: z.literal('albums'),
+    options: z
+      .object({
+        albumIds: z.array(z.string()).max(200).optional(),
+        style: z.enum(['grid', 'carousel']).default('grid'),
+      })
+      .default({ style: 'grid' }),
+  }),
+  z.object({
+    ...blockBase,
+    type: z.literal('items'),
+    options: z
+      .object({
+        kinds: z.array(z.enum(ITEM_BLOCK_KINDS)).min(1).default([...ITEM_BLOCK_KINDS]),
+        limit: z.number().int().min(1).max(200).optional(),
+      })
+      .default({ kinds: [...ITEM_BLOCK_KINDS] }),
+  }),
+  z.object({ ...blockBase, type: z.literal('friends'), options: z.object({}).default({}) }),
+  z.object({
+    ...blockBase,
+    type: z.literal('text'),
+    options: z.object({ markdown: z.string().max(10000).default('') }).default({ markdown: '' }),
+  }),
+  z.object({
+    ...blockBase,
+    type: z.literal('image'),
+    options: z.object({
+      url: z.string().max(2048),
+      alt: z.string().max(300).default(''),
+      caption: z.string().max(300).default(''),
+      link: z.string().max(2048).optional(),
+    }),
+  }),
+  z.object({
+    ...blockBase,
+    type: z.literal('links'),
+    options: z.object({ links: z.array(LinkEntrySchema).max(30).default([]) }).default({ links: [] }),
+  }),
+  z.object({
+    ...blockBase,
+    type: z.literal('featured'),
+    options: z.object({ canonicalUrl: z.string().max(2048) }),
+  }),
+  z.object({
+    ...blockBase,
+    type: z.literal('contact'),
+    options: z.object({ entries: z.array(LinkEntrySchema).max(20).default([]) }).default({ entries: [] }),
+  }),
+  z.object({ ...blockBase, type: z.literal('guestbook'), options: z.object({}).default({}) }),
+]);
+export type LayoutBlock = z.infer<typeof LayoutBlockSchema>;
+export type LayoutBlockType = LayoutBlock['type'];
+export const MAX_LAYOUT_BLOCKS = 40;
+
+/** The page as it looked before layouts existed: albums, everything shared, friends, guestbook. */
+export const DEFAULT_LAYOUT: LayoutBlock[] = [
+  { id: 'default-albums', type: 'albums', visible: true, options: { style: 'grid' } },
+  { id: 'default-items', type: 'items', visible: true, options: { kinds: [...ITEM_BLOCK_KINDS] } },
+  { id: 'default-friends', type: 'friends', visible: true, options: {} },
+  { id: 'default-guestbook', type: 'guestbook', visible: true, options: {} },
+];
+
+/**
+ * Keeps the valid blocks of a layout and drops anything unknown or malformed (e.g. a block type
+ * from a newer version), so one bad block never breaks the page or the profile.
+ */
+export function parseLayout(raw: unknown): LayoutBlock[] {
+  if (!Array.isArray(raw)) return [];
+  const seen = new Set<string>();
+  const blocks: LayoutBlock[] = [];
+  for (const candidate of raw) {
+    const parsed = LayoutBlockSchema.safeParse(candidate);
+    if (parsed.success && !seen.has(parsed.data.id)) {
+      seen.add(parsed.data.id);
+      blocks.push(parsed.data);
+    }
+    if (blocks.length >= MAX_LAYOUT_BLOCKS) break;
+  }
+  return blocks;
+}
+
 export const ProfileDocumentSchema = z.object({
   schemaVersion: z.string().default(WEBRING_SCHEMA_VERSION),
   did: z.string(),
@@ -165,6 +276,8 @@ export const ProfileDocumentSchema = z.object({
     )
     .default([]),
   theme: ProfileThemeSchema.default('neo-webring'),
+  appearance: AppearanceSchema.optional(),
+  layout: z.array(z.unknown()).transform(parseLayout).optional().catch(undefined),
   atprotoHandle: z.string().optional(),
   commentConfig: CommentConfigSchema.optional(),
   analyticsAddon: AnalyticsAddonSchema.optional(),
