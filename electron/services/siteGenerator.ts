@@ -3,7 +3,7 @@ import * as path from 'path';
 import * as crypto from 'crypto';
 import { StudioDatabase } from '../db/database';
 import { MediaLibrary } from './mediaLibrary';
-import { renderMarkdown } from '../../src/shared/markdown';
+import { markdownToPlainText, renderMarkdown } from '../../src/shared/markdown';
 import { renderTemplatePage, TEMPLATE_CONFIG, TEMPLATE_CSS, templateBodyClasses } from './siteTemplates';
 import { ENHANCEMENTS_CSS, installPageEnhancements } from './pageEnhancements';
 import {
@@ -225,10 +225,11 @@ export class StaticSiteGenerator {
     const preview = options.preview === true;
     const markdownSource = renderMarkdown.toString();
     const templateSource = renderTemplatePage.toString();
+    const plainTextSource = markdownToPlainText.toString();
     const appearance = bundle.profile.appearance || {};
     // Interactive extras are on unless turned off in Site Design; when off they aren't embedded
     const enhancementsSource = appearance.interactions === 'off' ? 'null' : installPageEnhancements.toString();
-    if (/<\/script/i.test(markdownSource + templateSource + enhancementsSource)) {
+    if (/<\/script/i.test(markdownSource + plainTextSource + templateSource + enhancementsSource)) {
       throw new Error('Page renderer source cannot be embedded safely.');
     }
     const safeJson = JSON.stringify(bundle)
@@ -341,6 +342,8 @@ export class StaticSiteGenerator {
     .prose-block th { font-weight: 700; background: rgba(148, 163, 184, 0.12); }
     .prose-block hr { border: 0; border-top: 1px solid rgba(148, 163, 184, 0.3); margin: 1rem 0; }
     .album-description { max-width: 48rem; }
+    .post-body > :first-child { margin-top: 0; }
+    .post-body > :last-child { margin-bottom: 0; }
     .album-description p:first-child, .album-description h2:first-child, .album-description h3:first-child { margin-top: 0.25rem; }
 ${TEMPLATE_CSS}${appearance.interactions === 'off' ? '' : ENHANCEMENTS_CSS}
   </style>
@@ -398,6 +401,7 @@ ${TEMPLATE_CSS}${appearance.interactions === 'off' ? '' : ENHANCEMENTS_CSS}
       }
 
       const renderMarkdown = ${markdownSource};
+      const markdownToPlainText = ${plainTextSource};
       const DEFAULT_LAYOUT = ${JSON.stringify(DEFAULT_LAYOUT)};
 
       // Look & feel (also set on <body> at publish; re-applied in case live profile.json differs)
@@ -653,6 +657,20 @@ ${TEMPLATE_CSS}${appearance.interactions === 'off' ? '' : ENHANCEMENTS_CSS}
         \`;
       }
 
+      // A post whose title is just its opening Markdown heading shows the heading only
+      function titleIsOpeningHeading(item) {
+        if (item.type !== 'post') return false;
+        const first = String(item.commentary || '').trim().split('\\n')[0];
+        return /^#{1,6}\\s/.test(first) && markdownToPlainText(first) === item.title;
+      }
+
+      // "edited" next to an item that changed after it was first published
+      function editedNote(item) {
+        const d = item.updatedAt ? new Date(item.updatedAt) : null;
+        if (!d || isNaN(d.getTime())) return '';
+        return ' • <span class="item-edited" title="Edited ' + esc(d.toLocaleString()) + '">edited</span>';
+      }
+
       function renderItem(item) {
         const badgeColor = item.type === 'post'
           ? 'bg-emerald-500/20 text-emerald-300 border border-emerald-500/30'
@@ -674,14 +692,16 @@ ${TEMPLATE_CSS}${appearance.interactions === 'off' ? '' : ENHANCEMENTS_CSS}
             <div>
               <div class="flex items-center justify-between gap-2 mb-2">
                 <span class="text-xs uppercase tracking-wider font-bold px-2.5 py-0.5 rounded-full \${badgeColor}">\${item.type === 'post' ? '📝 Wall Post' : esc(item.type)}</span>
-                <span class="text-xs opacity-60">\${esc(item.category)} \${item.rating && item.type !== 'post' && item.type !== 'comment' ? '• ' + '★'.repeat(Math.min(5, Math.max(1, Number(item.rating) || 5))) : ''}</span>
+                <span class="text-xs opacity-60">\${esc(item.category)} \${item.rating && item.type !== 'post' && item.type !== 'comment' ? '• ' + '★'.repeat(Math.min(5, Math.max(1, Number(item.rating) || 5))) : ''}\${editedNote(item)}</span>
               </div>
               \${item.mediaUrl ? \`<img src="\${safeUrl(item.mediaUrl)}" class="w-full \${item.type === 'post' ? 'max-h-80' : 'h-40'} object-cover rounded-lg mb-3" />\` : ''}
-              <h4 class="font-bold text-base mb-1">
+              \${titleIsOpeningHeading(item) ? '' : \`<h4 class="font-bold text-base mb-1">
                 \${isSelfPost ? \`<span>\${esc(item.title)}</span>\` : \`<a href="\${safeUrl(item.targetUrl)}" target="_blank" rel="noopener noreferrer" class="hover:underline">\${esc(item.title)} ↗</a>\`}
-              </h4>
+              </h4>\`}
               \${item.targetAuthorName ? \`<p class="text-xs opacity-70 mb-2">\${item.type === 'comment' ? 'Replying to' : 'Source'}: <a href="\${safeUrl(item.targetAuthorUrl || item.targetUrl)}" target="_blank" rel="noopener noreferrer" class="underline">\${esc(item.targetAuthorName)}</a></p>\` : ''}
-              <p class="text-sm opacity-90 mb-3 whitespace-pre-line">\${esc(item.commentary || '')}</p>
+              \${item.type === 'post'
+                ? (item.commentary ? \`<div class="prose-block post-body text-sm opacity-90 mb-3">\${renderMarkdown(item.commentary)}</div>\` : '')
+                : \`<p class="text-sm opacity-90 mb-3 whitespace-pre-line">\${esc(item.commentary || '')}</p>\`}
               <div class="flex flex-wrap gap-1.5 mb-3">
                 \${(item.tags || []).map(t => \`<span class="text-xs px-2 py-0.5 rounded bg-white/5 opacity-75">#\${esc(t)}</span>\`).join('')}
               </div>
@@ -853,7 +873,7 @@ ${TEMPLATE_CSS}${appearance.interactions === 'off' ? '' : ENHANCEMENTS_CSS}
         root.innerHTML = renderTemplatePage({
           shell: template.shell, profile, albums: allAlbums, items: allItems, friends: allFriends,
           endorsementCount: (connections.endorsements || []).length, layout: visibleBlocks,
-          blockRenderers, section, emptyNote, esc, safeUrl, buildDeepLink, getEndorsementsFor, getCommentsFor, renderMarkdown,
+          blockRenderers, section, emptyNote, esc, safeUrl, buildDeepLink, getEndorsementsFor, getCommentsFor, renderMarkdown, markdownToPlainText,
           hasLiveProvider: Boolean(commentCfg.provider && commentCfg.provider !== 'none'),
           webringBars, headerAdHtml, inFeedAdHtml, footerAdHtml, footerHtml
         });

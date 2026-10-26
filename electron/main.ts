@@ -262,6 +262,20 @@ function createWindow(show = true) {
     },
   });
 
+  // Links inside Studio (Markdown previews, posts) never open in an Electron window, which would
+  // get Studio's preload API: web links go to the default browser, anything else is ignored
+  mainWindow.webContents.setWindowOpenHandler(({ url }) => {
+    if (/^https?:\/\//i.test(url)) void shell.openExternal(url);
+    return { action: 'deny' };
+  });
+  mainWindow.webContents.on('will-navigate', (event, url) => {
+    const appUrl = mainWindow?.webContents.getURL() || '';
+    const sameDocument = url.split('#')[0] === appUrl.split('#')[0];
+    if (sameDocument) return;
+    event.preventDefault();
+    if (/^https?:\/\//i.test(url) && !url.startsWith(process.env.VITE_DEV_SERVER_URL || '\u0000')) void shell.openExternal(url);
+  });
+
   // In background mode, closing the window hides it so schedules keep running in the tray
   mainWindow.on('close', (event) => {
     if (!isQuitting && scheduler?.loadConfig().runInBackground) {
@@ -568,8 +582,17 @@ function registerIpcHandlers() {
     return personaManager.getActiveContext().db.createItem(input);
   });
 
+  ipcMain.handle('studio:update-item', (_e, itemId: string, updates) => {
+    const ctx = personaManager.getActiveContext();
+    const item = ctx.db.updateItem(itemId, updates);
+    cleanUpLibrary(ctx.db, ctx.mediaLibrary); // a replaced or removed post image
+    return item;
+  });
+
   ipcMain.handle('studio:delete-item', (_e, itemId: string) => {
-    personaManager.getActiveContext().db.deleteItem(itemId);
+    const ctx = personaManager.getActiveContext();
+    ctx.db.deleteItem(itemId);
+    cleanUpLibrary(ctx.db, ctx.mediaLibrary);
     return { ok: true };
   });
 

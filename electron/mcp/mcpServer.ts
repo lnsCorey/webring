@@ -311,7 +311,7 @@ export class WebringMcpServer {
             personaId: personaIdProp,
             commentary: {
               type: 'string',
-              description: 'Main body text of the wall post.',
+              description: 'Main body text of the wall post, in Markdown (links, emphasis, headings, lists, quotes, tables; no HTML).',
             },
             title: {
               type: 'string',
@@ -378,6 +378,28 @@ export class WebringMcpServer {
             },
           },
           required: ['type', 'targetUrl', 'commentary'],
+        },
+      },
+      {
+        name: 'webring_update_item',
+        description:
+          'Edit one of your wall posts, comments, likes, shares or recommendations. It keeps its ID and canonical URL (friends\' likes and comments still point at it) and is marked as edited. Only the fields you pass change; an empty title is derived from the text.',
+        inputSchema: {
+          type: 'object',
+          properties: {
+            personaId: personaIdProp,
+            itemId: { type: 'string', description: 'ID of the item to edit (e.g. item-...).' },
+            title: { type: 'string' },
+            commentary: { type: 'string', description: 'The post text (Markdown for wall posts) or your notes.' },
+            targetUrl: { type: 'string', description: 'The link the item is about (not for wall posts).' },
+            targetAuthorName: { type: 'string' },
+            targetAuthorUrl: { type: 'string' },
+            category: { type: 'string' },
+            mediaUrl: { type: 'string', description: 'Image URL, or "" to remove the image.' },
+            rating: { type: 'number', description: '1-5, for likes and recommendations.' },
+            tags: { type: 'array', items: { type: 'string' } },
+          },
+          required: ['itemId'],
         },
       },
       {
@@ -1117,10 +1139,32 @@ export class WebringMcpServer {
           break;
         }
 
+        case 'webring_update_item': {
+          const ctx = this.resolveContext(args);
+          const itemId = String(args.itemId || '');
+          const str = (key: string) => (args[key] !== undefined ? String(args[key]) : undefined);
+          const updated = ctx.db.updateItem(itemId, {
+            title: str('title'),
+            commentary: str('commentary'),
+            targetUrl: str('targetUrl'),
+            targetAuthorName: str('targetAuthorName'),
+            targetAuthorUrl: str('targetAuthorUrl'),
+            category: str('category'),
+            mediaUrl: str('mediaUrl'),
+            rating: typeof args.rating === 'number' ? args.rating : undefined,
+            tags: Array.isArray(args.tags) ? args.tags.map(String) : undefined,
+          });
+          cleanUpLibrary(ctx.db, ctx.mediaLibrary);
+          resultData = updated;
+          summary = `Edited "${updated.title}"`;
+          break;
+        }
+
         case 'webring_delete_item': {
           const ctx = this.resolveContext(args);
           const itemId = String(args.itemId || '');
           ctx.db.deleteItem(itemId);
+          cleanUpLibrary(ctx.db, ctx.mediaLibrary);
           resultData = { deleted: true, itemId };
           summary = `Deleted item ${itemId}`;
           break;

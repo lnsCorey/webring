@@ -10,6 +10,7 @@ import {
   PersonaSummary,
   ProfileDocument,
   ProfileTheme,
+  SharedItem,
   SharedItemType,
   siteUrlToDidWeb,
   WEBRING_SCHEMA_VERSION,
@@ -18,7 +19,9 @@ import {
   THEME_LABELS,
 } from '../shared/schema';
 import { SiteDesignPanel } from './SiteDesignPanel';
+import { ItemEdit, ItemEditor } from './ItemEditor';
 import { MarkdownField } from './MarkdownField';
+import { renderMarkdown } from '../shared/markdown';
 import { ProfileImagePicker } from './ProfileImagePicker';
 import {
   BookOpen,
@@ -43,6 +46,7 @@ import {
   Server,
   ShieldCheck,
   Sparkles,
+  Pencil,
   Trash2,
   UploadCloud,
   UserCheck,
@@ -375,6 +379,7 @@ declare global {
       deletePhoto: (photoId: string) => Promise<unknown>;
       createItem: (input: unknown) => Promise<unknown>;
       deleteItem: (itemId: string) => Promise<unknown>;
+      updateItem: (itemId: string, updates: ItemEdit) => Promise<SharedItem>;
       addFriend: (input: unknown) => Promise<unknown>;
       setFriendVisibility: (
         friendId: string,
@@ -642,6 +647,7 @@ export const App: React.FC = () => {
   const [itemMediaUrl, setItemMediaUrl] = useState('');
   const [itemRating, setItemRating] = useState<number>(5);
   const [itemTags, setItemTags] = useState('');
+  const [editingItemId, setEditingItemId] = useState<string | null>(null);
 
   // New Friend & Webring state
   const [friendSiteUrl, setFriendSiteUrl] = useState('');
@@ -1172,6 +1178,23 @@ export const App: React.FC = () => {
       setItemMediaUrl(imported.url);
       notify(`Attached ${imported.fileName} to your post (resized, location data removed).`);
     }
+  };
+
+  const handleSaveItemEdit = async (item: SharedItem, edit: ItemEdit) => {
+    if (!window.studioApi) return;
+    await window.studioApi.updateItem(item.id, edit);
+    setEditingItemId(null);
+    await refreshStudioData();
+    notify(item.type === 'post' ? 'Wall Post updated. Publish to put the change on your site.' : 'Item updated. Publish to put the change on your site.');
+  };
+
+  const handleDeleteItem = async (item: SharedItem) => {
+    if (!window.studioApi) return;
+    const what = item.type === 'post' ? 'Wall Post' : item.type;
+    if (!window.confirm(`Delete this ${what} ("${item.title}")? It's removed from your site at the next publish.`)) return;
+    await window.studioApi.deleteItem(item.id);
+    if (editingItemId === item.id) setEditingItemId(null);
+    await refreshStudioData();
   };
 
   const handleCreateItem = async (e: React.FormEvent) => {
@@ -2602,15 +2625,13 @@ export const App: React.FC = () => {
 
                     <div>
                       <label className="block text-xs text-slate-400 mb-1">
-                        Post Body (Multi-line text — what's on your mind?) *
+                        Post Body (what's on your mind?) *
                       </label>
-                      <textarea
-                        rows={4}
-                        required={!itemTitle.trim()}
+                      <MarkdownField
                         value={itemCommentary}
-                        onChange={(e) => setItemCommentary(e.target.value)}
-                        placeholder="Write your status update, thoughts, or story here..."
-                        className="w-full px-3.5 py-2.5 rounded-xl bg-slate-950 border border-slate-800 text-sm leading-relaxed"
+                        onChange={setItemCommentary}
+                        rows={5}
+                        placeholder={'Write your status update, thoughts, or story here.\n\nMarkdown works: **bold**, *italic*, [a link](https://…), lists, quotes and tables.'}
                       />
                     </div>
 
@@ -2859,16 +2880,47 @@ export const App: React.FC = () => {
                           >
                             {item.type === 'post' ? '📝 Wall Post' : item.type}
                           </span>
-                          <button
-                            onClick={async () => {
-                              await window.studioApi?.deleteItem(item.id);
-                              await refreshStudioData();
-                            }}
-                            className="text-slate-500 hover:text-rose-400"
-                          >
-                            <Trash2 className="w-4 h-4" />
-                          </button>
+                          <div className="flex items-center gap-2">
+                            {item.updatedAt && (
+                              <span className="text-[10px] text-slate-500" title={`Edited ${new Date(item.updatedAt).toLocaleString()}`}>
+                                edited
+                              </span>
+                            )}
+                            {editingItemId !== item.id && (
+                              <button
+                                type="button"
+                                onClick={() => setEditingItemId(item.id)}
+                                className="text-slate-500 hover:text-indigo-300"
+                                title="Edit"
+                                aria-label={`Edit ${item.title}`}
+                              >
+                                <Pencil className="w-4 h-4" />
+                              </button>
+                            )}
+                            <button
+                              type="button"
+                              onClick={() => handleDeleteItem(item)}
+                              className="text-slate-500 hover:text-rose-400"
+                              title="Delete"
+                              aria-label={`Delete ${item.title}`}
+                            >
+                              <Trash2 className="w-4 h-4" />
+                            </button>
+                          </div>
                         </div>
+                        {editingItemId === item.id ? (
+                          <ItemEditor
+                            item={item}
+                            mediaSrc={mediaSrc}
+                            onPickImage={async () => {
+                              const imported = await window.studioApi?.importImage();
+                              return imported ? imported.url : null;
+                            }}
+                            onSave={(edit) => handleSaveItemEdit(item, edit)}
+                            onCancel={() => setEditingItemId(null)}
+                          />
+                        ) : (
+                        <>
                         {item.mediaUrl && (
                           <img
                             src={mediaSrc(item.mediaUrl)}
@@ -2882,9 +2934,16 @@ export const App: React.FC = () => {
                             Target: {item.targetUrl}
                           </p>
                         )}
-                        <p className="text-sm text-slate-300 mt-2 whitespace-pre-line">
-                          {item.commentary}
-                        </p>
+                        {item.type === 'post' ? (
+                          <div
+                            className="studio-prose text-sm text-slate-300 mt-2"
+                            dangerouslySetInnerHTML={{ __html: renderMarkdown(item.commentary) }}
+                          />
+                        ) : (
+                          <p className="text-sm text-slate-300 mt-2 whitespace-pre-line">{item.commentary}</p>
+                        )}
+                        </>
+                        )}
 
                         {postComments.length > 0 && (
                           <div className="mt-3 pt-2.5 border-t border-slate-800 space-y-1.5">
@@ -4026,9 +4085,15 @@ export const App: React.FC = () => {
                             )}
 
                             <h4 className="font-bold text-base pt-1">{entry.title}</h4>
-                            <p className="text-sm text-slate-300 whitespace-pre-line">
-                              {entry.commentary}
-                            </p>
+                            {entry.entryType === 'post' ? (
+                              // Friends' posts are Markdown too; the renderer escapes everything first
+                              <div
+                                className="studio-prose text-sm text-slate-300"
+                                dangerouslySetInnerHTML={{ __html: renderMarkdown(entry.commentary) }}
+                              />
+                            ) : (
+                              <p className="text-sm text-slate-300 whitespace-pre-line">{entry.commentary}</p>
+                            )}
                             <p className="text-xs font-mono text-indigo-400 truncate">
                               Indexed Target: {entry.targetUrl}
                             </p>
@@ -6110,7 +6175,8 @@ export const App: React.FC = () => {
                           <strong>Wall, Likes & Comments</strong>, or add your own photos in the{' '}
                           <strong>Media Library</strong>. Photos are published as resized copies with
                           location data removed, with a signed manifest per album. Every post and photo
-                          receives a permanent canonical URI so peers in your ring can reply or like it.
+                          receives a permanent canonical URI so peers in your ring can reply or like it. Use the pencil on any of
+                          your items to edit it later; its URI stays the same. Wall posts support Markdown.
                         </p>
                         <div className="flex gap-3 pt-1">
                           <button

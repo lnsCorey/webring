@@ -31,6 +31,7 @@ contextBridge.exposeInMainWorld('studioApi', {
   deletePhoto: (photoId: string) => ipcRenderer.invoke('studio:delete-photo', photoId),
   createItem: (input: unknown) => ipcRenderer.invoke('studio:create-item', input),
   deleteItem: (itemId: string) => ipcRenderer.invoke('studio:delete-item', itemId),
+  updateItem: (itemId: string, updates: unknown) => ipcRenderer.invoke('studio:update-item', itemId, updates),
   addFriend: (input: unknown) => ipcRenderer.invoke('studio:add-friend', input),
   setFriendVisibility: (friendId: string, visibility: 'private' | 'public') =>
     ipcRenderer.invoke('studio:set-friend-visibility', friendId, visibility),

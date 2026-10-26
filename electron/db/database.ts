@@ -43,6 +43,7 @@ import {
   WebringMembership,
   ProfileThemeSchema,
 } from '../../src/shared/schema';
+import { markdownToPlainText } from '../../src/shared/markdown';
 import {
   isEncryptedKey,
   KeyCipher,
@@ -333,6 +334,20 @@ export interface StudioDatabaseOptions {
     theme?: ProfileTheme;
     atprotoHandle?: string;
   };
+}
+
+/** An item's title, or one derived from its text when left empty (as when it was created). */
+function defaultItemTitle(type: SharedItemType, title: string | undefined, commentary: string | undefined, targetAuthorName?: string): string {
+  const trimmed = (title || '').trim();
+  if (trimmed) return trimmed;
+  if (type === 'post') {
+    // Posts are Markdown: the title is the first line of their plain text
+    const firstLine = markdownToPlainText(commentary || '').split('\n').find((line) => line.trim()) || 'Wall Post';
+    const line = firstLine.trim();
+    return line.length > 72 ? `${line.slice(0, 69)}...` : line;
+  }
+  if (type === 'comment') return targetAuthorName ? `Comment on ${targetAuthorName}'s post` : 'Comment';
+  return 'Shared Item';
 }
 
 export class StudioDatabase {
@@ -771,6 +786,12 @@ export class StudioDatabase {
     addPhotoColumn('thumb_width', 'INTEGER');
     addPhotoColumn('thumb_height', 'INTEGER');
     addPhotoColumn('position', 'INTEGER NOT NULL DEFAULT 0');
+
+    // Edited items keep their id and canonical URL; updated_at records the last edit
+    const itemColumns = this.db.prepare('PRAGMA table_info(items)').all() as Array<{ name: string }>;
+    if (!itemColumns.some((c) => c.name === 'updated_at')) {
+      this.db.exec('ALTER TABLE items ADD COLUMN updated_at TEXT;');
+    }
 
     // One pinned key per site, shared by friends, ring hubs, applicants and members
     this.db.exec(`
@@ -1476,12 +1497,17 @@ export class StudioDatabase {
 
     return rows.map((r) => {
       const id = String(r.id);
+      const canonicalUrl = buildCanonicalUrl(profile.siteUrl, 'items', id);
+      // A post points at itself; one written before the site URL was set (or changed) still has
+      // its old address, so follow the current one
+      const storedTarget = String(r.target_url);
+      const targetUrl = storedTarget.endsWith(`/api/items.json#item-${id}`) ? canonicalUrl : storedTarget;
       return {
         id,
-        canonicalUrl: buildCanonicalUrl(profile.siteUrl, 'items', id),
+        canonicalUrl,
         type: (r.type as SharedItemType) || 'like',
         title: String(r.title),
-        targetUrl: String(r.target_url),
+        targetUrl,
         targetAuthorUrl: r.target_author_url ? String(r.target_author_url) : undefined,
         targetAuthorName: r.target_author_name ? String(r.target_author_name) : undefined,
         viaUrl: r.via_url ? String(r.via_url) : undefined,
@@ -1491,6 +1517,7 @@ export class StudioDatabase {
         rating: r.rating ? Number(r.rating) : undefined,
         tags: JSON.parse(String(r.tags_json || '[]')),
         createdAt: String(r.created_at),
+        ...(r.updated_at ? { updatedAt: String(r.updated_at) } : {}),
       };
     });
   }
@@ -1516,19 +1543,7 @@ export class StudioDatabase {
     const resolvedTargetUrl =
       input.targetUrl && input.targetUrl.trim() ? input.targetUrl.trim() : selfCanonicalUrl;
 
-    let resolvedTitle = (input.title || '').trim();
-    if (!resolvedTitle) {
-      if (input.type === 'post') {
-        const firstLine = (input.commentary || '').trim().split('\n')[0] || 'Wall Post';
-        resolvedTitle = firstLine.length > 72 ? `${firstLine.slice(0, 69)}...` : firstLine;
-      } else if (input.type === 'comment') {
-        resolvedTitle = input.targetAuthorName
-          ? `Comment on ${input.targetAuthorName}'s post`
-          : 'Comment';
-      } else {
-        resolvedTitle = 'Shared Item';
-      }
-    }
+    const resolvedTitle = defaultItemTitle(input.type, input.title, input.commentary, input.targetAuthorName);
 
     this.db
       .prepare(
@@ -1554,6 +1569,63 @@ export class StudioDatabase {
       );
 
     return this.getItems().find((i) => i.id === id)!;
+  }
+
+  /**
+   * Edits one of the user's own items. Its id, canonical URL (which friends' likes and comments
+   * point at), type and creation time stay the same; `updatedAt` records the edit.
+   */
+  public updateItem(
+    itemId: string,
+    updates: {
+      title?: string;
+      targetUrl?: string;
+      targetAuthorUrl?: string;
+      targetAuthorName?: string;
+      category?: string;
+      commentary?: string;
+      mediaUrl?: string;
+      rating?: number | null;
+      tags?: string[];
+    }
+  ): SharedItem {
+    const current = this.getItems().find((i) => i.id === itemId);
+    if (!current) throw new Error(`Item "${itemId}" not found.`);
+    const text = (value: string | undefined, fallback: string) => (value === undefined ? fallback : value.trim());
+    const commentary = text(updates.commentary, current.commentary);
+    const targetAuthorName = text(updates.targetAuthorName, current.targetAuthorName || '');
+    // A title that was derived from the text follows the text, unless the user changed it
+    const wasDerived = current.title === defaultItemTitle(current.type, '', current.commentary, current.targetAuthorName);
+    const requestedTitle = text(updates.title, current.title);
+    const title = defaultItemTitle(
+      current.type,
+      wasDerived && requestedTitle === current.title ? '' : requestedTitle,
+      commentary,
+      targetAuthorName
+    );
+    const targetUrl = text(updates.targetUrl, current.targetUrl) || current.canonicalUrl;
+    const rating =
+      updates.rating === undefined ? current.rating ?? null : updates.rating === null ? null : Math.min(5, Math.max(1, Math.round(updates.rating)));
+    const tags = updates.tags === undefined ? current.tags : updates.tags.map((t) => t.trim()).filter(Boolean);
+    this.db
+      .prepare(
+        `UPDATE items SET title = ?, target_url = ?, target_author_url = ?, target_author_name = ?, category = ?,
+          commentary = ?, media_url = ?, rating = ?, tags_json = ?, updated_at = ? WHERE id = ?`
+      )
+      .run(
+        title,
+        targetUrl,
+        text(updates.targetAuthorUrl, current.targetAuthorUrl || ''),
+        targetAuthorName,
+        text(updates.category, current.category) || current.category,
+        commentary,
+        text(updates.mediaUrl, current.mediaUrl),
+        rating,
+        JSON.stringify(tags),
+        new Date().toISOString(),
+        itemId
+      );
+    return this.getItems().find((i) => i.id === itemId)!;
   }
 
   public deleteItem(itemId: string): void {
@@ -2419,9 +2491,10 @@ export class StudioDatabase {
    */
   public countChangesSince(sinceIso: string | undefined): number {
     if (!sinceIso) return 0;
-    const count = (sql: string) => (this.db.prepare(sql).get(sinceIso) as { n: number }).n;
+    const count = (sql: string, params = 1) =>
+      (this.db.prepare(sql).get(...Array(params).fill(sinceIso)) as { n: number }).n;
     return (
-      count('SELECT COUNT(*) AS n FROM items WHERE created_at > ?') +
+      count('SELECT COUNT(*) AS n FROM items WHERE created_at > ? OR updated_at > ?', 2) +
       count('SELECT COUNT(*) AS n FROM photos WHERE created_at > ?') +
       count('SELECT COUNT(*) AS n FROM albums WHERE updated_at > ?') +
       count('SELECT COUNT(*) AS n FROM profile WHERE updated_at > ?') +
