@@ -38,10 +38,41 @@ export interface CrawlSiteResult {
   keyChangedWarning?: boolean;
   /** Set when the crawl was skipped because the site is blocked. */
   blocked?: boolean;
+  /** Documents the host said hadn't changed since the last sync, so they weren't downloaded. */
+  unchanged?: string[];
   error?: string;
 }
 
 export type JsonFetcher = (url: string) => Promise<unknown>;
+
+export interface FetchValidators {
+  etag: string;
+  lastModified: string;
+}
+
+/** A JSON fetch that can ask the host whether the file changed (ETag / Last-Modified). */
+export type ConditionalJsonFetcher = (
+  url: string,
+  validators: FetchValidators | null
+) => Promise<{ notModified: true } | { notModified?: false; json: unknown; etag?: string; lastModified?: string }>;
+
+/** HTTP(S) URLs are asked conditionally; local paths are always read in full. */
+export const defaultConditionalJsonFetcher: ConditionalJsonFetcher = async (url, validators) => {
+  if (!/^https?:\/\//i.test(url)) return { json: await defaultJsonFetcher(url) };
+  const res = await fetchPublic(url, { accept: 'application/json', maxBytes: MAX_JSON_BYTES, validators });
+  if (res.status === 'not-modified') return { notModified: true };
+  return { json: JSON.parse(res.body.toString('utf8')), etag: res.etag, lastModified: res.lastModified };
+};
+
+const MAX_IMAGE_BYTES = 15 * 1024 * 1024;
+
+/** Downloads an image from the public internet (same guards as the crawler), up to 15 MB. */
+export async function fetchPublicImage(url: string): Promise<{ body: Buffer; contentType: string }> {
+  const res = await fetchPublic(url, { accept: 'image/*', maxBytes: MAX_IMAGE_BYTES, validators: null });
+  if (res.status === 'not-modified') throw new Error('Unexpected 304');
+  if (!/^image\//i.test(res.contentType)) throw new Error(`Not an image: ${res.contentType || 'unknown type'}`);
+  return { body: res.body, contentType: res.contentType };
+}
 
 const MAX_JSON_BYTES = 5 * 1024 * 1024; // 5 MB limit per crawled JSON document
 
@@ -67,17 +98,28 @@ export async function defaultJsonFetcher(urlOrPath: string): Promise<unknown> {
     const raw = fs.readFileSync(urlOrPath, 'utf8');
     return JSON.parse(raw);
   }
-  return JSON.parse(await fetchPublicText(urlOrPath));
+  const res = await fetchPublic(urlOrPath, { accept: 'application/json', maxBytes: MAX_JSON_BYTES, validators: null });
+  if (res.status === 'not-modified') throw new Error(`Unexpected 304 fetching ${urlOrPath}`);
+  return JSON.parse(res.body.toString('utf8'));
 }
 
 const MAX_REDIRECTS = 3;
 const FETCH_TIMEOUT_MS = 10000;
 
+type PublicFetchResult =
+  | { status: 'not-modified' }
+  | { status: 'ok'; body: Buffer; contentType: string; etag: string; lastModified: string };
+
 /**
  * GETs a URL on the public internet only (see `electron/security/networkGuard.ts`). Every hop,
- * including redirects, is checked against the address actually connected to.
+ * including redirects, is checked against the address actually connected to. With validators,
+ * the host can answer 304 Not Modified instead of sending the file again.
  */
-function fetchPublicText(rawUrl: string, redirectsLeft = MAX_REDIRECTS): Promise<string> {
+function fetchPublic(
+  rawUrl: string,
+  options: { accept: string; maxBytes: number; validators: FetchValidators | null },
+  redirectsLeft = MAX_REDIRECTS
+): Promise<PublicFetchResult> {
   return new Promise((resolve, reject) => {
     let url: URL;
     try {
@@ -102,22 +144,29 @@ function fetchPublicText(rawUrl: string, redirectsLeft = MAX_REDIRECTS): Promise
       url,
       {
         // Some hosts (including api.github.com) refuse requests without a User-Agent
-        headers: { Accept: 'application/json', 'User-Agent': 'WebringStudio/1.0 (+ring crawler)' },
+        headers: {
+          Accept: options.accept,
+          'User-Agent': 'WebringStudio/1.0 (+ring crawler)',
+          ...(options.validators?.etag ? { 'If-None-Match': options.validators.etag } : {}),
+          ...(options.validators?.lastModified ? { 'If-Modified-Since': options.validators.lastModified } : {}),
+        },
         lookup: guardedLookup,
         timeout: FETCH_TIMEOUT_MS,
       },
       (res) => {
         const status = res.statusCode || 0;
+        if (status === 304 && options.validators) {
+          res.resume();
+          resolve({ status: 'not-modified' });
+          return;
+        }
         if (status >= 300 && status < 400 && res.headers.location) {
           res.resume();
           if (redirectsLeft <= 0) {
             reject(new Error(`Too many redirects fetching ${rawUrl}`));
             return;
           }
-          fetchPublicText(new URL(res.headers.location, url).toString(), redirectsLeft - 1).then(
-            resolve,
-            reject
-          );
+          fetchPublic(new URL(res.headers.location, url).toString(), options, redirectsLeft - 1).then(resolve, reject);
           return;
         }
         if (status < 200 || status >= 300) {
@@ -129,13 +178,25 @@ function fetchPublicText(rawUrl: string, redirectsLeft = MAX_REDIRECTS): Promise
         let total = 0;
         res.on('data', (chunk: Buffer) => {
           total += chunk.length;
-          if (total > MAX_JSON_BYTES) {
-            req.destroy(new Error(`Response from ${rawUrl} exceeds 5MB safety limit`));
+          if (total > options.maxBytes) {
+            req.destroy(new Error(`Response from ${rawUrl} exceeds the ${Math.round(options.maxBytes / 1048576)}MB safety limit`));
             return;
           }
           chunks.push(chunk);
         });
-        res.on('end', () => resolve(Buffer.concat(chunks).toString('utf8')));
+        const header = (name: string) => {
+          const value = res.headers[name];
+          return (Array.isArray(value) ? value[0] : value || '').slice(0, 512);
+        };
+        res.on('end', () =>
+          resolve({
+            status: 'ok',
+            body: Buffer.concat(chunks),
+            contentType: header('content-type'),
+            etag: header('etag'),
+            lastModified: header('last-modified'),
+          })
+        );
         res.on('error', reject);
       }
     );
@@ -150,11 +211,22 @@ function fetchPublicText(rawUrl: string, redirectsLeft = MAX_REDIRECTS): Promise
   });
 }
 
+/** Thrown inside a document's section to skip it when the host reported it unchanged. */
+class UnchangedDocument extends Error {}
+
 export class RingCrawler {
   private fetcher: JsonFetcher;
+  private conditionalFetcher: ConditionalJsonFetcher;
 
-  constructor(private db: StudioDatabase, customFetcher?: JsonFetcher) {
+  /**
+   * `customFetcher` replaces the network (tests, offline folders) and always fetches in full;
+   * `conditionalFetcher` lets items.json and albums.json skip when unchanged.
+   */
+  constructor(private db: StudioDatabase, customFetcher?: JsonFetcher, conditionalFetcher?: ConditionalJsonFetcher) {
     this.fetcher = customFetcher || defaultJsonFetcher;
+    this.conditionalFetcher =
+      conditionalFetcher ||
+      (customFetcher ? async (url: string) => ({ json: await customFetcher(url) }) : defaultConditionalJsonFetcher);
   }
 
   /**
@@ -291,10 +363,33 @@ export class RingCrawler {
       let entriesPruned = 0;
       let isAlbumsVerified = true;
       let isItemsVerified = true;
+      const unchanged: string[] = [];
+      // Entries older than the feed window aren't added (endorsements of our items still are)
+      const feedCutoff = this.db.feedCutoffIso();
+      const inWindow = (createdAt: string) => !feedCutoff || createdAt >= feedCutoff;
+      // items.json and albums.json are asked for conditionally: an unchanged file isn't downloaded
+      // or reprocessed. Validators are kept only for files that verified, so anything else is
+      // fetched in full next time.
+      const fetchDocument = async (endpoint: string) => {
+        const url = resolveEndpoint(endpoint);
+        const remote = /^https?:\/\//i.test(url);
+        const validators = remote && !keyChangedWarning ? this.db.getFetchValidators(url) : null;
+        const res = await this.conditionalFetcher(url, validators);
+        if (res.notModified) {
+          unchanged.push(endpoint);
+          return { url, notModified: true as const };
+        }
+        return { url, notModified: false as const, json: res.json, remote, etag: res.etag, lastModified: res.lastModified };
+      };
+      const rememberValidators = (doc: { url: string; remote?: boolean; etag?: string; lastModified?: string }) => {
+        if (doc.remote) this.db.setFetchValidators(doc.url, normalizedFriendUrl, { etag: doc.etag, lastModified: doc.lastModified });
+      };
 
       // Crawl albums.json and independently verify its Ed25519 signature
       try {
-        const rawAlbums = await this.fetcher(resolveEndpoint(manifest.endpoints.albums));
+        const albumsFetch = await fetchDocument(manifest.endpoints.albums);
+        if (albumsFetch.notModified) throw new UnchangedDocument();
+        const rawAlbums = albumsFetch.json;
         const albumsDoc = AlbumsDocumentSchema.parse(rawAlbums);
         isAlbumsVerified =
           !keyChangedWarning && effectiveVerifyKeyPem
@@ -314,6 +409,7 @@ export class RingCrawler {
               continue;
             }
             seenPhotoUrls.push(photo.canonicalUrl);
+            if (!inWindow(photo.createdAt)) continue;
             const fullPhotoUrl = photo.url.startsWith('http')
               ? photo.url
               : `${normalizedFriendUrl}/${photo.url.replace(/^\/+/, '')}`;
@@ -339,14 +435,17 @@ export class RingCrawler {
         // Only a verified document may delete rows, so a hijacked or tampered site can't wipe the feed
         if (photoVerified) {
           entriesPruned += this.db.pruneFriendFeed(normalizedFriendUrl, 'photos', seenPhotoUrls);
+          rememberValidators(albumsFetch);
         }
       } catch {
-        // Continue if albums.json is missing
+        // Continue if albums.json is missing or unchanged
       }
 
       // Crawl items.json (posts, shares, likes, recommendations, comments) and independently verify its Ed25519 signature
       try {
-        const rawItems = await this.fetcher(resolveEndpoint(manifest.endpoints.items));
+        const itemsFetch = await fetchDocument(manifest.endpoints.items);
+        if (itemsFetch.notModified) throw new UnchangedDocument();
+        const rawItems = itemsFetch.json;
         const itemsDoc = ItemsDocumentSchema.parse(rawItems);
         isItemsVerified =
           !keyChangedWarning && effectiveVerifyKeyPem
@@ -365,7 +464,7 @@ export class RingCrawler {
             continue;
           }
           seenItemUrls.push(item.canonicalUrl);
-          this.db.upsertNetworkFeedEntry({
+          if (inWindow(item.createdAt)) this.db.upsertNetworkFeedEntry({
             friendSiteUrl: normalizedFriendUrl,
             friendName: profile.displayName,
             friendAvatarUrl: profile.avatarUrl,
@@ -400,11 +499,14 @@ export class RingCrawler {
         }
 
         if (itemVerified) {
-          entriesPruned += this.db.pruneFriendFeed(normalizedFriendUrl, 'items', seenItemUrls);
-          entriesPruned += this.db.pruneEndorsementsFrom(normalizedFriendUrl, seenItemUrls);
+          // A friend who publishes only recent items has archived the older ones, not deleted them
+          const since = itemsDoc.archive?.since;
+          entriesPruned += this.db.pruneFriendFeed(normalizedFriendUrl, 'items', seenItemUrls, since);
+          entriesPruned += this.db.pruneEndorsementsFrom(normalizedFriendUrl, seenItemUrls, since);
+          rememberValidators(itemsFetch);
         }
       } catch {
-        // Continue if items.json is missing
+        // Continue if items.json is missing or unchanged
       }
 
       // Optionally inspect connections.json for webring discovery
@@ -414,6 +516,8 @@ export class RingCrawler {
       } catch {
         // Optional
       }
+
+      entriesPruned += this.db.pruneFeedOutsideWindow();
 
       const allVerified =
         !keyChangedWarning &&
@@ -433,6 +537,7 @@ export class RingCrawler {
         entriesPruned,
         verifiedSignature: allVerified,
         keyChangedWarning,
+        ...(unchanged.length ? { unchanged } : {}),
       };
     } catch (err: unknown) {
       return {

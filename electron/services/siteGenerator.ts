@@ -65,7 +65,7 @@ export class StaticSiteGenerator {
    * (timestamps and signatures). Equal fingerprints mean publishing again would change nothing,
    * which lets scheduled publishes skip. Covers the bundle, hosted ring hubs and media files.
    */
-  public contentFingerprint(bundle: CompleteSiteBundle = this.db.buildSignedSiteBundle()): string {
+  public contentFingerprint(bundle: CompleteSiteBundle = this.db.buildSignedSiteBundle({ publish: true })): string {
     const stripVolatile = (value: unknown): unknown => {
       if (Array.isArray(value)) return value.map(stripVolatile);
       if (value && typeof value === 'object') {
@@ -90,7 +90,7 @@ export class StaticSiteGenerator {
   }
 
   public generateToDirectory(outputDir: string, compiledProfileHtml?: string): GeneratedSiteResult {
-    const bundle = this.db.buildSignedSiteBundle();
+    const bundle = this.db.buildSignedSiteBundle({ publish: true });
     const filesWritten: string[] = [];
 
     const wellKnownDir = path.join(outputDir, '.well-known');
@@ -115,6 +115,10 @@ export class StaticSiteGenerator {
     writeJson('api/profile.json', bundle.profile);
     writeJson('api/albums.json', bundle.albums);
     writeJson('api/items.json', bundle.items);
+    // Older items, by month (items.json lists them in `archive`); stale months are dropped locally
+    const archiveDir = path.join(outputDir, 'api', 'archive');
+    if (fs.existsSync(archiveDir)) fs.rmSync(archiveDir, { recursive: true, force: true });
+    for (const { path: archivePath, doc } of bundle.archives || []) writeJson(archivePath, doc);
     writeJson('api/connections.json', bundle.connections);
 
     // 2. Hosted rings: a signed hub JSON (what members' Studios and visitors' Prev/Next read) and a
@@ -227,15 +231,16 @@ export class StaticSiteGenerator {
     const templateSource = renderTemplatePage.toString();
     const plainTextSource = markdownToPlainText.toString();
     const appearance = bundle.profile.appearance || {};
+    // Archives aren't embedded in the published page (it fetches them); the preview, which can't
+    // fetch, gets them embedded so "Older posts" works there too
+    const { archives = [], ...pageBundle } = bundle;
+    const archivesJson = preview ? embedJson(Object.fromEntries(archives.map((a) => ['/' + a.path, a.doc]))) : '';
     // Interactive extras are on unless turned off in Site Design; when off they aren't embedded
     const enhancementsSource = appearance.interactions === 'off' ? 'null' : installPageEnhancements.toString();
     if (/<\/script/i.test(markdownSource + plainTextSource + templateSource + enhancementsSource)) {
       throw new Error('Page renderer source cannot be embedded safely.');
     }
-    const safeJson = JSON.stringify(bundle)
-      .replace(/</g, '\\u003c')
-      .replace(/>/g, '\\u003e')
-      .replace(/&/g, '\\u0026');
+    const safeJson = embedJson(pageBundle);
 
     const analytics = bundle.profile.analyticsAddon;
     const hasValidAnalytics = Boolean(
@@ -297,7 +302,7 @@ export class StaticSiteGenerator {
   <link rel="alternate" type="application/json" title="Webring Manifest" href="./api/manifest.json" />
   <link rel="me" href="${this.escapeHtml(bundle.profile.siteUrl)}" />
   <script src="https://cdn.tailwindcss.com"></script>${analyticsHeadSnippet}${adsHeadSnippet}
-  <script>window.__WEBRING_BUNDLE__ = ${safeJson};</script>
+  <script>window.__WEBRING_BUNDLE__ = ${safeJson};${archivesJson ? `\n  window.__WEBRING_ARCHIVES__ = ${archivesJson};` : ''}</script>
   <style>
     body.theme-neo-webring { background: #0f172a; color: #f8fafc; font-family: system-ui, -apple-system, sans-serif; }
     body.theme-minimal-zine { background: #fafaf9; color: #1c1917; font-family: Georgia, Cambria, serif; }
@@ -864,6 +869,25 @@ ${TEMPLATE_CSS}${appearance.interactions === 'off' ? '' : ENHANCEMENTS_CSS}
         ? renderedBlocks[0] + inFeedAdHtml + renderedBlocks.slice(1).join('')
         : inFeedAdHtml;
 
+      // Older posts: items.json holds the recent window; signed monthly archives hold the rest and
+      // load on request (in the preview they're embedded, since it can't fetch)
+      const archiveMonths = items.archive && Array.isArray(items.archive.months)
+        ? items.archive.months.filter(m => m && /^\\/?api\\/archive\\/items-\\d{4}-\\d{2}\\.json$/.test(String(m.url)) && /^\\d{4}-\\d{2}$/.test(String(m.month)))
+        : [];
+      const monthLabel = (month) => {
+        const d = new Date(month + '-01T00:00:00Z');
+        return isNaN(d.getTime()) ? month : d.toLocaleDateString(undefined, { month: 'long', year: 'numeric', timeZone: 'UTC' });
+      };
+      const showsItems = visibleBlocks.some(b => b.type === 'items');
+      const olderPostsHtml = archiveMonths.length && showsItems
+        ? '<section class="mb-12 older-posts" data-archive><h2 class="text-2xl font-bold mb-4">Older posts</h2>' +
+          '<div class="flex flex-wrap gap-2">' + archiveMonths.map(m =>
+            '<button type="button" class="older-month px-3 py-1.5 rounded-lg card-surface text-sm" data-archive-url="' + esc(m.url) + '" data-archive-label="' + esc(monthLabel(m.month)) + '">' +
+            esc(monthLabel(m.month)) + ' <span class="opacity-60">(' + (Number(m.count) || 0) + ')</span></button>').join('') +
+          '</div><div class="older-list mt-4" data-archive-list></div></section>'
+        : '';
+      const archiveView = { renderItem: renderItem, wrapClass: 'grid grid-cols-1 md:grid-cols-2 gap-4' };
+
       const footerHtml = \`
         <footer class="text-center text-xs opacity-60 pt-8 border-t border-white/10">
           <p>Self-contained static profile powered by <strong>Webring Studio JSON Protocol v\${esc(data.manifest.schemaVersion)}</strong> • Cryptographically signed via <code>\${esc(profile.did)}</code></p>
@@ -875,7 +899,7 @@ ${TEMPLATE_CSS}${appearance.interactions === 'off' ? '' : ENHANCEMENTS_CSS}
           endorsementCount: (connections.endorsements || []).length, layout: visibleBlocks,
           blockRenderers, section, emptyNote, esc, safeUrl, buildDeepLink, getEndorsementsFor, getCommentsFor, renderMarkdown, markdownToPlainText,
           hasLiveProvider: Boolean(commentCfg.provider && commentCfg.provider !== 'none'),
-          webringBars, headerAdHtml, inFeedAdHtml, footerAdHtml, footerHtml
+          webringBars, headerAdHtml, inFeedAdHtml, footerAdHtml, footerHtml, olderPostsHtml, archiveView
         });
       } else root.innerHTML = \`
         \${webringBars}
@@ -917,6 +941,7 @@ ${TEMPLATE_CSS}${appearance.interactions === 'off' ? '' : ENHANCEMENTS_CSS}
         \${headerAdHtml}
 
         \${blocksHtml}
+        \${olderPostsHtml}
 
         \${footerAdHtml}
         \${footerHtml}
@@ -924,13 +949,47 @@ ${TEMPLATE_CSS}${appearance.interactions === 'off' ? '' : ENHANCEMENTS_CSS}
 
       // Interactive extras: lightbox, post view, sortable tables (pageEnhancements.ts)
       const installPageEnhancements = ${enhancementsSource};
+      let enhancements = null;
       if (installPageEnhancements && !(profile.appearance && profile.appearance.interactions === 'off')) {
         try {
-          installPageEnhancements({ root, profile, albums: allAlbums, items: allItems, esc, safeUrl, buildDeepLink, renderItem, projectUrl: ${JSON.stringify(WEBRING_STUDIO_URL)} });
+          enhancements = installPageEnhancements({ root, profile, albums: allAlbums, items: allItems, esc, safeUrl, buildDeepLink, renderItem, projectUrl: ${JSON.stringify(WEBRING_STUDIO_URL)} });
         } catch (err) {
           console.warn('Interactive extras unavailable:', err);
         }
       }
+
+      // Loading an archive month appends its posts in the page's layout
+      async function loadArchiveItems(url) {
+        const embedded = window.__WEBRING_ARCHIVES__;
+        let doc = embedded && Object.prototype.hasOwnProperty.call(embedded, url) ? embedded[url] : null;
+        if (!doc && window.location.protocol.startsWith('http')) {
+          const res = await fetch('./' + String(url).replace(/^\\/+/, ''), { credentials: 'omit' });
+          if (res.ok) doc = await res.json();
+        }
+        if (!doc || !Array.isArray(doc.items)) throw new Error('Archive unavailable');
+        return doc.items.filter(i => i && typeof i.id === 'string' && typeof i.canonicalUrl === 'string');
+      }
+      root.addEventListener('click', async function(ev) {
+        const button = ev.target && ev.target.closest ? ev.target.closest('[data-archive-url]') : null;
+        if (!button || button.disabled) return;
+        const list = root.querySelector('[data-archive-list]');
+        if (!list) return;
+        button.disabled = true;
+        try {
+          const loaded = await loadArchiveItems(button.getAttribute('data-archive-url'));
+          loaded.forEach(i => allItems.push(i));
+          if (enhancements && enhancements.addItems) enhancements.addItems(loaded);
+          const group = document.createElement('div');
+          group.className = 'older-month-items mb-8';
+          group.innerHTML = '<h3 class="text-lg font-bold mb-3">' + esc(button.getAttribute('data-archive-label')) + '</h3>' +
+            '<div class="' + archiveView.wrapClass + '">' + loaded.map(archiveView.renderItem).join('') + '</div>';
+          list.appendChild(group);
+          button.classList.add('opacity-50');
+        } catch (err) {
+          button.disabled = false;
+          button.setAttribute('title', 'Couldn\\'t load this month. Try again.');
+        }
+      });
 
       // Initialize any rendered AdSense slots
       if (profile.adsAddon && profile.adsAddon.enabled && typeof window !== 'undefined') {
@@ -985,6 +1044,11 @@ ${TEMPLATE_CSS}${appearance.interactions === 'off' ? '' : ENHANCEMENTS_CSS}
   }
 }
 
+
+/** JSON that's safe inside a <script> element. */
+function embedJson(value: unknown): string {
+  return JSON.stringify(value).replace(/</g, '\\u003c').replace(/>/g, '\\u003e').replace(/&/g, '\\u0026');
+}
 
 /** Where "What's Webring Studio?" on a published page points. */
 const WEBRING_STUDIO_URL = 'https://github.com/lnsCorey/webring';

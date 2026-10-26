@@ -3,6 +3,7 @@ import * as fs from 'fs';
 import { PersonaManager, ActivePersonaContext } from '../services/personaManager';
 import { LocalPreviewServer } from '../services/localPreviewServer';
 import { cleanUpLibrary, deleteAlbumWithFiles, deletePhotoWithFiles, setProfileImageFromFile } from '../services/mediaLibrary';
+import { savePost, unsavePost } from '../services/savedPosts';
 import { jobNextRunAt, Scheduler, SchedulePreset } from '../services/scheduler';
 import {
   FriendVisibility,
@@ -601,6 +602,44 @@ export class WebringMcpServer {
           properties: {
             personaId: personaIdProp,
           },
+        },
+      },
+      {
+        name: 'webring_save_post',
+        description:
+          'Save a friend\'s post or photo from the Neighborhood Feed as a private copy (with a local copy of its image) that stays after it leaves the feed window or the friend removes it. Never published.',
+        inputSchema: {
+          type: 'object',
+          properties: {
+            personaId: personaIdProp,
+            canonicalUrl: { type: 'string', description: 'canonicalUrl of the feed entry.' },
+            note: { type: 'string', description: 'Optional private note.' },
+          },
+          required: ['canonicalUrl'],
+        },
+      },
+      {
+        name: 'webring_list_saved',
+        description: 'List saved posts and photos (private copies), newest saved first.',
+        inputSchema: { type: 'object', properties: { personaId: personaIdProp } },
+      },
+      {
+        name: 'webring_unsave_post',
+        description: 'Remove a saved post and its local image copy.',
+        inputSchema: {
+          type: 'object',
+          properties: { personaId: personaIdProp, savedId: { type: 'string' } },
+          required: ['savedId'],
+        },
+      },
+      {
+        name: 'webring_set_feed_retention',
+        description:
+          'How many days friends\' posts stay in the Neighborhood Feed (0 = forever; default 90). Older entries are removed now and skipped by future syncs. Saved posts and friends\' likes/comments on your posts are kept.',
+        inputSchema: {
+          type: 'object',
+          properties: { personaId: personaIdProp, days: { type: 'number' } },
+          required: ['days'],
         },
       },
       {
@@ -1305,6 +1344,39 @@ export class WebringMcpServer {
             totalFeedEntries: ctx.db.getCuratedNetworkFeed().entries.length,
           };
           summary = `Crawled all ${results.length} friend(s) in ring`;
+          break;
+        }
+
+        case 'webring_save_post': {
+          const ctx = this.resolveContext(args);
+          const saved = await savePost(ctx.db, ctx.mediaLibrary, String(args.canonicalUrl || ''), {
+            note: args.note !== undefined ? String(args.note) : undefined,
+          });
+          resultData = saved;
+          summary = `Saved "${saved.title}" from ${saved.friendName}`;
+          break;
+        }
+
+        case 'webring_list_saved': {
+          const ctx = this.resolveContext(args);
+          resultData = ctx.db.getSavedPosts();
+          summary = `${(resultData as unknown[]).length} saved post(s)`;
+          break;
+        }
+
+        case 'webring_unsave_post': {
+          const ctx = this.resolveContext(args);
+          unsavePost(ctx.db, ctx.mediaLibrary, String(args.savedId || ''));
+          resultData = { removed: true, savedId: args.savedId };
+          summary = 'Removed saved post';
+          break;
+        }
+
+        case 'webring_set_feed_retention': {
+          const ctx = this.resolveContext(args);
+          resultData = ctx.db.setFeedRetentionDays(Number(args.days));
+          const { days, pruned } = resultData as { days: number; pruned: number };
+          summary = days ? `Feed keeps ${days} day(s); removed ${pruned} older entr${pruned === 1 ? 'y' : 'ies'}` : 'Feed keeps everything';
           break;
         }
 

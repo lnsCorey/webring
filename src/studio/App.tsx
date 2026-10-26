@@ -20,6 +20,7 @@ import {
 } from '../shared/schema';
 import { SiteDesignPanel } from './SiteDesignPanel';
 import { ItemEdit, ItemEditor } from './ItemEditor';
+import { SavedPostView, SavedPostsView } from './SavedPostsView';
 import { MarkdownField } from './MarkdownField';
 import { renderMarkdown } from '../shared/markdown';
 import { ProfileImagePicker } from './ProfileImagePicker';
@@ -254,13 +255,13 @@ function formatRelativeTime(iso: string): string {
   return `${days} day${days === 1 ? '' : 's'} ago`;
 }
 
-type FeedScope = 'friends' | 'everyone' | 'me';
+type FeedScope = 'friends' | 'everyone' | 'me' | 'saved';
 const FEED_SCOPE_KEY = 'webring-studio.feedScope';
 
 function loadFeedScope(): FeedScope {
   try {
     const stored = window.localStorage.getItem(FEED_SCOPE_KEY);
-    return stored === 'everyone' || stored === 'me' ? stored : 'friends';
+    return stored === 'everyone' || stored === 'me' || stored === 'saved' ? stored : 'friends';
   } catch {
     return 'friends';
   }
@@ -326,6 +327,8 @@ declare global {
         hostedRings: HostedRing[];
         publishedUpToDate: boolean;
         previewHtml: string;
+        savedPosts?: SavedPostView[];
+        feedRetentionDays?: number;
       }>;
       listPersonas: () => Promise<{
         activePersonaId: string;
@@ -380,6 +383,10 @@ declare global {
       createItem: (input: unknown) => Promise<unknown>;
       deleteItem: (itemId: string) => Promise<unknown>;
       updateItem: (itemId: string, updates: ItemEdit) => Promise<SharedItem>;
+      savePost: (canonicalUrl: string) => Promise<SavedPostView>;
+      unsavePost: (savedId: string) => Promise<unknown>;
+      updateSavedNote: (savedId: string, note: string) => Promise<unknown>;
+      setFeedRetention: (days: number) => Promise<{ days: number; pruned: number }>;
       addFriend: (input: unknown) => Promise<unknown>;
       setFriendVisibility: (
         friendId: string,
@@ -537,6 +544,8 @@ export const App: React.FC = () => {
   const [allFriends, setAllFriends] = useState<FriendConnection[]>([]);
   const [allEndorsements, setAllEndorsements] = useState<EndorsementItem[]>([]);
   const [networkFeed, setNetworkFeed] = useState<NetworkFeedEntry[]>([]);
+  const [savedPosts, setSavedPosts] = useState<SavedPostView[]>([]);
+  const [feedRetentionDays, setFeedRetentionDays] = useState(90);
   const [feedScope, setFeedScopeState] = useState<FeedScope>(loadFeedScope);
   const setFeedScope = (scope: FeedScope) => {
     setFeedScopeState(scope);
@@ -756,6 +765,8 @@ export const App: React.FC = () => {
     setAllFriends(data.allFriends || []);
     setAllEndorsements(data.allEndorsements || []);
     setNetworkFeed(data.networkFeed || []);
+    setSavedPosts(data.savedPosts || []);
+    if (typeof data.feedRetentionDays === 'number') setFeedRetentionDays(data.feedRetentionDays);
     setFeedExclusions(data.feedExclusions || { muted: 0, blocked: 0, unverified: 0 });
     setModeration(data.moderation || []);
     setChangesSinceLastPublish(data.changesSinceLastPublish || 0);
@@ -1785,10 +1796,57 @@ export const App: React.FC = () => {
     ),
   ];
   const visibleFeed = (
-    feedScope === 'friends' ? networkFeed : feedScope === 'me' ? myFeedEntries : [...networkFeed, ...myFeedEntries]
+    feedScope === 'saved'
+      ? []
+      : feedScope === 'friends'
+        ? networkFeed
+        : feedScope === 'me'
+          ? myFeedEntries
+          : [...networkFeed, ...myFeedEntries]
   )
     .filter((entry) => entry.entryType !== 'comment')
     .sort((a, b) => b.createdAt.localeCompare(a.createdAt));
+
+  const savedByUrl = new Map(savedPosts.map((s) => [s.canonicalUrl, s]));
+
+  const handleToggleSaved = async (entry: NetworkFeedEntry) => {
+    if (!window.studioApi) return;
+    const existing = savedByUrl.get(entry.canonicalUrl);
+    try {
+      if (existing) {
+        await window.studioApi.unsavePost(existing.id);
+        notify('Removed from Saved.');
+      } else {
+        const saved = await window.studioApi.savePost(entry.canonicalUrl);
+        notify(
+          saved.mediaUrl && !saved.localMediaUrl
+            ? 'Saved. Its image couldn\'t be copied, so it links to the original.'
+            : 'Saved: a private copy that stays after it leaves your feed.'
+        );
+      }
+    } catch (err) {
+      notify(`Couldn't save that: ${err instanceof Error ? err.message.replace(/^Error invoking remote method '[^']+': (Error: )?/, '') : String(err)}`);
+    }
+    await refreshStudioData();
+  };
+
+  const handleSetFeedRetention = async (days: number) => {
+    if (!window.studioApi) return;
+    const narrower = days !== 0 && (feedRetentionDays === 0 || days < feedRetentionDays);
+    if (narrower && !window.confirm('Remove friends\' posts older than this from your feed now? Saved posts, and friends\' likes and comments on your posts, are kept.')) {
+      return;
+    }
+    const result = await window.studioApi.setFeedRetention(days);
+    setFeedRetentionDays(result.days);
+    await refreshStudioData();
+    notify(
+      result.pruned
+        ? `Removed ${result.pruned} older entr${result.pruned === 1 ? 'y' : 'ies'} from your feed.`
+        : days === 0 || !narrower
+          ? 'Feed window widened. The next sync brings back older posts friends still publish.'
+          : 'Feed window updated.'
+    );
+  };
 
   const handleDeleteMyFeedEntry = async (entry: NetworkFeedEntry) => {
     if (!window.studioApi) return;
@@ -3906,6 +3964,7 @@ export const App: React.FC = () => {
                         ['friends', 'Friends only'],
                         ['everyone', 'Everyone'],
                         ['me', 'Just me'],
+                        ['saved', `Saved${savedPosts.length ? ` (${savedPosts.length})` : ''}`],
                       ] as const
                     ).map(([scope, label]) => (
                       <button
@@ -3922,6 +3981,20 @@ export const App: React.FC = () => {
                       </button>
                     ))}
                   </div>
+                  <label className="flex items-center gap-1.5 text-xs text-slate-400" title="How long friends' posts stay in your feed">
+                    Keep
+                    <select
+                      value={feedRetentionDays}
+                      onChange={(e) => handleSetFeedRetention(Number(e.target.value))}
+                      className="px-2 py-1.5 rounded-lg bg-slate-900 border border-slate-800 text-slate-200"
+                    >
+                      <option value={7}>1 week</option>
+                      <option value={30}>1 month</option>
+                      <option value={90}>3 months</option>
+                      <option value={365}>1 year</option>
+                      <option value={0}>Forever</option>
+                    </select>
+                  </label>
                   <button
                     onClick={handleSyncAllFriends}
                     disabled={isSyncingFriends}
@@ -3974,7 +4047,23 @@ export const App: React.FC = () => {
                 </div>
               )}
 
-              {visibleFeed.length === 0 ? (
+              {feedScope === 'saved' ? (
+                <SavedPostsView
+                  saved={savedPosts}
+                  mediaSrc={mediaSrc}
+                  onOpen={(url) => window.studioApi?.openExternal(url)}
+                  onRemove={async (saved) => {
+                    if (!window.studioApi) return;
+                    if (!window.confirm(`Remove "${saved.title}" from Saved? Its local image copy is deleted too.`)) return;
+                    await window.studioApi.unsavePost(saved.id);
+                    await refreshStudioData();
+                  }}
+                  onSaveNote={async (saved, note) => {
+                    await window.studioApi?.updateSavedNote(saved.id, note);
+                    setSavedPosts((prev) => prev.map((s) => (s.id === saved.id ? { ...s, note } : s)));
+                  }}
+                />
+              ) : visibleFeed.length === 0 ? (
                 <div className="bg-slate-900 border border-slate-800 rounded-2xl p-10 text-center space-y-3">
                   <Radio className="w-10 h-10 text-indigo-400 mx-auto" />
                   {feedScope === 'me' ? (
@@ -4065,6 +4154,21 @@ export const App: React.FC = () => {
                                 </div>
                               </div>
 
+                              <div className="flex items-center gap-2 shrink-0">
+                              {!entry.isMine && (
+                                <button
+                                  type="button"
+                                  onClick={() => handleToggleSaved(entry)}
+                                  className={`text-xs font-semibold px-2 py-0.5 rounded-full ${
+                                    savedByUrl.has(entry.canonicalUrl)
+                                      ? 'bg-amber-500/20 text-amber-300'
+                                      : 'text-slate-400 hover:text-amber-300'
+                                  }`}
+                                  title={savedByUrl.has(entry.canonicalUrl) ? 'Remove from Saved' : 'Save a private copy'}
+                                >
+                                  {savedByUrl.has(entry.canonicalUrl) ? '★ Saved' : '☆ Save'}
+                                </button>
+                              )}
                               <span
                                 className={`text-xs uppercase font-bold px-2.5 py-0.5 rounded-full shrink-0 ${
                                   entry.entryType === 'post'
@@ -4074,6 +4178,7 @@ export const App: React.FC = () => {
                               >
                                 {entry.entryType === 'post' ? '📝 Wall Post' : entry.entryType}
                               </span>
+                              </div>
                             </div>
 
                             {entry.mediaUrl && (
@@ -6210,6 +6315,12 @@ export const App: React.FC = () => {
                           <li>
                             <strong>Sync All Friends</strong> (top bar or Feed tab) crawls every
                             friend's signed JSON. Each friend card shows when it was last synced.
+                          </li>
+                          <li>
+                            Your feed keeps friends' posts for a window you choose (<strong>Keep</strong> on
+                            the Feed tab, 3 months by default), and files that haven't changed aren't
+                            downloaded again. Use <strong>☆ Save</strong> to keep a private copy of a post
+                            and its image for good, under <strong>Saved</strong>.
                           </li>
                           <li>
                             Use <strong>Mute</strong> or <strong>Block</strong> on a friend or feed

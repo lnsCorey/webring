@@ -35,6 +35,7 @@ import { runScheduledPublish } from '../electron/services/jobs';
 import { isPrivateNetworkAddress } from '../electron/security/networkGuard';
 import { PersonaManager } from '../electron/services/personaManager';
 import { gitBlobSha, SitePublisher } from '../electron/services/publisher';
+import { savePost, unsavePost } from '../electron/services/savedPosts';
 import {
   cleanUpLibrary,
   deletePhotoWithFiles,
@@ -2431,6 +2432,276 @@ describe('Media Library', () => {
     expect(photos[0].mediaUrl).toContain(owner.db.getAlbums()[0].photos[0].sha256!.slice(0, 20));
     owner.db.close();
     friend.db.close();
+  });
+});
+
+describe('History window: published archives, feed window, conditional sync, saved posts', () => {
+  let tempRoot: string;
+
+  beforeEach(() => {
+    tempRoot = fs.mkdtempSync(path.join(os.tmpdir(), 'webring-history-'));
+  });
+
+  afterEach(() => {
+    fs.rmSync(tempRoot, { recursive: true, force: true });
+  });
+
+  const DAY = 86400000;
+  const daysAgo = (n: number) => new Date(Date.now() - n * DAY).toISOString();
+  /** Moves an item (or a feed row) back in time; tests only. */
+  const raw = (db: StudioDatabase) => (db as unknown as { db: { prepare(sql: string): { run(...args: unknown[]): unknown } } }).db;
+  const backdate = (db: StudioDatabase, id: string, iso: string) => raw(db).prepare('UPDATE items SET created_at = ? WHERE id = ?').run(iso, id);
+
+  /** Alice with 70 posts: 40 from the last 40 days and 30 from 100–390 days ago. */
+  const makeAlice = () => {
+    const dir = path.join(tempRoot, 'alice');
+    const db = new StudioDatabase(dir, 'alice.sqlite');
+    db.updateProfile({ siteUrl: 'https://alice.ring.test', displayName: 'Alice' });
+    const posts: Array<{ id: string; canonicalUrl: string; createdAt: string }> = [];
+    for (let i = 0; i < 70; i++) {
+      const post = db.createItem({ type: 'post', commentary: `Post number ${i} <b>bold?</b>` });
+      const createdAt = i < 40 ? daysAgo(i) : daysAgo(100 + (i - 40) * 10);
+      backdate(db, post.id, createdAt);
+      posts.push({ id: post.id, canonicalUrl: post.canonicalUrl, createdAt });
+    }
+    return { db, dir, posts };
+  };
+
+  it('publishes recent items in items.json and older ones in signed, stable monthly archives', () => {
+    const { db, dir } = makeAlice();
+    const out = path.join(dir, 'out');
+    new StaticSiteGenerator(db).generateToDirectory(out);
+    const didDoc = JSON.parse(fs.readFileSync(path.join(out, '.well-known/did.json'), 'utf8'));
+    const key = didDoc.verificationMethod[0].publicKeyPem;
+    const items = JSON.parse(fs.readFileSync(path.join(out, 'api/items.json'), 'utf8'));
+    expect(verifyDocumentSignature(items, key)).toBe(true);
+    expect(items.items).toHaveLength(50); // 40 within 90 days, topped up to the 50 newest
+    expect(items.archive.since).toBe(items.items[49].createdAt);
+    const months = items.archive.months as Array<{ month: string; url: string; count: number }>;
+    expect(months.reduce((n, m) => n + m.count, 0)).toBe(20);
+    const archived: string[] = [];
+    for (const m of months) {
+      expect(m.url).toBe(`/api/archive/items-${m.month}.json`);
+      const doc = JSON.parse(fs.readFileSync(path.join(out, m.url), 'utf8'));
+      expect(verifyDocumentSignature(doc, key)).toBe(true);
+      expect(doc.items.every((i: { createdAt: string }) => i.createdAt.startsWith(m.month))).toBe(true);
+      archived.push(...doc.items.map((i: { id: string }) => i.id));
+    }
+    expect(new Set([...items.items.map((i: { id: string }) => i.id), ...archived]).size).toBe(70);
+
+    // Unchanged months are byte-identical on the next publish (no re-upload); Studio still sees all 70
+    const before = months.map((m) => fs.readFileSync(path.join(out, m.url), 'utf8'));
+    new StaticSiteGenerator(db).generateToDirectory(out);
+    expect(months.map((m) => fs.readFileSync(path.join(out, m.url), 'utf8'))).toEqual(before);
+    expect(db.buildSignedSiteBundle().items.items).toHaveLength(70);
+    expect(db.buildSignedSiteBundle().archives).toBeUndefined();
+    db.close();
+  });
+
+  it('shows Older posts on the page and loads a month in the page layout', async () => {
+    const { db } = makeAlice();
+    for (const theme of ['neo-webring', 'xtraspecial'] as ProfileTheme[]) {
+      db.updateProfile({ theme });
+      const generator = new StaticSiteGenerator(db);
+      const bundle = db.buildSignedSiteBundle({ publish: true });
+      expect(generator.buildStandaloneProfileHtml(bundle)).not.toContain('window.__WEBRING_ARCHIVES__ ='); // fetched, not embedded
+      const preview = generator.buildStandaloneProfileHtml(bundle, { preview: true });
+      expect(preview).toContain('window.__WEBRING_ARCHIVES__ =');
+
+      // A small DOM stand-in that can click a month button
+      const scripts = [...preview.matchAll(/<script(?![^>]*src)[^>]*>([\s\S]*?)<\/script>/g)].map((m) => m[1]);
+      const appended: Array<{ innerHTML: string }> = [];
+      const listeners: Array<(ev: unknown) => unknown> = [];
+      const root = {
+        innerHTML: '',
+        addEventListener: (_type: string, fn: (ev: unknown) => unknown) => listeners.push(fn),
+        querySelectorAll: () => [],
+        querySelector: (sel: string) => (sel === '[data-archive-list]' ? { appendChild: (el: { innerHTML: string }) => appended.push(el) } : null),
+      };
+      const windowStub: Record<string, unknown> = { location: { protocol: 'file:' } };
+      const context = vm.createContext({
+        window: windowStub,
+        document: {
+          body: { className: '', setAttribute: () => undefined, removeAttribute: () => undefined, style: { setProperty: () => undefined } },
+          getElementById: (id: string) => (id === 'profile-root' ? root : null),
+          addEventListener: () => undefined,
+          createElement: () => ({ setAttribute: () => undefined, className: '', innerHTML: '' }),
+        },
+        URLSearchParams,
+        console,
+        setTimeout,
+        parent: { postMessage: () => undefined },
+      });
+      for (const code of scripts) vm.runInContext(code, context);
+      await new Promise((r) => setTimeout(r, 20));
+      expect(root.innerHTML).toContain('Older posts');
+      const month = bundle.items.archive!.months[0];
+      expect(root.innerHTML).toContain(`data-archive-url="${month.url}"`);
+      const button = {
+        disabled: false,
+        classList: { add: () => undefined },
+        setAttribute: () => undefined,
+        getAttribute: (name: string) => (name === 'data-archive-url' ? month.url : 'That month'),
+      };
+      for (const fn of listeners) {
+        await fn({ target: { closest: (sel: string) => (sel === '[data-archive-url]' ? button : null) } });
+      }
+      expect(appended).toHaveLength(1);
+      expect(appended[0].innerHTML).toContain('That month');
+      expect(appended[0].innerHTML).toContain('Post number');
+      expect(appended[0].innerHTML).not.toContain('<b>bold?</b>');
+      expect(appended[0].innerHTML).toContain(theme === 'xtraspecial' ? 'tw-row' : 'card-surface');
+    }
+    db.close();
+  });
+
+  it('keeps a friend\'s archived posts and old comments, and still prunes deletions inside their window', async () => {
+    const alice = makeAlice();
+    const out = path.join(alice.dir, 'out');
+    new StaticSiteGenerator(alice.db).generateToDirectory(out);
+    const bobDb = new StudioDatabase(path.join(tempRoot, 'bob'), 'bob.sqlite');
+    bobDb.updateProfile({ siteUrl: 'https://bob.ring.test', displayName: 'Bob' });
+    bobDb.setFeedRetentionDays(0);
+
+    // Bob's feed already had an archived Alice post, a since-deleted recent one, and an old comment of hers on his post
+    const archivedPost = alice.posts[69];
+    const feedRow = (canonicalUrl: string, createdAt: string) => ({
+      friendSiteUrl: 'https://alice.ring.test', friendName: 'Alice', friendAvatarUrl: '', friendDid: 'did:web:alice.ring.test',
+      entryType: 'post' as const, title: 't', canonicalUrl, targetUrl: canonicalUrl, commentary: '', mediaUrl: '', tags: [],
+      createdAt, verifiedSignature: true,
+    });
+    bobDb.upsertNetworkFeedEntry(feedRow(archivedPost.canonicalUrl, archivedPost.createdAt));
+    bobDb.upsertNetworkFeedEntry(feedRow('https://alice.ring.test/api/items.json#item-item-gone', daysAgo(1)));
+    bobDb.upsertEndorsement({
+      targetCanonicalUrl: 'https://bob.ring.test/api/items.json#item-item-x', authorSiteUrl: 'https://alice.ring.test', authorName: 'Alice',
+      authorAvatarUrl: '', type: 'comment', commentary: 'Nice!', sourceItemUrl: 'https://alice.ring.test/api/items.json#item-item-oldcomment',
+      createdAt: daysAgo(300), verifiedSignature: true,
+    });
+
+    const result = await new RingCrawler(bobDb).crawlFriendSite('https://alice.ring.test', out);
+    expect(result.verifiedSignature).toBe(true);
+    const feedUrls = bobDb.getNetworkFeed().map((f) => f.canonicalUrl);
+    expect(feedUrls).toContain(archivedPost.canonicalUrl);
+    expect(feedUrls).not.toContain('https://alice.ring.test/api/items.json#item-item-gone');
+    expect(bobDb.getEndorsements().some((e) => e.sourceItemUrl.endsWith('item-oldcomment'))).toBe(true);
+    alice.db.close();
+    bobDb.close();
+  });
+
+  it('keeps the feed to the chosen window, without touching saved posts or endorsements', async () => {
+    const alice = makeAlice();
+    const out = path.join(alice.dir, 'out');
+    new StaticSiteGenerator(alice.db).generateToDirectory(out);
+    const bobDir = path.join(tempRoot, 'bob');
+    const bobDb = new StudioDatabase(bobDir, 'bob.sqlite');
+    bobDb.updateProfile({ siteUrl: 'https://bob.ring.test', displayName: 'Bob' });
+    expect(bobDb.getFeedRetentionDays()).toBe(90);
+
+    await new RingCrawler(bobDb).crawlFriendSite('https://alice.ring.test', out);
+    expect(bobDb.getNetworkFeed()).toHaveLength(40); // the 10 older posts in items.json are outside 90 days
+
+    const library = new MediaLibrary(path.join(bobDir, 'media-store'));
+    const keep = bobDb.getNetworkFeed().find((f) => f.createdAt < daysAgo(20))!;
+    const saved = await savePost(bobDb, library, keep.canonicalUrl, { note: 'try this' });
+    bobDb.setFetchValidators('https://alice.ring.test/api/items.json', 'https://alice.ring.test', { etag: '"v1"' });
+
+    expect(bobDb.setFeedRetentionDays(7).pruned).toBe(33); // days 7–39
+    expect(bobDb.getNetworkFeed().every((f) => f.createdAt >= daysAgo(7))).toBe(true);
+    expect(bobDb.getSavedPosts()).toMatchObject([{ id: saved.id, note: 'try this', canonicalUrl: keep.canonicalUrl }]);
+    expect(bobDb.getFetchValidators('https://alice.ring.test/api/items.json')).not.toBeNull(); // narrowing keeps the cache
+    bobDb.setFeedRetentionDays(30);
+    expect(bobDb.getFetchValidators('https://alice.ring.test/api/items.json')).toBeNull(); // widening downloads again
+    alice.db.close();
+    bobDb.close();
+  });
+
+  it('skips unchanged files using ETag / Last-Modified, and only remembers verified ones', async () => {
+    const alice = makeAlice();
+    const out = path.join(alice.dir, 'out');
+    new StaticSiteGenerator(alice.db).generateToDirectory(out);
+    const bobDb = new StudioDatabase(path.join(tempRoot, 'bob'), 'bob.sqlite');
+    bobDb.updateProfile({ siteUrl: 'https://bob.ring.test', displayName: 'Bob' });
+    const fileFor = (url: string) => path.join(out, new URL(url).pathname);
+    const plain = async (url: string) => JSON.parse(fs.readFileSync(fileFor(url), 'utf8'));
+    const sent: Array<{ url: string; validators: unknown }> = [];
+    const conditional = async (url: string, validators: { etag: string; lastModified: string } | null) => {
+      sent.push({ url, validators });
+      if (validators?.etag === `"${path.basename(url)}"`) return { notModified: true as const };
+      return { json: await plain(url), etag: `"${path.basename(url)}"`, lastModified: 'Mon, 26 Oct 2026 10:00:00 GMT' };
+    };
+    const crawler = new RingCrawler(bobDb, plain, conditional);
+
+    const first = await crawler.crawlFriendSite('https://alice.ring.test');
+    expect(first.success).toBe(true);
+    expect(first.unchanged).toBeUndefined();
+    expect(sent.every((s) => s.validators === null)).toBe(true);
+    const feedSize = bobDb.getNetworkFeed().length;
+
+    sent.length = 0;
+    const second = await crawler.crawlFriendSite('https://alice.ring.test');
+    expect(second.unchanged).toEqual(['/api/albums.json', '/api/items.json']);
+    expect(sent.find((s) => s.url.endsWith('/api/items.json'))!.validators).toEqual({
+      etag: '"items.json"',
+      lastModified: 'Mon, 26 Oct 2026 10:00:00 GMT',
+    });
+    expect(bobDb.getNetworkFeed()).toHaveLength(feedSize); // nothing reprocessed or pruned
+    alice.db.close();
+    bobDb.close();
+  });
+
+  it('saves a private copy of a friend\'s post with its image, never published, removed on unsave', async () => {
+    const bobDir = path.join(tempRoot, 'bob');
+    const bobDb = new StudioDatabase(bobDir, 'bob.sqlite');
+    bobDb.updateProfile({ siteUrl: 'https://bob.ring.test', displayName: 'Bob' });
+    const library = new MediaLibrary(path.join(bobDir, 'media-store'));
+    const url = 'https://alice.ring.test/api/items.json#item-item-recipe';
+    bobDb.upsertNetworkFeedEntry({
+      friendSiteUrl: 'https://alice.ring.test', friendName: 'Alice', friendAvatarUrl: '', friendDid: 'did:web:alice.ring.test',
+      entryType: 'post', title: 'Pancakes', canonicalUrl: url, targetUrl: url, commentary: '## Recipe\n\n- flour', tags: ['food'],
+      mediaUrl: 'https://alice.ring.test/media/pancakes.jpg', createdAt: daysAgo(3), verifiedSignature: true,
+    });
+    const pixels = Buffer.alloc(64 * 48 * 4, 200);
+    const jpeg = jpegJs.encode({ data: pixels, width: 64, height: 48 }, 90).data;
+    const fetched: string[] = [];
+    const saved = await savePost(bobDb, library, url, {
+      fetchImage: async (u) => {
+        fetched.push(u);
+        return { body: Buffer.concat([jpeg.subarray(0, 2), Buffer.from([0xff, 0xfe, 0, 12]), Buffer.from('GPS-SECRET'), jpeg.subarray(2)]), contentType: 'image/jpeg' };
+      },
+    });
+    expect(fetched).toEqual(['https://alice.ring.test/media/pancakes.jpg']);
+    expect(saved).toMatchObject({ title: 'Pancakes', commentary: '## Recipe\n\n- flour', tags: ['food'], verifiedSignature: true });
+    expect(saved.localMediaUrl).toMatch(/^media\/saved\/[0-9a-f]{20}\.jpg$/);
+    const file = library.resolveLocalUrl(saved.localMediaUrl)!;
+    expect(fs.readFileSync(file).includes(Buffer.from('GPS-SECRET'))).toBe(false);
+    expect((await savePost(bobDb, library, url)).id).toBe(saved.id); // saving twice keeps one copy
+
+    // Survives the friend leaving the feed and library clean-up; never published
+    raw(bobDb).prepare('DELETE FROM network_feed').run();
+    cleanUpLibrary(bobDb, library);
+    expect(fs.existsSync(file)).toBe(true);
+    expect(bobDb.getLocalMediaReferences().urls.has(saved.localMediaUrl)).toBe(false);
+    const out = path.join(bobDir, 'out');
+    new StaticSiteGenerator(bobDb, path.join(bobDir, 'media-store')).generateToDirectory(out);
+    expect(fs.existsSync(path.join(out, saved.localMediaUrl))).toBe(false);
+    expect(fs.readFileSync(path.join(out, 'api/items.json'), 'utf8')).not.toContain('Pancakes');
+
+    unsavePost(bobDb, library, saved.id);
+    expect(bobDb.getSavedPosts()).toEqual([]);
+    expect(fs.existsSync(file)).toBe(false);
+    // A failed image download still saves the post
+    bobDb.upsertNetworkFeedEntry({
+      friendSiteUrl: 'https://alice.ring.test', friendName: 'Alice', friendAvatarUrl: '', friendDid: '', entryType: 'photo', title: 'Gone',
+      canonicalUrl: 'https://alice.ring.test/api/albums.json#photo-1', targetUrl: '', commentary: '', tags: [],
+      mediaUrl: 'https://alice.ring.test/media/gone.jpg', createdAt: daysAgo(1), verifiedSignature: false,
+    });
+    const noImage = await savePost(bobDb, library, 'https://alice.ring.test/api/albums.json#photo-1', {
+      fetchImage: async () => {
+        throw new Error('404');
+      },
+    });
+    expect(noImage.localMediaUrl).toBe('');
+    bobDb.close();
   });
 });
 

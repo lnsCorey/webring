@@ -275,6 +275,28 @@ export interface NetworkFeedEntry {
   verifiedSignature: boolean;
 }
 
+/** A friend's post or photo the user saved: a private copy kept outside the feed window. */
+export interface SavedPost {
+  id: string;
+  canonicalUrl: string;
+  friendSiteUrl: string;
+  friendName: string;
+  friendAvatarUrl: string;
+  entryType: NetworkFeedEntry['entryType'];
+  title: string;
+  commentary: string;
+  targetUrl: string;
+  /** The image on the friend's site. */
+  mediaUrl: string;
+  /** Studio's copy of the image (media/saved/...), never published; empty if it couldn't be saved. */
+  localMediaUrl: string;
+  tags: string[];
+  note: string;
+  createdAt: string;
+  savedAt: string;
+  verifiedSignature: boolean;
+}
+
 interface SqlStatementAdapter {
   get(...params: unknown[]): unknown;
   all(...params: unknown[]): unknown[];
@@ -334,6 +356,22 @@ export interface StudioDatabaseOptions {
     theme?: ProfileTheme;
     atprotoHandle?: string;
   };
+}
+
+/** Friends' posts stay in the feed this many days unless the user picks another window (0 = forever). */
+export const DEFAULT_FEED_RETENTION_DAYS = 90;
+
+/** Published items.json keeps the last PUBLISH_WINDOW_DAYS, and never fewer than PUBLISH_MIN_RECENT items. */
+export const PUBLISH_WINDOW_DAYS = 90;
+export const PUBLISH_MIN_RECENT = 50;
+
+/** Splits items (newest first) into the recent ones for items.json and the older ones for archives. */
+export function splitItemsForPublishing(items: SharedItem[], nowMs: number): { recent: SharedItem[]; archived: SharedItem[] } {
+  const sorted = [...items].sort((a, b) => b.createdAt.localeCompare(a.createdAt));
+  const cutoff = new Date(nowMs - PUBLISH_WINDOW_DAYS * 86400000).toISOString();
+  let split = sorted.findIndex((item, index) => index >= PUBLISH_MIN_RECENT && item.createdAt < cutoff);
+  if (split === -1) split = sorted.length;
+  return { recent: sorted.slice(0, split), archived: sorted.slice(split) };
 }
 
 /** An item's title, or one derived from its text when left empty (as when it was created). */
@@ -724,6 +762,40 @@ export class StudioDatabase {
         site_url TEXT PRIMARY KEY,
         action TEXT NOT NULL CHECK (action IN ('mute', 'block')),
         created_at TEXT NOT NULL
+      );
+
+      -- Local-only preferences (never exported), e.g. how long friends' posts stay in the feed
+      CREATE TABLE IF NOT EXISTS local_settings (
+        key TEXT PRIMARY KEY,
+        value TEXT NOT NULL
+      );
+
+      -- HTTP validators for friends' JSON files, so unchanged files aren't downloaded again
+      CREATE TABLE IF NOT EXISTS fetch_cache (
+        url TEXT PRIMARY KEY,
+        site_url TEXT NOT NULL,
+        etag TEXT NOT NULL DEFAULT '',
+        last_modified TEXT NOT NULL DEFAULT ''
+      );
+
+      -- Friends' posts and photos the user saved: a private copy, kept beyond the feed window
+      CREATE TABLE IF NOT EXISTS saved_posts (
+        id TEXT PRIMARY KEY,
+        canonical_url TEXT NOT NULL UNIQUE,
+        friend_site_url TEXT NOT NULL,
+        friend_name TEXT NOT NULL DEFAULT '',
+        friend_avatar_url TEXT NOT NULL DEFAULT '',
+        entry_type TEXT NOT NULL,
+        title TEXT NOT NULL DEFAULT '',
+        commentary TEXT NOT NULL DEFAULT '',
+        target_url TEXT NOT NULL DEFAULT '',
+        media_url TEXT NOT NULL DEFAULT '',
+        local_media_url TEXT NOT NULL DEFAULT '',
+        tags_json TEXT NOT NULL DEFAULT '[]',
+        note TEXT NOT NULL DEFAULT '',
+        created_at TEXT NOT NULL,
+        saved_at TEXT NOT NULL,
+        verified_signature INTEGER NOT NULL DEFAULT 0
       );
     `);
 
@@ -1754,6 +1826,7 @@ export class StudioDatabase {
       if (row) {
         this.db.prepare('DELETE FROM network_feed WHERE friend_site_url = ?').run(row.site_url);
         this.db.prepare('DELETE FROM endorsements WHERE author_site_url = ?').run(row.site_url);
+        this.db.prepare('DELETE FROM fetch_cache WHERE site_url = ?').run(row.site_url);
       }
       this.db.prepare('DELETE FROM friends WHERE id = ?').run(friendId);
     });
@@ -1777,14 +1850,19 @@ export class StudioDatabase {
   public pruneFriendFeed(
     friendSiteUrl: string,
     scope: 'photos' | 'items',
-    keepCanonicalUrls: string[]
+    keepCanonicalUrls: string[],
+    /** The friend publishes only items from here on (items.json `archive.since`); older ones are archived, not deleted. */
+    sinceIso?: string
   ): number {
     const keep = new Set(keepCanonicalUrls);
     const rows = this.db
-      .prepare('SELECT id, canonical_url, entry_type FROM network_feed WHERE friend_site_url = ?')
-      .all(normalizeSiteUrl(friendSiteUrl)) as Array<{ id: string; canonical_url: string; entry_type: string }>;
+      .prepare('SELECT id, canonical_url, entry_type, created_at FROM network_feed WHERE friend_site_url = ?')
+      .all(normalizeSiteUrl(friendSiteUrl)) as Array<{ id: string; canonical_url: string; entry_type: string; created_at: string }>;
     const stale = rows.filter(
-      (r) => (scope === 'photos') === (r.entry_type === 'photo') && !keep.has(r.canonical_url)
+      (r) =>
+        (scope === 'photos') === (r.entry_type === 'photo') &&
+        !keep.has(r.canonical_url) &&
+        (!sinceIso || r.created_at >= sinceIso)
     );
     this.transaction(() => {
       for (const r of stale) {
@@ -1797,18 +1875,85 @@ export class StudioDatabase {
   /**
    * Deletes endorsements from a friend whose source item is no longer in their items.json.
    */
-  public pruneEndorsementsFrom(authorSiteUrl: string, keepSourceItemUrls: string[]): number {
+  public pruneEndorsementsFrom(authorSiteUrl: string, keepSourceItemUrls: string[], sinceIso?: string): number {
     const keep = new Set(keepSourceItemUrls);
     const rows = this.db
-      .prepare('SELECT id, source_item_url FROM endorsements WHERE author_site_url = ?')
-      .all(normalizeSiteUrl(authorSiteUrl)) as Array<{ id: string; source_item_url: string }>;
-    const stale = rows.filter((r) => !keep.has(r.source_item_url));
+      .prepare('SELECT id, source_item_url, created_at FROM endorsements WHERE author_site_url = ?')
+      .all(normalizeSiteUrl(authorSiteUrl)) as Array<{ id: string; source_item_url: string; created_at: string }>;
+    // Endorsements older than the friend's published window are in their archives, not deleted
+    const stale = rows.filter((r) => !keep.has(r.source_item_url) && (!sinceIso || r.created_at >= sinceIso));
     this.transaction(() => {
       for (const r of stale) {
         this.db.prepare('DELETE FROM endorsements WHERE id = ?').run(r.id);
       }
     });
     return stale.length;
+  }
+
+  // ---------------------------------------------------------------------------
+  // Feed window and fetch cache
+
+  /** How many days friends' posts stay in the feed; 0 = forever. */
+  public getFeedRetentionDays(): number {
+    const row = this.db.prepare("SELECT value FROM local_settings WHERE key = 'feedRetentionDays'").get() as
+      | { value: string }
+      | undefined;
+    const days = row ? Number(row.value) : DEFAULT_FEED_RETENTION_DAYS;
+    return Number.isFinite(days) && days >= 0 ? Math.floor(days) : DEFAULT_FEED_RETENTION_DAYS;
+  }
+
+  /**
+   * Changes the feed window and applies it now. A wider window forgets the fetch cache, so the
+   * next sync downloads friends' files again and brings back the older entries.
+   */
+  public setFeedRetentionDays(days: number): { days: number; pruned: number } {
+    const next = Math.max(0, Math.floor(Number(days) || 0));
+    const previous = this.getFeedRetentionDays();
+    this.db
+      .prepare("INSERT INTO local_settings (key, value) VALUES ('feedRetentionDays', ?) ON CONFLICT(key) DO UPDATE SET value = excluded.value")
+      .run(String(next));
+    if (next === 0 || (previous !== 0 && next > previous)) this.clearFetchCache();
+    return { days: next, pruned: this.pruneFeedOutsideWindow() };
+  }
+
+  /** Oldest createdAt the feed keeps, or null for forever. */
+  public feedCutoffIso(nowMs = Date.now()): string | null {
+    const days = this.getFeedRetentionDays();
+    return days > 0 ? new Date(nowMs - days * 86400000).toISOString() : null;
+  }
+
+  /** Removes feed rows older than the window. Saved posts and endorsements aren't touched. */
+  public pruneFeedOutsideWindow(nowMs = Date.now()): number {
+    const cutoff = this.feedCutoffIso(nowMs);
+    if (!cutoff) return 0;
+    const result = this.db.prepare('DELETE FROM network_feed WHERE created_at < ?').run(cutoff) as { changes?: number | bigint };
+    return Number(result.changes || 0);
+  }
+
+  public getFetchValidators(url: string): { etag: string; lastModified: string } | null {
+    const row = this.db.prepare('SELECT etag, last_modified FROM fetch_cache WHERE url = ?').get(url) as
+      | { etag: string; last_modified: string }
+      | undefined;
+    return row && (row.etag || row.last_modified) ? { etag: row.etag, lastModified: row.last_modified } : null;
+  }
+
+  public setFetchValidators(url: string, siteUrl: string, validators: { etag?: string; lastModified?: string }): void {
+    if (!validators.etag && !validators.lastModified) {
+      this.db.prepare('DELETE FROM fetch_cache WHERE url = ?').run(url);
+      return;
+    }
+    this.db
+      .prepare(
+        `INSERT INTO fetch_cache (url, site_url, etag, last_modified) VALUES (?, ?, ?, ?)
+         ON CONFLICT(url) DO UPDATE SET site_url = excluded.site_url, etag = excluded.etag, last_modified = excluded.last_modified`
+      )
+      .run(url, normalizeSiteUrl(siteUrl), validators.etag || '', validators.lastModified || '');
+  }
+
+  /** Forgets cached validators (all, or one site's), so the next sync downloads everything. */
+  public clearFetchCache(siteUrl?: string): void {
+    if (siteUrl) this.db.prepare('DELETE FROM fetch_cache WHERE site_url = ?').run(normalizeSiteUrl(siteUrl));
+    else this.db.exec('DELETE FROM fetch_cache');
   }
 
   public getModeration(): ModerationEntry[] {
@@ -1841,6 +1986,8 @@ export class StudioDatabase {
     } else {
       this.db.prepare('DELETE FROM moderation WHERE site_url = ?').run(normalized);
     }
+    // Muting or blocking can hide or drop their entries; download in full next time
+    this.clearFetchCache(normalized);
     return this.getModeration();
   }
 
@@ -2415,6 +2562,84 @@ export class StudioDatabase {
     }));
   }
 
+  // ---------------------------------------------------------------------------
+  // Saved posts (private: never exported or published)
+
+  /** Saves a copy of a feed entry; saving it again keeps the existing copy and note. */
+  public saveFeedEntry(canonicalUrl: string, note = ''): SavedPost {
+    const existing = this.getSavedPosts().find((s) => s.canonicalUrl === canonicalUrl);
+    if (existing) return existing;
+    const entry = this.db.prepare('SELECT * FROM network_feed WHERE canonical_url = ?').get(canonicalUrl) as
+      | Record<string, unknown>
+      | undefined;
+    if (!entry) throw new Error('That post is no longer in your feed.');
+    const id = `saved-${crypto.randomBytes(4).toString('hex')}`;
+    this.db
+      .prepare(
+        `INSERT INTO saved_posts (id, canonical_url, friend_site_url, friend_name, friend_avatar_url, entry_type, title,
+          commentary, target_url, media_url, tags_json, note, created_at, saved_at, verified_signature)
+         VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)`
+      )
+      .run(
+        id,
+        canonicalUrl,
+        String(entry.friend_site_url),
+        String(entry.friend_name || ''),
+        String(entry.friend_avatar_url || ''),
+        String(entry.entry_type),
+        String(entry.title || ''),
+        String(entry.commentary || ''),
+        String(entry.target_url || ''),
+        String(entry.media_url || ''),
+        String(entry.tags_json || '[]'),
+        note.slice(0, 2000),
+        String(entry.created_at),
+        new Date().toISOString(),
+        entry.verified_signature ? 1 : 0
+      );
+    return this.getSavedPosts().find((s) => s.id === id)!;
+  }
+
+  public getSavedPosts(): SavedPost[] {
+    const rows = this.db.prepare('SELECT * FROM saved_posts ORDER BY saved_at DESC').all() as Array<Record<string, unknown>>;
+    return rows.map((r) => ({
+      id: String(r.id),
+      canonicalUrl: String(r.canonical_url),
+      friendSiteUrl: String(r.friend_site_url),
+      friendName: String(r.friend_name || ''),
+      friendAvatarUrl: String(r.friend_avatar_url || ''),
+      entryType: r.entry_type as SavedPost['entryType'],
+      title: String(r.title || ''),
+      commentary: String(r.commentary || ''),
+      targetUrl: String(r.target_url || ''),
+      mediaUrl: String(r.media_url || ''),
+      localMediaUrl: String(r.local_media_url || ''),
+      tags: JSON.parse(String(r.tags_json || '[]')),
+      note: String(r.note || ''),
+      createdAt: String(r.created_at),
+      savedAt: String(r.saved_at),
+      verifiedSignature: Boolean(r.verified_signature),
+    }));
+  }
+
+  public setSavedLocalMedia(savedId: string, localMediaUrl: string): void {
+    this.db.prepare('UPDATE saved_posts SET local_media_url = ? WHERE id = ?').run(localMediaUrl, savedId);
+  }
+
+  public updateSavedNote(savedId: string, note: string): void {
+    this.db.prepare('UPDATE saved_posts SET note = ? WHERE id = ?').run(String(note || '').slice(0, 2000), savedId);
+  }
+
+  public deleteSavedPost(savedId: string): void {
+    this.db.prepare('DELETE FROM saved_posts WHERE id = ?').run(savedId);
+  }
+
+  /** Library files saved posts use; kept by clean-up but never published. */
+  public getSavedMediaReferences(): Set<string> {
+    const rows = this.db.prepare("SELECT local_media_url AS u FROM saved_posts WHERE local_media_url LIKE 'media/%'").all() as Array<{ u: string }>;
+    return new Set(rows.map((r) => r.u));
+  }
+
   /**
    * The feed as the user has curated it: muted and blocked sites removed. Unverified entries
    * stay (they're badged in the UI) but are counted so the user can see how many there are.
@@ -2530,7 +2755,11 @@ export class StudioDatabase {
       );
   }
 
-  public buildSignedSiteBundle(): CompleteSiteBundle {
+  /**
+   * The signed site. Studio uses it with all items; with `publish`, items.json holds only the
+   * recent window and older items go to signed monthly archives (`bundle.archives`).
+   */
+  public buildSignedSiteBundle(options: { publish?: boolean } = {}): CompleteSiteBundle {
     const rawProfile = this.getProfile();
     const publishSettings = rawProfile.publishSettings;
     const { publicKeyPem, privateKeyPem } = this.getKeys();
@@ -2589,12 +2818,40 @@ export class StudioDatabase {
         }))
       : rawItems;
 
+    const { recent, archived } = options.publish
+      ? splitItemsForPublishing(exportedItems, Date.now())
+      : { recent: exportedItems, archived: [] as SharedItem[] };
+    const archives: Array<{ path: string; doc: ItemsDocument }> = [];
+    const byMonth = new Map<string, SharedItem[]>();
+    for (const item of archived) {
+      const month = item.createdAt.slice(0, 7);
+      byMonth.set(month, [...(byMonth.get(month) || []), item]);
+    }
+    for (const [month, monthItems] of [...byMonth.entries()].sort((a, b) => b[0].localeCompare(a[0]))) {
+      // Signed at the month's last change, so an unchanged month is byte-identical every publish
+      const lastChange = monthItems.map((i) => i.updatedAt || i.createdAt).sort().pop()!;
+      const doc: ItemsDocument = { schemaVersion: WEBRING_SCHEMA_VERSION, siteUrl, did, updatedAt: lastChange, items: monthItems };
+      archives.push({ path: `api/archive/items-${month}.json`, doc: signDocument(doc, did, privateKeyPem, lastChange) });
+    }
+
     const itemsUnsigned: ItemsDocument = {
       schemaVersion: WEBRING_SCHEMA_VERSION,
       siteUrl,
       did,
       updatedAt: now,
-      items: exportedItems,
+      items: recent,
+      ...(archives.length
+        ? {
+            archive: {
+              since: recent.length ? recent[recent.length - 1].createdAt : archived[0].createdAt,
+              months: archives.map(({ path: archivePath, doc }) => ({
+                month: archivePath.slice(-12, -5),
+                url: `/${archivePath}`,
+                count: doc.items.length,
+              })),
+            },
+          }
+        : {}),
     };
     const items = signDocument(itemsUnsigned, did, privateKeyPem);
 
@@ -2654,6 +2911,7 @@ export class StudioDatabase {
       albums,
       items,
       connections,
+      ...(options.publish ? { archives } : {}),
     };
   }
 
