@@ -3778,9 +3778,9 @@ export const App: React.FC = () => {
                     return (
                       <div
                         key={friend.id}
-                        className="bg-slate-900 border border-slate-800 rounded-xl p-4 flex items-center justify-between gap-4"
+                        className="bg-slate-900 border border-slate-800 rounded-xl p-4 flex flex-col gap-3"
                       >
-                        <div className="flex items-center gap-3 min-w-0">
+                        <div className="flex items-start gap-3 min-w-0">
                           <img
                             src={
                               friend.avatarUrl ||
@@ -3789,13 +3789,13 @@ export const App: React.FC = () => {
                               )}`
                             }
                             alt={friend.displayName}
-                            className="w-12 h-12 rounded-full object-cover bg-slate-800"
+                            className="w-12 h-12 rounded-full object-cover bg-slate-800 shrink-0"
                           />
-                          <div className="min-w-0">
-                            <div className="flex flex-wrap items-center gap-2">
-                              <h4 className="font-bold text-sm truncate">{friend.displayName}</h4>
+                          <div className="min-w-0 flex-1">
+                            <h4 className="font-bold text-sm truncate">{friend.displayName}</h4>
+                            <div className="flex flex-wrap items-center gap-1.5 mt-1">
                               <span
-                                className={`text-[10px] px-2 py-0.5 rounded-full font-medium ${
+                                className={`text-[10px] px-2 py-0.5 rounded-full font-medium whitespace-nowrap ${
                                   isActuallyExported
                                     ? 'bg-amber-500/20 text-amber-300'
                                     : 'bg-emerald-500/20 text-emerald-300'
@@ -3809,7 +3809,7 @@ export const App: React.FC = () => {
                               </span>
                               {friend.keyStatus === 'pinned' && (
                                 <span
-                                  className="text-[10px] px-2 py-0.5 rounded-full font-medium bg-indigo-500/20 text-indigo-300 border border-indigo-500/30"
+                                  className="text-[10px] px-2 py-0.5 rounded-full font-medium whitespace-nowrap bg-indigo-500/20 text-indigo-300 border border-indigo-500/30"
                                   title="Ed25519 Public Key Pinned via Trust-On-First-Use (TOFU)"
                                 >
                                   🔐 Key Pinned (TOFU)
@@ -3817,14 +3817,14 @@ export const App: React.FC = () => {
                               )}
                               {friend.keyStatus === 'changed' && (
                                 <span
-                                  className="text-[10px] px-2 py-0.5 rounded-full font-bold bg-rose-500/20 text-rose-300 border border-rose-500/40"
+                                  className="text-[10px] px-2 py-0.5 rounded-full font-bold whitespace-nowrap bg-rose-500/20 text-rose-300 border border-rose-500/40"
                                   title="WARNING: Friend domain's Ed25519 key in did.json changed unexpectedly! Signatures rejected."
                                 >
                                   🚨 Key Changed Warning!
                                 </span>
                               )}
                             </div>
-                            <p className="text-xs text-indigo-400 font-mono truncate">
+                            <p className="text-xs text-indigo-400 font-mono truncate mt-1.5" title={friend.siteUrl}>
                               {friend.siteUrl}
                             </p>
                             <p
@@ -3837,12 +3837,16 @@ export const App: React.FC = () => {
                               {moderationFor(friend.siteUrl) === 'mute' && ' · Muted'}
                               {moderationFor(friend.siteUrl) === 'block' && ' · Blocked'}
                             </p>
-                            <p className="text-xs text-slate-400 truncate mt-0.5">{friend.bio}</p>
-                            <div className="flex gap-1 mt-1">
+                            {friend.bio && (
+                              <p className="text-xs text-slate-400 line-clamp-2 mt-1" title={friend.bio}>
+                                {friend.bio}
+                              </p>
+                            )}
+                            <div className="flex flex-wrap gap-1 mt-1.5">
                               {friend.relationship.map((r) => (
                                 <span
                                   key={r}
-                                  className="text-[10px] px-2 py-0.5 rounded bg-slate-800 text-slate-300"
+                                  className="text-[10px] px-2 py-0.5 rounded bg-slate-800 text-slate-300 whitespace-nowrap"
                                 >
                                   {r}
                                 </span>
@@ -3850,7 +3854,7 @@ export const App: React.FC = () => {
                             </div>
                           </div>
                         </div>
-                        <div className="flex items-center gap-2 shrink-0">
+                        <div className="flex flex-wrap items-center gap-2 pt-3 border-t border-slate-800">
                           <button
                             onClick={async () => {
                               const nextVis: FriendVisibility = isPublic ? 'private' : 'public';
@@ -3933,7 +3937,9 @@ export const App: React.FC = () => {
                               await window.studioApi?.deleteFriend(friend.id);
                               await refreshStudioData();
                             }}
-                            className="text-slate-500 hover:text-rose-400 p-1"
+                            className="ml-auto text-slate-500 hover:text-rose-400 p-1"
+                            title={`Remove ${friend.displayName}`}
+                            aria-label={`Remove ${friend.displayName}`}
                           >
                             <Trash2 className="w-4 h-4" />
                           </button>
