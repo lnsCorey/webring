@@ -1,13 +1,18 @@
-import { HostedRing, JoinedRing, StudioDatabase } from '../db/database';
+import { FriendNotice, HostedRing, JoinedRing, StudioDatabase } from '../db/database';
 import {
+  buildFriendNoticeUri,
   buildRingRequestUri,
   computeRingNeighbors,
   ConnectionsDocumentSchema,
+  decodeFriendNoticeToken,
   decodeRingRequestToken,
   DidDocumentSchema,
+  encodeFriendNoticeToken,
   encodeRingRequestToken,
+  FriendNoticeDocument,
   isUrlWithinSite,
   normalizeSiteUrl,
+  parseFriendNoticeUri,
   parseRingRequestUri,
   publicKeyFingerprint,
   RingJoinRequest,
@@ -27,6 +32,8 @@ const REQUEST_CLOCK_SKEW_MS = 5 * 60 * 1000;
 export const RING_APPROVAL_GRACE_MS = 14 * 24 * 60 * 60 * 1000;
 /** A member whose site can't be verified for this long is flagged to the maintainer. */
 export const RING_MEMBER_FLAG_AFTER_MS = 7 * 24 * 60 * 60 * 1000;
+/** Most ring members checked for "added you" per sync, so a huge ring can't stall Sync All. */
+export const RING_DISCOVERY_MAX_SITES = 200;
 
 export interface VerifiedHub {
   doc: WebringHubDocument;
@@ -43,6 +50,13 @@ export interface RingRequestReview {
   applicant: { siteUrl: string; displayName: string; did: string; keyFingerprint: string };
   state: 'new' | 'already-member' | 'banned';
   banReason?: string;
+}
+
+export interface FriendNoticeReview {
+  token: string;
+  notice: FriendNoticeDocument;
+  sender: { siteUrl: string; displayName: string; avatarUrl: string; did: string; keyFingerprint: string };
+  state: 'new' | 'already-friend' | 'blocked';
 }
 
 export interface JoinedRingSyncResult {
@@ -281,7 +295,7 @@ export class RingService {
    */
   private async fetchMemberConnections(
     siteUrl: string
-  ): Promise<{ hubUrls: string[]; displayName?: string }> {
+  ): Promise<{ hubUrls: string[]; friendUrls: string[] }> {
     const normalized = normalizeSiteUrl(siteUrl);
     const key = await this.fetchSiteKey(normalized);
     if (key.keyChanged) {
@@ -307,7 +321,10 @@ export class RingService {
     if (normalizeSiteUrl(connections.siteUrl) !== normalized || connections.did !== key.did) {
       throw new Error('connections.json belongs to a different site');
     }
-    return { hubUrls: connections.webrings.map((w) => w.hubUrl.trim()) };
+    return {
+      hubUrls: connections.webrings.map((w) => w.hubUrl.trim()),
+      friendUrls: connections.friends.map((f) => normalizeSiteUrl(f.siteUrl)),
+    };
   }
 
   // ---------------------------------------------------------------------------
@@ -317,6 +334,7 @@ export class RingService {
   public async syncJoinedRings(): Promise<JoinedRingSyncResult[]> {
     const mySiteUrl = normalizeSiteUrl(this.db.getProfile().siteUrl);
     const results: JoinedRingSyncResult[] = [];
+    const discovery = { checked: new Set<string>() };
     for (const ring of this.db.getJoinedRings()) {
       if (ring.status === 'removed' || ring.status === 'closed') continue;
       const now = new Date().toISOString();
@@ -368,6 +386,7 @@ export class RingService {
           nextSiteUrl: neighbors.nextSiteUrl ?? null,
           memberCount: neighbors.memberCount,
         });
+        if (hub.verified) await this.discoverRingFriends(doc, mySiteUrl, discovery);
         results.push({ hubUrl: ring.hubUrl, name: doc.name, outcome: 'member' });
       } else if (ring.status === 'requested') {
         this.db.upsertJoinedRing(common);
@@ -384,6 +403,125 @@ export class RingService {
       }
     }
     return results;
+  }
+
+  /**
+   * Notes ring members who list this persona as a public friend in their verified connections.json.
+   * Members who are already friends or blocked aren't fetched; each site is checked once per sync,
+   * up to RING_DISCOVERY_MAX_SITES. Unreachable or unverifiable sites are skipped.
+   */
+  private async discoverRingFriends(
+    doc: WebringHubDocument,
+    mySiteUrl: string,
+    discovery: { checked: Set<string> }
+  ): Promise<void> {
+    const friendUrls = new Set(this.db.getFriends().map((f) => normalizeSiteUrl(f.siteUrl)));
+    for (const member of doc.members) {
+      if (discovery.checked.size >= RING_DISCOVERY_MAX_SITES) return;
+      const siteUrl = normalizeSiteUrl(member.siteUrl);
+      if (siteUrl === mySiteUrl || friendUrls.has(siteUrl) || discovery.checked.has(siteUrl)) continue;
+      if (this.db.getModerationAction(siteUrl) === 'block') continue;
+      discovery.checked.add(siteUrl);
+      try {
+        const { friendUrls: theirFriends } = await this.fetchMemberConnections(siteUrl);
+        if (theirFriends.includes(mySiteUrl)) {
+          this.db.upsertFriendNotice({ siteUrl, displayName: member.displayName, source: 'ring', ringName: doc.name });
+        }
+      } catch {
+        // Not reachable or not verifiable: no news
+      }
+    }
+  }
+
+  // ---------------------------------------------------------------------------
+  // Friend notices ("I added you")
+
+  /**
+   * Returns a private signed link telling `friendSiteUrl` that this persona added them. The site
+   * must already be published, so the recipient can check the signature against its did.json.
+   */
+  public createFriendNotice(friendSiteUrl: string): { link: string; notice: FriendNoticeDocument } {
+    const profile = this.db.getProfile();
+    const siteUrl = normalizeSiteUrl(profile.siteUrl);
+    const did = siteUrlToDidWeb(siteUrl);
+    const avatarUrl = absoluteSiteUrl(profile.avatarUrl, siteUrl);
+    const unsigned: FriendNoticeDocument = {
+      type: 'webring-friend-notice',
+      version: 1,
+      siteUrl,
+      did,
+      displayName: profile.displayName.slice(0, 120),
+      ...(avatarUrl ? { avatarUrl } : {}),
+      friendUrl: normalizeSiteUrl(friendSiteUrl),
+      createdAt: new Date().toISOString(),
+    };
+    const notice = signDocument(unsigned, did, this.db.getKeys().privateKeyPem);
+    return { link: buildFriendNoticeUri(encodeFriendNoticeToken(notice)), notice };
+  }
+
+  /**
+   * Checks a friend-notice link without changing anything: addressed to this persona, not expired,
+   * and signed by the sender's own (pinned) site key.
+   */
+  public async reviewFriendNotice(linkOrToken: string): Promise<FriendNoticeReview> {
+    const token = parseFriendNoticeUri(linkOrToken);
+    if (!token) throw new Error('That isn’t a friend notice link.');
+    let notice: FriendNoticeDocument;
+    try {
+      notice = decodeFriendNoticeToken(token);
+    } catch {
+      throw new Error('The friend notice link is damaged or incomplete.');
+    }
+    const mySiteUrl = normalizeSiteUrl(this.db.getProfile().siteUrl);
+    if (normalizeSiteUrl(notice.friendUrl) !== mySiteUrl) {
+      throw new Error(
+        `This link is for ${notice.friendUrl}, not the active persona (${mySiteUrl}). Switch to that persona and try again.`
+      );
+    }
+    const siteUrl = normalizeSiteUrl(notice.siteUrl);
+    if (notice.did !== siteUrlToDidWeb(siteUrl)) {
+      throw new Error('The link’s identity doesn’t match its site.');
+    }
+    const age = Date.now() - new Date(notice.createdAt).getTime();
+    if (!(age < REQUEST_MAX_AGE_MS && age > -REQUEST_CLOCK_SKEW_MS)) {
+      throw new Error('This link has expired. Ask them to send a new one.');
+    }
+    const key = await this.fetchSiteKey(siteUrl);
+    if (key.keyChanged) {
+      throw new Error(`${siteUrl}'s signing key changed since you last saw it, so the link can’t be trusted.`);
+    }
+    if (!verifyDocumentSignature(notice as Parameters<typeof verifyDocumentSignature>[0], key.publicKeyPem)) {
+      throw new Error('The link’s signature is invalid.');
+    }
+    const avatarUrl = notice.avatarUrl && /^https?:\/\//i.test(notice.avatarUrl) ? notice.avatarUrl : '';
+    const isFriend = this.db.getFriends().some((f) => normalizeSiteUrl(f.siteUrl) === siteUrl);
+    return {
+      token,
+      notice,
+      sender: {
+        siteUrl,
+        displayName: notice.displayName,
+        avatarUrl,
+        did: notice.did,
+        keyFingerprint: publicKeyFingerprint(key.publicKeyPem),
+      },
+      state: this.db.getModerationAction(siteUrl) === 'block' ? 'blocked' : isFriend ? 'already-friend' : 'new',
+    };
+  }
+
+  /** Reviews a friend-notice link and, if it's new, adds it to "Added you". */
+  public async acceptFriendNotice(
+    linkOrToken: string
+  ): Promise<{ review: FriendNoticeReview; notice?: FriendNotice }> {
+    const review = await this.reviewFriendNotice(linkOrToken);
+    if (review.state !== 'new') return { review };
+    const notice = this.db.upsertFriendNotice({
+      siteUrl: review.sender.siteUrl,
+      displayName: review.sender.displayName,
+      avatarUrl: review.sender.avatarUrl,
+      source: 'link',
+    });
+    return { review, notice };
   }
 
   /**
@@ -407,8 +545,16 @@ export class RingService {
         if (member.siteUrl === mySiteUrl) continue;
         result.checked++;
         try {
-          const { hubUrls } = await this.fetchMemberConnections(member.siteUrl);
+          const { hubUrls, friendUrls } = await this.fetchMemberConnections(member.siteUrl);
           const listsRing = hubUrls.includes(ring.hubUrl);
+          if (friendUrls.includes(mySiteUrl)) {
+            this.db.upsertFriendNotice({
+              siteUrl: member.siteUrl,
+              displayName: member.displayName,
+              source: 'ring',
+              ringName: ring.name,
+            });
+          }
           this.db.recordRingMemberCheck(ring.id, member.siteUrl, { ok: true, listsRing });
           if (listsRing) {
             if (!member.confirmedAt) result.confirmed.push(member.siteUrl);
@@ -438,4 +584,13 @@ export function isRingMemberFlagged(
   if (member.failCount === 0) return false;
   const since = member.lastVerifiedAt || member.joinedAt;
   return now - new Date(since).getTime() > RING_MEMBER_FLAG_AFTER_MS;
+}
+
+/** A site-relative path (e.g. media/profile/avatar.jpg) as an absolute URL on `siteUrl`. */
+function absoluteSiteUrl(url: string, siteUrl: string): string {
+  const trimmed = (url || '').trim();
+  if (!trimmed) return '';
+  if (/^https?:\/\//i.test(trimmed)) return trimmed;
+  if (/^[a-z][a-z0-9+.-]*:/i.test(trimmed)) return '';
+  return `${siteUrl}/${trimmed.replace(/^\/+/, '')}`;
 }

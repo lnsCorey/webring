@@ -21,6 +21,7 @@ import {
 import { SiteDesignPanel } from './SiteDesignPanel';
 import { ItemEdit, ItemEditor } from './ItemEditor';
 import { SavedPostView, SavedPostsView } from './SavedPostsView';
+import { AddBackTarget, FriendNoticeReviewView, FriendNoticeView, FriendNoticesPanel } from './FriendNoticesPanel';
 import { MarkdownField } from './MarkdownField';
 import { renderMarkdown } from '../shared/markdown';
 import { ProfileImagePicker } from './ProfileImagePicker';
@@ -53,6 +54,7 @@ import {
   UserCheck,
   UserPlus,
   Users,
+  Send,
 } from 'lucide-react';
 
 interface PublishSettingsState {
@@ -329,6 +331,8 @@ declare global {
         previewHtml: string;
         savedPosts?: SavedPostView[];
         feedRetentionDays?: number;
+        friendNotices?: FriendNoticeView[];
+        mutualFriendUrls?: string[];
       }>;
       listPersonas: () => Promise<{
         activePersonaId: string;
@@ -422,6 +426,11 @@ declare global {
         change: { action: RingMemberAction; reason?: string }
       ) => Promise<HostedRing>;
       onRingRequestLink?: (cb: (link: string) => void) => () => void;
+      createFriendNotice?: (friendSiteUrl: string) => Promise<string>;
+      reviewFriendNotice?: (link: string) => Promise<FriendNoticeReviewView>;
+      acceptFriendNotice?: (link: string) => Promise<unknown>;
+      dismissFriendNotice?: (siteUrl: string) => Promise<unknown>;
+      onFriendNoticeLink?: (cb: (link: string) => void) => () => void;
       getSchedule: () => Promise<ScheduleOverview>;
       setSchedule: (
         change:
@@ -546,6 +555,9 @@ export const App: React.FC = () => {
   const [networkFeed, setNetworkFeed] = useState<NetworkFeedEntry[]>([]);
   const [savedPosts, setSavedPosts] = useState<SavedPostView[]>([]);
   const [feedRetentionDays, setFeedRetentionDays] = useState(90);
+  const [friendNotices, setFriendNotices] = useState<FriendNoticeView[]>([]);
+  const [mutualFriendUrls, setMutualFriendUrls] = useState<string[]>([]);
+  const [incomingFriendNotice, setIncomingFriendNotice] = useState<{ link: string; at: number } | null>(null);
   const [feedScope, setFeedScopeState] = useState<FeedScope>(loadFeedScope);
   const setFeedScope = (scope: FeedScope) => {
     setFeedScopeState(scope);
@@ -767,6 +779,8 @@ export const App: React.FC = () => {
     setNetworkFeed(data.networkFeed || []);
     setSavedPosts(data.savedPosts || []);
     if (typeof data.feedRetentionDays === 'number') setFeedRetentionDays(data.feedRetentionDays);
+    setFriendNotices(data.friendNotices || []);
+    setMutualFriendUrls(data.mutualFriendUrls || []);
     setFeedExclusions(data.feedExclusions || { muted: 0, blocked: 0, unverified: 0 });
     setModeration(data.moderation || []);
     setChangesSinceLastPublish(data.changesSinceLastPublish || 0);
@@ -925,6 +939,15 @@ export const App: React.FC = () => {
             // Opens the review screen only; approving still needs a click
             setActiveTab('friends');
             handleReviewRingRequest(link);
+          })
+        );
+      }
+      if (window.studioApi.onFriendNoticeLink) {
+        cleanups.push(
+          window.studioApi.onFriendNoticeLink((link) => {
+            // Opens the review only; nothing is added until the user clicks
+            setActiveTab('friends');
+            setIncomingFriendNotice({ link, at: Date.now() });
           })
         );
       }
@@ -1505,6 +1528,35 @@ export const App: React.FC = () => {
     );
   };
 
+  // "Added you": add someone back (private by default, like any new friend) and sync them once
+  const handleAddBack = async (target: AddBackTarget) => {
+    if (!window.studioApi) return;
+    await window.studioApi.addFriend({
+      siteUrl: target.siteUrl,
+      displayName: target.displayName || target.siteUrl,
+      avatarUrl: target.avatarUrl,
+      relationship: ['friend'],
+      visibility: 'private',
+    });
+    await refreshStudioData();
+    notify(`Added ${target.displayName || target.siteUrl} back (Private). Make them Public to list them on your site.`);
+    await window.studioApi.crawlFriend(target.siteUrl).catch(() => undefined);
+    await refreshStudioData();
+  };
+
+  const handleLetThemKnow = async (friend: { siteUrl: string; displayName: string }) => {
+    if (!window.studioApi?.createFriendNotice) return;
+    try {
+      const link = await window.studioApi.createFriendNotice(friend.siteUrl);
+      await navigator.clipboard.writeText(link);
+      notify(
+        `Link copied. Send it to ${friend.displayName} by email or message; when they open it, Studio checks it was signed by your site.`
+      );
+    } catch (err) {
+      notify(`Couldn't make the link: ${errorMessage(err)}`);
+    }
+  };
+
   const activeSchedule = scheduleOverview?.personas.find((p) => p.personaId === activePersonaId);
 
   const handleSetSchedule = async (
@@ -1857,7 +1909,7 @@ export const App: React.FC = () => {
     await refreshStudioData();
   };
 
-  const navItems: Array<{ id: StudioTab; label: string; icon: React.ReactNode; badge?: number }> = [
+  const navItems: Array<{ id: StudioTab; label: string; icon: React.ReactNode; badge?: number; alert?: string }> = [
     { id: 'profile', label: 'Profile & Identity', icon: <UserCheck className="w-4 h-4" /> },
     {
       id: 'albums',
@@ -1876,6 +1928,7 @@ export const App: React.FC = () => {
       label: 'Friends & Webrings',
       icon: <Users className="w-4 h-4" />,
       badge: allFriends.length,
+      alert: friendNotices.length ? `${friendNotices.length} added you` : undefined,
     },
     {
       id: 'feed',
@@ -2004,6 +2057,13 @@ export const App: React.FC = () => {
                   {item.icon}
                   {item.label}
                 </span>
+                {item.alert && (
+                  <span
+                    className="ml-auto mr-1.5 w-2 h-2 rounded-full bg-amber-400"
+                    title={item.alert}
+                    aria-label={item.alert}
+                  />
+                )}
                 {item.badge !== undefined && (
                   <span
                     className={`text-xs px-2 py-0.5 rounded-full ${
@@ -3044,6 +3104,26 @@ export const App: React.FC = () => {
                 </p>
               </div>
 
+              <FriendNoticesPanel
+                notices={friendNotices}
+                incomingLink={incomingFriendNotice}
+                errorMessage={errorMessage}
+                onReview={async (link) => {
+                  if (!window.studioApi?.reviewFriendNotice) throw new Error('Not available.');
+                  return window.studioApi.reviewFriendNotice(link);
+                }}
+                onAccept={async (link) => {
+                  await window.studioApi?.acceptFriendNotice?.(link);
+                  await refreshStudioData();
+                }}
+                onAddBack={handleAddBack}
+                onDismiss={async (siteUrl) => {
+                  await window.studioApi?.dismissFriendNotice?.(siteUrl);
+                  await refreshStudioData();
+                }}
+                onBlock={(target) => handleSetModeration(target.siteUrl, target.displayName || target.siteUrl, 'block')}
+              />
+
               {/* Social Graph Privacy & Anti-Scraping Shield Panel */}
               <div className="bg-slate-900 border border-emerald-500/30 rounded-2xl p-5 space-y-4">
                 <div className="flex flex-wrap items-center justify-between gap-3">
@@ -3815,6 +3895,14 @@ export const App: React.FC = () => {
                                   🔐 Key Pinned (TOFU)
                                 </span>
                               )}
+                              {mutualFriendUrls.includes(friend.siteUrl) && (
+                                <span
+                                  className="text-[10px] px-2 py-0.5 rounded-full font-medium whitespace-nowrap bg-sky-500/20 text-sky-300 border border-sky-500/30"
+                                  title="Their signed connections.json lists you as a friend"
+                                >
+                                  ↔ Mutual
+                                </span>
+                              )}
                               {friend.keyStatus === 'changed' && (
                                 <span
                                   className="text-[10px] px-2 py-0.5 rounded-full font-bold whitespace-nowrap bg-rose-500/20 text-rose-300 border border-rose-500/40"
@@ -3909,6 +3997,20 @@ export const App: React.FC = () => {
                           >
                             <RefreshCw className="w-3 h-3" /> Sync JSON
                           </button>
+                          {!mutualFriendUrls.includes(friend.siteUrl) && (
+                            <button
+                              onClick={() => handleLetThemKnow(friend)}
+                              disabled={!publishSettings.lastPublishedAt}
+                              className="px-2.5 py-1.5 rounded-lg bg-slate-800 hover:bg-slate-700 disabled:opacity-50 disabled:hover:bg-slate-800 text-xs flex items-center gap-1"
+                              title={
+                                publishSettings.lastPublishedAt
+                                  ? 'Copy a signed link that tells them you added them'
+                                  : 'Publish your site first: the link is checked against your published key'
+                              }
+                            >
+                              <Send className="w-3 h-3" /> Let them know
+                            </button>
+                          )}
                           <select
                             value={moderationFor(friend.siteUrl) || ''}
                             onChange={(e) =>
@@ -7203,6 +7305,27 @@ git push -u origin main --force`}
                           <li>
                             New members get 14 days to publish the ring before a maintainer's sync treats
                             them as having left.
+                          </li>
+                        </ul>
+                      </div>
+
+                      <div className="p-4 rounded-xl bg-slate-950 border border-slate-800 space-y-2 md:col-span-2">
+                        <h4 className="font-bold text-sm text-amber-300">Letting people know you added them</h4>
+                        <ul className="list-disc list-inside space-y-1 text-slate-300">
+                          <li>
+                            Adding a friend sends nothing. To tell them, click <strong>Let them know</strong>{' '}
+                            on their card: Studio copies a private link signed with your key. Send it any way
+                            you like. Publish your site first, since they check the link against it.
+                          </li>
+                          <li>
+                            When they open the link, their Studio checks it's for them, recent and really
+                            from your site, then shows you under <strong>Added you</strong> with{' '}
+                            <strong>Add back</strong>. Nothing is added automatically.
+                          </li>
+                          <li>
+                            Studio also notices on its own when a friend's public friends list includes you
+                            (<strong>↔ Mutual</strong>), or when someone in a ring you share lists you.
+                            Private friends are never seen, and "Added you" is never published.
                           </li>
                         </ul>
                       </div>

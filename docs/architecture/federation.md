@@ -51,6 +51,7 @@ Rings are curated by a maintainer and run entirely on static files (`electron/se
   - Older hub copies are ignored.
   - Unsigned (v1) hubs, changed keys and failed fetches never remove anyone; they only raise warnings or flags.
   - Keys are pinned once per site in `site_keys`, shared with friend crawling.
+- **"Added you".** Adding a friend notifies no one. The adder can send a private signed `webring://friend-notice` link out-of-band; the recipient verifies it against the sender's `did.json` (pinned key, under 30 days, addressed to them). Studio also reads verified `connections.json` from friends (Mutual) and ring members (people who list you but aren't friends yet). Only public friends are visible this way; notices are local and never published.
 - **Navigation.** Prev/Next are baked into the page at publish. On click, the page re-reads the hub (2 s timeout, no credentials or referrer, https-only member URLs) to skip removed or hidden sites, falling back to the baked link. Random needs JavaScript; without it, it goes to the directory page.
 - **Migration.** The pre-redesign single hub (`publishWebringHub`, members = public friends) was converted once into a hosted ring at the same path, `api/webring-hub.json`. Older joined rings are kept as `legacy`: still shown, never auto-removed.
 - **Not yet supported:** following a ring when its maintainer moves domains (`movedTo`), and keeping a member's place when they change site URL. Both currently mean re-joining.

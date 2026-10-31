@@ -276,6 +276,21 @@ export interface NetworkFeedEntry {
 }
 
 /** A friend's post or photo the user saved: a private copy kept outside the feed window. */
+export type FriendNoticeSource = 'link' | 'ring';
+
+/** Someone who added this persona as a friend (database.ts friend_notices). Never exported. */
+export interface FriendNotice {
+  siteUrl: string;
+  displayName: string;
+  avatarUrl: string;
+  /** 'link': they sent a signed link. 'ring': seen in a shared ring member's connections.json. */
+  source: FriendNoticeSource;
+  ringName: string;
+  firstSeenAt: string;
+  lastSeenAt: string;
+  dismissedAt?: string;
+}
+
 export interface SavedPost {
   id: string;
   canonicalUrl: string;
@@ -797,6 +812,19 @@ export class StudioDatabase {
         saved_at TEXT NOT NULL,
         verified_signature INTEGER NOT NULL DEFAULT 0
       );
+
+      -- People who added this persona as a friend (a signed link they sent, or their signed
+      -- connections.json seen while syncing). Local only, never exported.
+      CREATE TABLE IF NOT EXISTS friend_notices (
+        site_url TEXT PRIMARY KEY,
+        display_name TEXT NOT NULL DEFAULT '',
+        avatar_url TEXT NOT NULL DEFAULT '',
+        source TEXT NOT NULL CHECK (source IN ('link', 'ring')),
+        ring_name TEXT NOT NULL DEFAULT '',
+        first_seen_at TEXT NOT NULL,
+        last_seen_at TEXT NOT NULL,
+        dismissed_at TEXT
+      );
     `);
 
     // Safe migration for existing databases lacking friends.visibility or TOFU key pinning columns
@@ -811,6 +839,10 @@ export class StudioDatabase {
     }
     if (!columns.some((c) => c.name === 'key_status')) {
       this.db.exec(`ALTER TABLE friends ADD COLUMN key_status TEXT NOT NULL DEFAULT 'unverified';`);
+    }
+    // When a friend's verified connections.json last listed this persona (local only, never exported)
+    if (!columns.some((c) => c.name === 'lists_me_at')) {
+      this.db.exec('ALTER TABLE friends ADD COLUMN lists_me_at TEXT;');
     }
 
     // Joined-ring tracking. Rows that predate it become 'legacy' (still published, never auto-removed)
@@ -1803,6 +1835,7 @@ export class StudioDatabase {
         input.lastCrawledAt ?? null,
         now
       );
+    this.db.prepare('DELETE FROM friend_notices WHERE site_url = ?').run(normalizedUrl);
 
     return this.getFriends().find((f) => f.id === id)!;
   }
@@ -1830,6 +1863,90 @@ export class StudioDatabase {
       }
       this.db.prepare('DELETE FROM friends WHERE id = ?').run(friendId);
     });
+  }
+
+  /** Records whether a friend's verified connections.json lists this persona. */
+  public setFriendListsMe(siteUrl: string, listsMe: boolean): void {
+    this.db
+      .prepare('UPDATE friends SET lists_me_at = ? WHERE site_url = ?')
+      .run(listsMe ? new Date().toISOString() : null, normalizeSiteUrl(siteUrl));
+  }
+
+  /** Friends whose verified connections.json lists this persona (shown as "Mutual"). */
+  public getMutualFriendUrls(): string[] {
+    const rows = this.db.prepare('SELECT site_url FROM friends WHERE lists_me_at IS NOT NULL').all() as Array<{
+      site_url: string;
+    }>;
+    return rows.map((r) => r.site_url);
+  }
+
+  /**
+   * Records that a site added this persona as a friend. Ignored for existing friends, blocked sites
+   * and this persona's own site. A dismissed notice comes back only for a new signed link.
+   */
+  public upsertFriendNotice(input: {
+    siteUrl: string;
+    displayName: string;
+    avatarUrl?: string;
+    source: FriendNoticeSource;
+    ringName?: string;
+  }): FriendNotice | undefined {
+    const siteUrl = normalizeSiteUrl(input.siteUrl);
+    if (siteUrl === normalizeSiteUrl(this.getProfile().siteUrl)) return undefined;
+    if (this.getModerationAction(siteUrl) === 'block') return undefined;
+    if (this.db.prepare('SELECT 1 FROM friends WHERE site_url = ?').get(siteUrl)) return undefined;
+    const now = new Date().toISOString();
+    this.db
+      .prepare(
+        `INSERT INTO friend_notices (site_url, display_name, avatar_url, source, ring_name, first_seen_at, last_seen_at)
+         VALUES (?, ?, ?, ?, ?, ?, ?)
+         ON CONFLICT(site_url) DO UPDATE SET
+           display_name = excluded.display_name,
+           avatar_url = COALESCE(NULLIF(excluded.avatar_url, ''), avatar_url),
+           source = CASE WHEN excluded.source = 'link' THEN 'link' ELSE source END,
+           ring_name = COALESCE(NULLIF(excluded.ring_name, ''), ring_name),
+           last_seen_at = excluded.last_seen_at,
+           dismissed_at = CASE WHEN excluded.source = 'link' THEN NULL ELSE dismissed_at END`
+      )
+      .run(
+        siteUrl,
+        input.displayName.slice(0, 120),
+        input.avatarUrl || '',
+        input.source,
+        input.ringName || '',
+        now,
+        now
+      );
+    return this.getFriendNotices({ includeDismissed: true }).find((n) => n.siteUrl === siteUrl);
+  }
+
+  /** People who added this persona and haven't been added back, dismissed or blocked. */
+  public getFriendNotices(options: { includeDismissed?: boolean } = {}): FriendNotice[] {
+    const rows = this.db
+      .prepare(
+        `SELECT n.* FROM friend_notices n
+         WHERE NOT EXISTS (SELECT 1 FROM friends f WHERE f.site_url = n.site_url)
+           AND NOT EXISTS (SELECT 1 FROM moderation m WHERE m.site_url = n.site_url AND m.action = 'block')
+           ${options.includeDismissed ? '' : 'AND n.dismissed_at IS NULL'}
+         ORDER BY n.last_seen_at DESC`
+      )
+      .all() as Array<Record<string, unknown>>;
+    return rows.map((r) => ({
+      siteUrl: String(r.site_url),
+      displayName: String(r.display_name || ''),
+      avatarUrl: String(r.avatar_url || ''),
+      source: r.source === 'link' ? 'link' : 'ring',
+      ringName: String(r.ring_name || ''),
+      firstSeenAt: String(r.first_seen_at),
+      lastSeenAt: String(r.last_seen_at),
+      ...(r.dismissed_at ? { dismissedAt: String(r.dismissed_at) } : {}),
+    }));
+  }
+
+  public dismissFriendNotice(siteUrl: string): void {
+    this.db
+      .prepare('UPDATE friend_notices SET dismissed_at = ? WHERE site_url = ?')
+      .run(new Date().toISOString(), normalizeSiteUrl(siteUrl));
   }
 
   private transaction(fn: () => void): void {
@@ -1983,6 +2100,7 @@ export class StudioDatabase {
       this.db
         .prepare('INSERT OR REPLACE INTO moderation (site_url, action, created_at) VALUES (?, ?, ?)')
         .run(normalized, action, new Date().toISOString());
+      if (action === 'block') this.db.prepare('DELETE FROM friend_notices WHERE site_url = ?').run(normalized);
     } else {
       this.db.prepare('DELETE FROM moderation WHERE site_url = ?').run(normalized);
     }

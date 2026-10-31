@@ -51,6 +51,7 @@ protocol.registerSchemesAsPrivileged([
 import {
   CreatePersonaInput,
   ModerationAction,
+  parseFriendNoticeUri,
   parseRingRequestUri,
   parseWebringUri,
 } from '../src/shared/schema';
@@ -302,6 +303,13 @@ function handleDeepLinkUrl(rawUri: string) {
     mainWindow.focus();
     return;
   }
+  // Friend notices only open the review; nothing is added until the user clicks
+  if (rawUri.startsWith('webring://friend-notice') && parseFriendNoticeUri(rawUri) && mainWindow) {
+    mainWindow.webContents.send('webring:friend-notice', rawUri);
+    if (mainWindow.isMinimized()) mainWindow.restore();
+    mainWindow.focus();
+    return;
+  }
   const parsed = parseWebringUri(rawUri);
   if (parsed && mainWindow) {
     mainWindow.webContents.send('webring:deep-link', parsed);
@@ -438,6 +446,8 @@ function registerIpcHandlers() {
       previewHtml: ctx.siteGenerator.buildStandaloneProfileHtml(publishedBundle, { preview: true }),
       savedPosts: ctx.db.getSavedPosts(),
       feedRetentionDays: ctx.db.getFeedRetentionDays(),
+      friendNotices: ctx.db.getFriendNotices(),
+      mutualFriendUrls: ctx.db.getMutualFriendUrls(),
     };
   });
 
@@ -671,6 +681,21 @@ function registerIpcHandlers() {
       return await personaManager.getActiveContext().ringService.decideRequest(link, decision, reason);
     }
   );
+
+  // "I added you" links and the "Added you" list (local only)
+  ipcMain.handle('studio:friend-notice-create', (_e, friendSiteUrl: string) => {
+    return personaManager.getActiveContext().ringService.createFriendNotice(String(friendSiteUrl)).link;
+  });
+  ipcMain.handle('studio:friend-notice-review', async (_e, link: string) => {
+    return await personaManager.getActiveContext().ringService.reviewFriendNotice(String(link));
+  });
+  ipcMain.handle('studio:friend-notice-accept', async (_e, link: string) => {
+    return await personaManager.getActiveContext().ringService.acceptFriendNotice(String(link));
+  });
+  ipcMain.handle('studio:friend-notice-dismiss', (_e, siteUrl: string) => {
+    personaManager.getActiveContext().db.dismissFriendNotice(String(siteUrl));
+    return { ok: true };
+  });
 
   ipcMain.handle('studio:ring-sync-all', async () => {
     return withActiveLock(async () => {
