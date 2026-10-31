@@ -743,6 +743,41 @@ export class WebringMcpServer {
         },
       },
       {
+        name: 'webring_create_friend_notice',
+        description:
+          'Make a private signed webring://friend-notice link telling a friend you added them. Nothing is sent: give the link to the user to pass on. Needs the persona’s site to be published.',
+        inputSchema: {
+          type: 'object',
+          properties: { personaId: personaIdProp, friendSiteUrl: { type: 'string' } },
+          required: ['friendSiteUrl'],
+        },
+      },
+      {
+        name: 'webring_review_friend_notice',
+        description:
+          'Check a webring://friend-notice link someone sent (addressed to this persona, not expired, signed by their site key). With accept=true a new sender is added to "Added you"; it never adds them as a friend.',
+        inputSchema: {
+          type: 'object',
+          properties: { personaId: personaIdProp, link: { type: 'string' }, accept: { type: 'boolean' } },
+          required: ['link'],
+        },
+      },
+      {
+        name: 'webring_list_friend_notices',
+        description:
+          'List "Added you": people who sent a signed friend-notice link, or ring members whose verified connections.json lists this persona, and who aren’t friends, dismissed or blocked. Also lists friends who list you back (mutual).',
+        inputSchema: { type: 'object', properties: { personaId: personaIdProp } },
+      },
+      {
+        name: 'webring_dismiss_friend_notice',
+        description: 'Dismiss someone from "Added you". They come back only if they send a new signed link.',
+        inputSchema: {
+          type: 'object',
+          properties: { personaId: personaIdProp, siteUrl: { type: 'string' } },
+          required: ['siteUrl'],
+        },
+      },
+      {
         name: 'webring_get_schedule',
         description:
           'Show the persona’s sync and publish schedules (preset, next run, last result) and the app-level background settings.',
@@ -1474,6 +1509,42 @@ export class WebringMcpServer {
           summary = decision
             ? `${decision} ${review.applicant.siteUrl} for "${review.ring.name}"`
             : `Reviewed request from ${review.applicant.siteUrl}`;
+          break;
+        }
+
+        case 'webring_create_friend_notice': {
+          const ctx = this.resolveContext(args);
+          const { link, notice } = ctx.ringService.createFriendNotice(String(args.friendSiteUrl || ''));
+          resultData = { link, friendUrl: notice.friendUrl };
+          summary = `Made a friend notice link for ${notice.friendUrl}`;
+          break;
+        }
+
+        case 'webring_review_friend_notice': {
+          const ctx = this.resolveContext(args);
+          const link = String(args.link || '');
+          const result =
+            args.accept === true
+              ? await ctx.ringService.acceptFriendNotice(link)
+              : { review: await ctx.ringService.reviewFriendNotice(link), notice: undefined };
+          const { token: _token, ...publicReview } = result.review;
+          resultData = { ...publicReview, added: Boolean(result.notice) };
+          summary = `Reviewed friend notice from ${result.review.sender.siteUrl}`;
+          break;
+        }
+
+        case 'webring_list_friend_notices': {
+          const ctx = this.resolveContext(args);
+          resultData = { addedYou: ctx.db.getFriendNotices(), mutualFriends: ctx.db.getMutualFriendUrls() };
+          summary = 'Listed friend notices';
+          break;
+        }
+
+        case 'webring_dismiss_friend_notice': {
+          const ctx = this.resolveContext(args);
+          ctx.db.dismissFriendNotice(String(args.siteUrl || ''));
+          resultData = { dismissed: String(args.siteUrl || '') };
+          summary = `Dismissed ${String(args.siteUrl || '')} from Added you`;
           break;
         }
 

@@ -509,12 +509,32 @@ export class RingCrawler {
         // Continue if items.json is missing or unchanged
       }
 
-      // Optionally inspect connections.json for webring discovery
+      // connections.json: does this friend list us back ("Mutual")? Only a verified copy that
+      // belongs to this site can set or clear it; it's never re-published.
       try {
-        const rawConnections = await this.fetcher(resolveEndpoint(manifest.endpoints.connections));
-        ConnectionsDocumentSchema.parse(rawConnections);
+        const connectionsFetch = await fetchDocument(manifest.endpoints.connections);
+        if (connectionsFetch.notModified) throw new UnchangedDocument();
+        const rawConnections = connectionsFetch.json;
+        const connections = ConnectionsDocumentSchema.parse(rawConnections);
+        const connectionsVerified =
+          !keyChangedWarning &&
+          Boolean(effectiveVerifyKeyPem) &&
+          Boolean(connections.proof) &&
+          verifyDocumentSignature(
+            rawConnections as Record<string, unknown> & { proof?: typeof connections.proof },
+            effectiveVerifyKeyPem
+          ) &&
+          normalizeSiteUrl(connections.siteUrl) === normalizedFriendUrl &&
+          connections.did === manifest.did;
+        if (connectionsVerified) {
+          this.db.setFriendListsMe(
+            normalizedFriendUrl,
+            connections.friends.some((f) => normalizeSiteUrl(f.siteUrl) === mySiteUrl)
+          );
+          rememberValidators(connectionsFetch);
+        }
       } catch {
-        // Optional
+        // Optional: missing, unchanged or unverifiable leaves "Mutual" as it was
       }
 
       entriesPruned += this.db.pruneFeedOutsideWindow();

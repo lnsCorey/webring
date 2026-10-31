@@ -2639,7 +2639,7 @@ describe('History window: published archives, feed window, conditional sync, sav
 
     sent.length = 0;
     const second = await crawler.crawlFriendSite('https://alice.ring.test');
-    expect(second.unchanged).toEqual(['/api/albums.json', '/api/items.json']);
+    expect(second.unchanged).toEqual(['/api/albums.json', '/api/items.json', '/api/connections.json']);
     expect(sent.find((s) => s.url.endsWith('/api/items.json'))!.validators).toEqual({
       etag: '"items.json"',
       lastModified: 'Mon, 26 Oct 2026 10:00:00 GMT',
@@ -3085,5 +3085,230 @@ describe('Site Design (look & feel, page layout)', () => {
       expect(typeof standalone).toBe('function');
       expect(renderTemplatePage.toString()).not.toMatch(/<\/script/i);
     });
+  });
+});
+
+describe('Letting people know you added them (friend notices, mutual, "Added you")', () => {
+  let tempRoot: string;
+  const sites = new Map<string, { db: StudioDatabase; outDir: string }>();
+  const fetched: string[] = [];
+
+  const fetcher = async (url: string): Promise<unknown> => {
+    fetched.push(url);
+    const parsed = new URL(url);
+    const site = sites.get(parsed.origin);
+    if (!site) throw new Error(`HTTP 404 fetching ${url}`);
+    const file = path.join(site.outDir, decodeURIComponent(parsed.pathname));
+    if (!fs.existsSync(file)) throw new Error(`HTTP 404 fetching ${url}`);
+    return JSON.parse(fs.readFileSync(file, 'utf8'));
+  };
+
+  const makeSite = (name: string) => {
+    const siteUrl = `https://${name}.notice.test`;
+    const dir = path.join(tempRoot, name);
+    const db = new StudioDatabase(dir, `${name}.sqlite`);
+    db.updateProfile({
+      siteUrl,
+      handle: `${name}.notice.test`,
+      displayName: name,
+      avatarUrl: 'media/profile/avatar-abc.jpg',
+      publishSettings: { publishFriendsList: true },
+    });
+    const outDir = path.join(dir, 'public_html');
+    sites.set(siteUrl, { db, outDir });
+    return {
+      db,
+      siteUrl,
+      outDir,
+      rings: new RingService(db, fetcher),
+      crawler: new RingCrawler(db, fetcher),
+      publish: () => new StaticSiteGenerator(db).generateToDirectory(outDir),
+    };
+  };
+
+  const tick = () => new Promise((r) => setTimeout(r, 5));
+  const decodeLink = (link: string) =>
+    JSON.parse(Buffer.from(decodeURIComponent(link.split('token=')[1]), 'base64url').toString('utf8'));
+  const encode = (doc: unknown) => Buffer.from(JSON.stringify(doc)).toString('base64url');
+
+  beforeEach(() => {
+    tempRoot = fs.mkdtempSync(path.join(os.tmpdir(), 'webring-notices-'));
+    sites.clear();
+    fetched.length = 0;
+  });
+
+  afterEach(() => {
+    vi.useRealTimers();
+    for (const { db } of sites.values()) db.close();
+    fs.rmSync(tempRoot, { recursive: true, force: true });
+  });
+
+  it('sends a signed "I added you" link that the recipient verifies, keeps and can add back', async () => {
+    const ana = makeSite('ana');
+    const ben = makeSite('ben');
+    ana.db.addOrUpdateFriend({ siteUrl: ben.siteUrl, displayName: 'Ben' });
+    ana.publish();
+
+    const { link } = ana.rings.createFriendNotice(ben.siteUrl);
+    expect(link).toMatch(/^webring:\/\/friend-notice\?token=/);
+    expect(decodeLink(link).avatarUrl).toBe(`${ana.siteUrl}/media/profile/avatar-abc.jpg`);
+
+    const review = await ben.rings.reviewFriendNotice(link);
+    expect(review.state).toBe('new');
+    expect(review.sender).toMatchObject({ siteUrl: ana.siteUrl, displayName: 'ana' });
+    // Reviewing alone changes nothing
+    expect(ben.db.getFriendNotices()).toHaveLength(0);
+
+    const { notice } = await ben.rings.acceptFriendNotice(link);
+    expect(notice).toMatchObject({ siteUrl: ana.siteUrl, source: 'link' });
+    expect(ben.db.getFriendNotices().map((n) => n.siteUrl)).toEqual([ana.siteUrl]);
+    // Never added automatically, and never published
+    expect(ben.db.getFriends()).toHaveLength(0);
+    ben.publish();
+    const published = fs
+      .readdirSync(path.join(ben.outDir, 'api'))
+      .map((f) => fs.readFileSync(path.join(ben.outDir, 'api', f), 'utf8'))
+      .join('\n');
+    expect(published).not.toContain('ana.notice.test');
+
+    // Adding them back clears the notice
+    ben.db.addOrUpdateFriend({ siteUrl: ana.siteUrl, displayName: 'ana' });
+    expect(ben.db.getFriendNotices()).toHaveLength(0);
+    expect((await ben.rings.reviewFriendNotice(link)).state).toBe('already-friend');
+  });
+
+  it('rejects tampered, misdirected, expired, re-keyed and blocked senders', async () => {
+    const ana = makeSite('ana');
+    const ben = makeSite('ben');
+    const cat = makeSite('cat');
+    ana.publish();
+    cat.publish();
+    const { link } = ana.rings.createFriendNotice(ben.siteUrl);
+
+    const tampered = { ...decodeLink(link), displayName: 'Impostor' };
+    await expect(ben.rings.reviewFriendNotice(encode(tampered))).rejects.toThrow(/signature/);
+    await expect(cat.rings.reviewFriendNotice(link)).rejects.toThrow(/not the active persona/);
+    await expect(ben.rings.reviewFriendNotice('webring://friend-notice?token=garbage')).rejects.toThrow(/damaged/);
+    // Claims to be Ana but signed by Cat's key
+    const forged = cat.rings.createFriendNotice(ben.siteUrl).notice;
+    await expect(
+      ben.rings.reviewFriendNotice(encode({ ...forged, siteUrl: ana.siteUrl, did: decodeLink(link).did }))
+    ).rejects.toThrow(/signature/);
+
+    vi.useFakeTimers({ toFake: ['Date'] });
+    vi.setSystemTime(Date.now() + 31 * 24 * 60 * 60 * 1000);
+    await expect(ben.rings.reviewFriendNotice(link)).rejects.toThrow(/expired/);
+    vi.useRealTimers();
+
+    // Ben pins Ana's key; then Ana's key "changes"
+    expect((await ben.rings.reviewFriendNotice(link)).state).toBe('new');
+    const didPath = path.join(ana.outDir, '.well-known', 'did.json');
+    const didDoc = JSON.parse(fs.readFileSync(didPath, 'utf8'));
+    const catDid = JSON.parse(fs.readFileSync(path.join(cat.outDir, '.well-known', 'did.json'), 'utf8'));
+    didDoc.verificationMethod[0].publicKeyPem = catDid.verificationMethod[0].publicKeyPem;
+    fs.writeFileSync(didPath, JSON.stringify(didDoc));
+    await expect(ben.rings.reviewFriendNotice(link)).rejects.toThrow(/key changed/);
+
+    const dan = makeSite('dan');
+    dan.publish();
+    const fromDan = dan.rings.createFriendNotice(ben.siteUrl).link;
+    ben.db.setModeration(dan.siteUrl, 'block');
+    const blocked = await ben.rings.acceptFriendNotice(fromDan);
+    expect(blocked.review.state).toBe('blocked');
+    expect(blocked.notice).toBeUndefined();
+    expect(ben.db.getFriendNotices()).toHaveLength(0);
+  });
+
+  it('marks friends who list you back as mutual, from verified connections.json only', async () => {
+    const ana = makeSite('ana');
+    const ben = makeSite('ben');
+    ben.db.addOrUpdateFriend({ siteUrl: ana.siteUrl, displayName: 'ana' });
+    ana.publish();
+
+    await ben.crawler.crawlFriendSite(ana.siteUrl);
+    expect(ben.db.getMutualFriendUrls()).toEqual([]);
+
+    // A private friend isn't published, so it isn't mutual
+    const anaFriend = ana.db.addOrUpdateFriend({ siteUrl: ben.siteUrl, displayName: 'Ben' });
+    ana.publish();
+    await ben.crawler.crawlFriendSite(ana.siteUrl);
+    expect(ben.db.getMutualFriendUrls()).toEqual([]);
+
+    ana.db.setFriendVisibility(anaFriend.id, 'public');
+    await tick();
+    ana.publish();
+    await ben.crawler.crawlFriendSite(ana.siteUrl);
+    expect(ben.db.getMutualFriendUrls()).toEqual([ana.siteUrl]);
+    // Never published by Ben
+    ben.publish();
+    expect(JSON.stringify(ben.db.buildSignedSiteBundle())).not.toMatch(/lists_?me/i);
+
+    // A tampered (unverifiable) copy can't clear it...
+    const connectionsPath = path.join(ana.outDir, 'api', 'connections.json');
+    const good = fs.readFileSync(connectionsPath, 'utf8');
+    const tampered = JSON.parse(good);
+    tampered.friends = [];
+    fs.writeFileSync(connectionsPath, JSON.stringify(tampered));
+    await ben.crawler.crawlFriendSite(ana.siteUrl);
+    expect(ben.db.getMutualFriendUrls()).toEqual([ana.siteUrl]);
+
+    // ...but a verified one that drops Ben does
+    ana.db.setFriendVisibility(anaFriend.id, 'private');
+    await tick();
+    ana.publish();
+    await ben.crawler.crawlFriendSite(ana.siteUrl);
+    expect(ben.db.getMutualFriendUrls()).toEqual([]);
+  });
+
+  it('finds ring members who list you, skipping friends, blocked sites and dismissed notices', async () => {
+    const maya = makeSite('maya');
+    const ben = makeSite('ben');
+    const cat = makeSite('cat');
+    const dan = makeSite('dan');
+    const ring = maya.db.createHostedRing({ name: 'Garden Ring' });
+    for (const s of [maya, ben, cat, dan]) s.publish();
+    for (const s of [ben, cat, dan]) {
+      const { requestLink } = await s.rings.requestToJoin(ring.hubUrl);
+      await maya.rings.decideRequest(requestLink, 'approve');
+    }
+    await tick();
+    maya.publish();
+    for (const s of [ben, cat, dan]) {
+      await s.rings.syncJoinedRings();
+      s.publish();
+    }
+
+    // Cat and Dan list Ben publicly; Maya (the maintainer) does too
+    cat.db.addOrUpdateFriend({ siteUrl: ben.siteUrl, displayName: 'Ben', visibility: 'public' });
+    dan.db.addOrUpdateFriend({ siteUrl: ben.siteUrl, displayName: 'Ben', visibility: 'public' });
+    maya.db.addOrUpdateFriend({ siteUrl: ben.siteUrl, displayName: 'Ben', visibility: 'public' });
+    await tick();
+    for (const s of [cat, dan, maya]) s.publish();
+
+    ben.db.addOrUpdateFriend({ siteUrl: cat.siteUrl, displayName: 'cat' });
+    ben.db.setModeration(dan.siteUrl, 'block');
+    fetched.length = 0;
+    await ben.rings.syncJoinedRings();
+    const notices = ben.db.getFriendNotices();
+    expect(notices.map((n) => n.siteUrl)).toEqual([maya.siteUrl]);
+    expect(notices[0]).toMatchObject({ source: 'ring', ringName: 'Garden Ring', displayName: 'maya' });
+    // Friends and blocked sites aren't even fetched
+    expect(fetched.some((u) => u.startsWith(cat.siteUrl))).toBe(false);
+    expect(fetched.some((u) => u.startsWith(dan.siteUrl))).toBe(false);
+
+    ben.db.dismissFriendNotice(maya.siteUrl);
+    await ben.rings.syncJoinedRings();
+    expect(ben.db.getFriendNotices()).toHaveLength(0);
+    // A new signed link brings a dismissed notice back
+    const { link } = maya.rings.createFriendNotice(ben.siteUrl);
+    await ben.rings.acceptFriendNotice(link);
+    expect(ben.db.getFriendNotices().map((n) => n.source)).toEqual(['link']);
+
+    // The maintainer sees members who list them while checking the ring
+    cat.db.addOrUpdateFriend({ siteUrl: maya.siteUrl, displayName: 'maya', visibility: 'public' });
+    await tick();
+    cat.publish();
+    await maya.rings.syncHostedRings();
+    expect(maya.db.getFriendNotices().map((n) => n.siteUrl)).toEqual([cat.siteUrl]);
   });
 });

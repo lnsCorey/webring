@@ -616,6 +616,52 @@ export function parseRingRequestUri(uriOrToken: string): string | null {
 }
 
 /**
+ * A private, signed "I added you as a friend" notice. The sender signs it with their site key and
+ * sends it however they like as a `webring://friend-notice?token=…` link; nothing is published.
+ */
+export const FriendNoticeSchema = z.object({
+  type: z.literal('webring-friend-notice'),
+  version: z.literal(1),
+  siteUrl: z.string(),
+  did: z.string(),
+  displayName: z.string().max(120),
+  avatarUrl: z.string().max(2048).optional(),
+  /** The site of the person who was added. */
+  friendUrl: z.string(),
+  createdAt: z.string(),
+  proof: SignatureProofSchema.optional(),
+});
+export type FriendNoticeDocument = z.infer<typeof FriendNoticeSchema>;
+
+export function encodeFriendNoticeToken(notice: FriendNoticeDocument): string {
+  return Buffer.from(JSON.stringify(notice), 'utf8').toString('base64url');
+}
+
+export function decodeFriendNoticeToken(token: string): FriendNoticeDocument {
+  const raw = JSON.parse(Buffer.from(token.trim(), 'base64url').toString('utf8'));
+  return FriendNoticeSchema.parse(raw);
+}
+
+export function buildFriendNoticeUri(token: string): string {
+  return `webring://friend-notice?token=${encodeURIComponent(token)}`;
+}
+
+/** Reads a `webring://friend-notice?token=…` link (or a bare token). */
+export function parseFriendNoticeUri(uriOrToken: string): string | null {
+  const trimmed = uriOrToken.trim();
+  if (!trimmed.startsWith('webring:')) return trimmed || null;
+  try {
+    const parsed = new URL(trimmed);
+    if (parsed.hostname !== 'friend-notice' && parsed.pathname.replace(/^\/+/, '') !== 'friend-notice') {
+      return null;
+    }
+    return parsed.searchParams.get('token');
+  } catch {
+    return null;
+  }
+}
+
+/**
  * Prev / next neighbours for `siteUrl` among members in rotation. Returns nothing for a site
  * that isn't a member (no more "prev = last, next = first" for outsiders).
  */

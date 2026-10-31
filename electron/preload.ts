@@ -53,6 +53,10 @@ contextBridge.exposeInMainWorld('studioApi', {
   decideRingRequest: (link: string, decision: 'approve' | 'decline' | 'ban', reason?: string) =>
     ipcRenderer.invoke('studio:ring-decide-request', link, decision, reason),
   syncRings: () => ipcRenderer.invoke('studio:ring-sync-all'),
+  createFriendNotice: (friendSiteUrl: string) => ipcRenderer.invoke('studio:friend-notice-create', friendSiteUrl),
+  reviewFriendNotice: (link: string) => ipcRenderer.invoke('studio:friend-notice-review', link),
+  acceptFriendNotice: (link: string) => ipcRenderer.invoke('studio:friend-notice-accept', link),
+  dismissFriendNotice: (siteUrl: string) => ipcRenderer.invoke('studio:friend-notice-dismiss', siteUrl),
   createHostedRing: (input: { name: string; description?: string }) =>
     ipcRenderer.invoke('studio:hosted-ring-create', input),
   updateHostedRing: (ringId: string, updates: unknown) =>
@@ -92,6 +96,11 @@ contextBridge.exposeInMainWorld('studioApi', {
     const listener = (_event: unknown, link: string) => callback(link);
     ipcRenderer.on('webring:ring-request', listener);
     return () => ipcRenderer.removeListener('webring:ring-request', listener);
+  },
+  onFriendNoticeLink: (callback: (link: string) => void) => {
+    const listener = (_event: unknown, link: string) => callback(link);
+    ipcRenderer.on('webring:friend-notice', listener);
+    return () => ipcRenderer.removeListener('webring:friend-notice', listener);
   },
   onDeepLink: (callback: (action: WebringDeepLinkAction) => void) => {
     const listener = (_event: unknown, action: WebringDeepLinkAction) => callback(action);

@@ -135,6 +135,16 @@ History grows forever, so Studio keeps syncing small on both sides:
 - **Unchanged files aren't downloaded.** Syncing asks each host whether a friend's `items.json` and `albums.json` changed since last time (ETag / Last-Modified); if not, nothing is downloaded or reprocessed.
 - **You publish recent posts, with archives.** Your `items.json` holds the last 90 days of posts (at least your 50 newest). Older ones move to signed monthly archives (`api/archive/items-YYYY-MM.json`), so friends download less. Your page lists them under **Older posts**, and each month loads when a visitor opens it. Studio itself still shows all your posts.
 
+### Letting people know you added them
+
+Studio has no server or inbox, so adding someone as a friend doesn't notify them. Instead:
+
+- **Send a signed link.** **Let them know** on a friend's card copies a private `webring://friend-notice` link, signed with your key, to send however you like. Their Studio checks it's addressed to them, under 30 days old and signed by your site's key, then lists you under **Added you** with **Add back**, **Dismiss** and **Block**. Your site must be published first. Nothing is added automatically.
+- **Mutual friends.** When you sync a friend whose signed, public friends list includes you, their card shows **↔ Mutual**.
+- **People in your rings.** When rings sync, members whose public friends list includes you appear under **Added you**, even if you haven't added them yet. Studio only checks ring members (at most 200 per sync) and skips your friends and anyone blocked.
+
+Private friends are never published, so they can't be discovered. "Added you" and Mutual status stay on your computer.
+
 ### Webrings
 
 A webring is a circle of sites linked by **← Prev**, **Next →** and **Random**. Each ring has a **maintainer** who decides who's in it. Everything still runs on static files:
