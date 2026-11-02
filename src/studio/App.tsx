@@ -1,5 +1,6 @@
 import React, { useEffect, useRef, useState } from 'react';
 import {
+  AlbumDisplay,
   CompleteSiteBundle,
   CreatePersonaInput,
   EndorsementItem,
@@ -668,6 +669,8 @@ export const App: React.FC = () => {
   const [newAlbumTitle, setNewAlbumTitle] = useState('');
   const [newAlbumDesc, setNewAlbumDesc] = useState('');
   const [newAlbumTags, setNewAlbumTags] = useState('');
+  const [newAlbumPostToFeed, setNewAlbumPostToFeed] = useState(false);
+  const [newAlbumDisplay, setNewAlbumDisplay] = useState<AlbumDisplay>('card');
   const [selectedAlbumId, setSelectedAlbumId] = useState('');
   const [newPhotoUrl, setNewPhotoUrl] = useState('');
   const [newPhotoCaption, setNewPhotoCaption] = useState('');
@@ -675,7 +678,13 @@ export const App: React.FC = () => {
   const [mediaUsage, setMediaUsage] = useState<{ files: number; bytes: number } | null>(null);
   const [isImportingPhotos, setIsImportingPhotos] = useState(false);
   const [isDraggingPhotos, setIsDraggingPhotos] = useState(false);
-  const [albumDraft, setAlbumDraft] = useState<{ title: string; description: string; tags: string } | null>(null);
+  const [albumDraft, setAlbumDraft] = useState<{
+    title: string;
+    description: string;
+    tags: string;
+    postToFeed: boolean;
+    display: AlbumDisplay;
+  } | null>(null);
   const [photoDrafts, setPhotoDrafts] = useState<Record<string, { caption: string; altText: string }>>({});
 
   // New Item (Wall Post / Like / Share / Recommendation / Comment) state
@@ -1078,10 +1087,14 @@ export const App: React.FC = () => {
         .split(',')
         .map((s) => s.trim())
         .filter(Boolean),
+      postToFeed: newAlbumPostToFeed,
+      display: newAlbumDisplay,
     })) as { id: string };
     setNewAlbumTitle('');
     setNewAlbumDesc('');
     setNewAlbumTags('');
+    setNewAlbumPostToFeed(false);
+    setNewAlbumDisplay('card');
     setSelectedAlbumId(created.id);
     await refreshStudioData();
     notify(`Created photo album "${newAlbumTitle}"`);
@@ -1192,6 +1205,8 @@ export const App: React.FC = () => {
         .split(',')
         .map((t) => t.trim())
         .filter(Boolean),
+      postToFeed: albumDraft.postToFeed,
+      display: albumDraft.display,
     });
     setAlbumDraft(null);
     await refreshStudioData();
@@ -2432,7 +2447,13 @@ export const App: React.FC = () => {
             const albums = bundle.albums.albums;
             const album = albums.find((a) => a.id === selectedAlbumId);
             const draft = album
-              ? albumDraft || { title: album.title, description: album.description, tags: album.tags.join(', ') }
+              ? albumDraft || {
+                  title: album.title,
+                  description: album.description,
+                  tags: album.tags.join(', '),
+                  postToFeed: album.postToFeed ?? false,
+                  display: album.display ?? 'card',
+                }
               : null;
             return (
             <div className="max-w-6xl mx-auto space-y-6">
@@ -2477,6 +2498,32 @@ export const App: React.FC = () => {
                       placeholder="Description (optional)"
                       className="w-full px-3 py-2 rounded-xl bg-slate-950 border border-slate-800 text-sm"
                     />
+                    <label className="flex items-start gap-2 text-xs text-slate-300 cursor-pointer">
+                      <input
+                        type="checkbox"
+                        checked={newAlbumPostToFeed}
+                        onChange={(e) => setNewAlbumPostToFeed(e.target.checked)}
+                        className="mt-0.5"
+                      />
+                      <span>
+                        Post to feed
+                        <span className="block text-[11px] text-slate-500">Announce this album in your posts timeline</span>
+                      </span>
+                    </label>
+                    <div className="flex flex-wrap items-center gap-3 text-xs text-slate-300">
+                      <span>Show in Photos as:</span>
+                      {(['card', 'expanded'] as AlbumDisplay[]).map((mode) => (
+                        <label key={mode} className="flex items-center gap-1.5 cursor-pointer">
+                          <input
+                            type="radio"
+                            name="new-album-display"
+                            checked={newAlbumDisplay === mode}
+                            onChange={() => setNewAlbumDisplay(mode)}
+                          />
+                          {mode === 'card' ? 'Card' : 'Expanded'}
+                        </label>
+                      ))}
+                    </div>
                     <button
                       type="submit"
                       className="w-full px-3 py-2 rounded-xl bg-indigo-600 hover:bg-indigo-500 text-white font-semibold text-xs"
@@ -2556,6 +2603,51 @@ export const App: React.FC = () => {
                         placeholder="Description (Markdown: headings, links, lists, tables)"
                         className="md:col-span-2"
                       />
+                    </div>
+                    <div className="flex flex-wrap items-center gap-x-2 gap-y-1 text-xs text-slate-500">
+                      <span>Page address:</span>
+                      <code className="text-slate-300">{album.pageUrl}</code>
+                      {publishSettings.lastPublishedAt && !isPlaceholderSiteUrl(bundle.profile.siteUrl) && (
+                        <button
+                          type="button"
+                          onClick={() =>
+                            window.studioApi?.openExternal(
+                              `${bundle.profile.siteUrl.replace(/\/+$/, '')}/${album.pageUrl}`,
+                            )
+                          }
+                          className="text-indigo-400 hover:text-indigo-300"
+                        >
+                          View page ↗
+                        </button>
+                      )}
+                    </div>
+                    <div className="space-y-2">
+                      <label className="flex items-start gap-2 text-xs text-slate-300 cursor-pointer">
+                        <input
+                          type="checkbox"
+                          checked={draft.postToFeed}
+                          onChange={(e) => setAlbumDraft({ ...draft, postToFeed: e.target.checked })}
+                          className="mt-0.5"
+                        />
+                        <span>
+                          Post to feed
+                          <span className="block text-[11px] text-slate-500">Announce this album in your posts timeline</span>
+                        </span>
+                      </label>
+                      <div className="flex flex-wrap items-center gap-3 text-xs text-slate-300">
+                        <span>Show in Photos as:</span>
+                        {(['card', 'expanded'] as AlbumDisplay[]).map((mode) => (
+                          <label key={mode} className="flex items-center gap-1.5 cursor-pointer">
+                            <input
+                              type="radio"
+                              name="album-display"
+                              checked={draft.display === mode}
+                              onChange={() => setAlbumDraft({ ...draft, display: mode })}
+                            />
+                            {mode === 'card' ? 'Card' : 'Expanded'}
+                          </label>
+                        ))}
+                      </div>
                     </div>
                     <div className="flex flex-wrap items-center gap-2">
                       {albumDraft && (
