@@ -654,7 +654,7 @@ export class WebringMcpServer {
             personaId: personaIdProp,
             entryType: {
               type: 'string',
-              enum: ['photo', 'post', 'like', 'share', 'recommendation', 'comment'],
+              enum: ['photo', 'album', 'post', 'like', 'share', 'recommendation', 'comment'],
               description: 'Optional filter by entry type.',
             },
             friendSiteUrl: {

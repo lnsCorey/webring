@@ -289,7 +289,7 @@ interface NetworkFeedEntry {
   friendName: string;
   friendAvatarUrl: string;
   friendDid: string;
-  entryType: 'photo' | 'post' | 'like' | 'share' | 'recommendation' | 'comment';
+  entryType: 'photo' | 'album' | 'post' | 'like' | 'share' | 'recommendation' | 'comment';
   title: string;
   canonicalUrl: string;
   targetUrl: string;
@@ -298,6 +298,12 @@ interface NetworkFeedEntry {
   tags: string[];
   createdAt: string;
   verifiedSignature: boolean;
+  /** Photo rows: the canonical URL of their album. */
+  albumUrl?: string;
+  /** Album rows: how many photos, how many are new, and up to 3 thumbnails for the card. */
+  photoCount?: number;
+  newCount?: number;
+  peekUrls?: string[];
   /** Your own post or photo, shown in the feed (never stored with friends' entries). */
   isMine?: boolean;
 }

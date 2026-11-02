@@ -269,15 +269,24 @@ export interface NetworkFeedEntry {
   friendName: string;
   friendAvatarUrl: string;
   friendDid: string;
-  entryType: 'photo' | 'post' | 'like' | 'share' | 'recommendation' | 'comment';
+  entryType: 'photo' | 'album' | 'post' | 'like' | 'share' | 'recommendation' | 'comment';
   title: string;
   canonicalUrl: string;
   targetUrl: string;
   commentary: string;
   mediaUrl: string;
   tags: string[];
+  /** Album rows: the newest photo's createdAt (or the album's, if it's empty). */
   createdAt: string;
   verifiedSignature: boolean;
+  /** Photo rows: the canonical URL of the album they belong to. Photo rows aren't in the main feed. */
+  albumUrl?: string;
+  /** Album rows: how many photos the album has. */
+  photoCount?: number;
+  /** Album rows: photos first seen since the album was last opened. */
+  newCount?: number;
+  /** Album rows: up to 3 absolute thumbnail URLs for the card. */
+  peekUrls?: string[];
 }
 
 /** A friend's post or photo the user saved: a private copy kept outside the feed window. */
@@ -380,6 +389,36 @@ export interface StudioDatabaseOptions {
 
 /** Friends' posts stay in the feed this many days unless the user picks another window (0 = forever). */
 export const DEFAULT_FEED_RETENTION_DAYS = 90;
+
+/** A network_feed row; album fields only on album rows, albumUrl only on photos in an album. */
+function mapNetworkFeedRow(r: Record<string, unknown>): NetworkFeedEntry {
+  const entryType = r.entry_type as NetworkFeedEntry['entryType'];
+  const albumUrl = String(r.album_url || '');
+  return {
+    id: String(r.id),
+    friendSiteUrl: String(r.friend_site_url),
+    friendName: String(r.friend_name),
+    friendAvatarUrl: String(r.friend_avatar_url || ''),
+    friendDid: String(r.friend_did || ''),
+    entryType,
+    title: String(r.title),
+    canonicalUrl: String(r.canonical_url),
+    targetUrl: String(r.target_url),
+    commentary: String(r.commentary || ''),
+    mediaUrl: String(r.media_url || ''),
+    tags: JSON.parse(String(r.tags_json || '[]')),
+    createdAt: String(r.created_at),
+    verifiedSignature: Boolean(r.verified_signature),
+    ...(albumUrl ? { albumUrl } : {}),
+    ...(entryType === 'album'
+      ? {
+          photoCount: Number(r.photo_count || 0),
+          newCount: Number(r.new_count || 0),
+          peekUrls: JSON.parse(String(r.peek_json || '[]')) as string[],
+        }
+      : {}),
+  };
+}
 
 /** A published document's content, ignoring its own `updatedAt` and signature. */
 function publishedContentHash(doc: Record<string, unknown>): string {
@@ -891,6 +930,20 @@ export class StudioDatabase {
       CREATE INDEX IF NOT EXISTS idx_network_feed_created ON network_feed(created_at);
       CREATE INDEX IF NOT EXISTS idx_endorsements_author ON endorsements(author_site_url);
     `);
+
+    // Album cards: a friend's album is one row, and its photos are rows linked to it by album_url
+    const feedColumns = this.db.prepare('PRAGMA table_info(network_feed)').all() as Array<{ name: string }>;
+    const addFeedColumn = (name: string, ddl: string) => {
+      if (feedColumns.some((c) => c.name === name)) return false;
+      this.db.exec(`ALTER TABLE network_feed ADD COLUMN ${name} ${ddl};`);
+      return true;
+    };
+    // The next sync reprocesses every friend's albums, turning per-photo rows into album cards
+    if (addFeedColumn('album_url', "TEXT NOT NULL DEFAULT ''")) this.clearFetchCache();
+    addFeedColumn('photo_count', 'INTEGER NOT NULL DEFAULT 0');
+    addFeedColumn('new_count', 'INTEGER NOT NULL DEFAULT 0');
+    addFeedColumn('peek_json', "TEXT NOT NULL DEFAULT '[]'");
+    this.db.exec('CREATE INDEX IF NOT EXISTS idx_network_feed_album ON network_feed(album_url);');
 
     // Joined-ring tracking. Rows that predate it become 'legacy' (still published, never auto-removed)
     const ringColumns = this.db
@@ -2092,7 +2145,7 @@ export class StudioDatabase {
       .all(normalizeSiteUrl(friendSiteUrl)) as Array<{ id: string; canonical_url: string; entry_type: string; created_at: string }>;
     const stale = rows.filter(
       (r) =>
-        (scope === 'photos') === (r.entry_type === 'photo') &&
+        (scope === 'photos') === (r.entry_type === 'photo' || r.entry_type === 'album') &&
         !keep.has(r.canonical_url) &&
         (!sinceIso || r.created_at >= sinceIso)
     );
@@ -2154,11 +2207,20 @@ export class StudioDatabase {
     return days > 0 ? new Date(nowMs - days * 86400000).toISOString() : null;
   }
 
-  /** Removes feed rows older than the window. Saved posts and endorsements aren't touched. */
+  /**
+   * Removes feed rows older than the window. Saved posts and endorsements aren't touched. An album
+   * in the window (its newest photo is) keeps all its photos, so the album view is never partial.
+   */
   public pruneFeedOutsideWindow(nowMs = Date.now()): number {
     const cutoff = this.feedCutoffIso(nowMs);
     if (!cutoff) return 0;
-    const result = this.db.prepare('DELETE FROM network_feed WHERE created_at < ?').run(cutoff) as { changes?: number | bigint };
+    const result = this.db
+      .prepare(
+        `DELETE FROM network_feed WHERE created_at < ?
+           AND NOT (entry_type = 'photo' AND album_url != '' AND album_url IN (
+             SELECT canonical_url FROM network_feed WHERE entry_type = 'album' AND created_at >= ?))`
+      )
+      .run(cutoff, cutoff) as { changes?: number | bigint };
     return Number(result.changes || 0);
   }
 
@@ -2834,27 +2896,39 @@ export class StudioDatabase {
       );
   }
 
+  /** The main feed: posts, endorsements and album cards. An album's photos are in getFeedAlbumPhotos. */
   public getNetworkFeed(): NetworkFeedEntry[] {
     const rows = this.db
-      .prepare('SELECT * FROM network_feed ORDER BY created_at DESC LIMIT 200')
+      .prepare("SELECT * FROM network_feed WHERE entry_type != 'photo' ORDER BY created_at DESC LIMIT 200")
       .all() as Array<Record<string, unknown>>;
+    return rows.map(mapNetworkFeedRow);
+  }
 
-    return rows.map((r) => ({
-      id: String(r.id),
-      friendSiteUrl: String(r.friend_site_url),
-      friendName: String(r.friend_name),
-      friendAvatarUrl: String(r.friend_avatar_url || ''),
-      friendDid: String(r.friend_did || ''),
-      entryType: r.entry_type as NetworkFeedEntry['entryType'],
-      title: String(r.title),
-      canonicalUrl: String(r.canonical_url),
-      targetUrl: String(r.target_url),
-      commentary: String(r.commentary || ''),
-      mediaUrl: String(r.media_url || ''),
-      tags: JSON.parse(String(r.tags_json || '[]')),
-      createdAt: String(r.created_at),
-      verifiedSignature: Boolean(r.verified_signature),
-    }));
+  /** A friend album's photos, in album order. */
+  public getFeedAlbumPhotos(albumUrl: string): NetworkFeedEntry[] {
+    const rows = this.db
+      .prepare("SELECT * FROM network_feed WHERE album_url = ? AND entry_type = 'photo' ORDER BY created_at ASC")
+      .all(albumUrl) as Array<Record<string, unknown>>;
+    return rows.map(mapNetworkFeedRow);
+  }
+
+  /**
+   * What sync needs to count an album's new photos: the stored album card's newCount (null if
+   * there's no card yet) and the canonical URLs of the photos already stored for it.
+   */
+  public getFeedAlbumSyncState(albumUrl: string): { newCount: number | null; photoUrls: Set<string> } {
+    const card = this.db
+      .prepare("SELECT new_count FROM network_feed WHERE canonical_url = ? AND entry_type = 'album'")
+      .get(albumUrl) as { new_count: number } | undefined;
+    const photos = this.db
+      .prepare("SELECT canonical_url FROM network_feed WHERE album_url = ? AND entry_type = 'photo'")
+      .all(albumUrl) as Array<{ canonical_url: string }>;
+    return { newCount: card ? Number(card.new_count) : null, photoUrls: new Set(photos.map((p) => p.canonical_url)) };
+  }
+
+  /** The user opened the album: its card no longer shows new photos. */
+  public markFeedAlbumSeen(albumUrl: string): void {
+    this.db.prepare("UPDATE network_feed SET new_count = 0 WHERE canonical_url = ? AND entry_type = 'album'").run(albumUrl);
   }
 
   // ---------------------------------------------------------------------------
@@ -3056,8 +3130,9 @@ export class StudioDatabase {
         `INSERT OR REPLACE INTO network_feed (
           id, friend_site_url, friend_name, friend_avatar_url, friend_did,
           entry_type, title, canonical_url, target_url, commentary,
-          media_url, tags_json, created_at, verified_signature
-        ) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)`
+          media_url, tags_json, created_at, verified_signature,
+          album_url, photo_count, new_count, peek_json
+        ) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)`
       )
       .run(
         id,
@@ -3073,7 +3148,11 @@ export class StudioDatabase {
         entry.mediaUrl,
         JSON.stringify(entry.tags || []),
         entry.createdAt,
-        entry.verifiedSignature ? 1 : 0
+        entry.verifiedSignature ? 1 : 0,
+        entry.albumUrl || '',
+        entry.photoCount || 0,
+        entry.newCount || 0,
+        JSON.stringify(entry.peekUrls || [])
       );
   }
 

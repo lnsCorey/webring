@@ -216,6 +216,7 @@ describe('Two-Peer Pull Federation, Static Site Generation & Endorsement Discove
       title: 'Botanical Glasshouse',
       description: 'Rare ferns and orchids',
       tags: ['botany', 'glasshouse'],
+      postToFeed: true,
     });
     const alicePhoto = aliceDb.addPhotoToAlbum({
       albumId: aliceAlbum.id,
@@ -253,8 +254,8 @@ describe('Two-Peer Pull Federation, Static Site Generation & Endorsement Discove
     expect(crawlAliceRes.verifiedSignature).toBe(true);
     expect(crawlAliceRes.photosIndexed).toBeGreaterThan(0);
 
-    // Bob's neighborhood feed now contains Alice's photo
-    const bobFeed = bobDb.getNetworkFeed();
+    // Bob's neighborhood feed now contains Alice's photo (in her album's card)
+    const bobFeed = bobDb.getFeedAlbumPhotos(aliceAlbum.canonicalUrl);
     expect(bobFeed.some((f) => f.canonicalUrl === alicePhoto.canonicalUrl)).toBe(true);
 
     // Bob likes Alice's photo by referencing its canonicalUrl
@@ -670,7 +671,7 @@ describe('Two-Peer Pull Federation, Static Site Generation & Endorsement Discove
         handle: 'bob-sec.ring.test',
         displayName: 'Bob Secure',
       });
-      const bobAlbum = bobDb.createAlbum({ title: 'Verified Album' });
+      const bobAlbum = bobDb.createAlbum({ title: 'Verified Album', postToFeed: true });
       bobDb.addPhotoToAlbum({
         albumId: bobAlbum.id,
         url: 'https://bob-sec.ring.test/photo.jpg',
@@ -713,7 +714,7 @@ describe('Two-Peer Pull Federation, Static Site Generation & Endorsement Discove
 
       // Photos from untampered albums.json remain verified, while tampered items/endorsements are marked unverified!
       const feedAfterTamper = aliceDb.getNetworkFeed();
-      const photoEntry = feedAfterTamper.find((e) => e.entryType === 'photo');
+      const photoEntry = aliceDb.getFeedAlbumPhotos(bobAlbum.canonicalUrl)[0];
       const itemEntry = feedAfterTamper.find((e) => e.entryType === 'like');
       expect(photoEntry?.verifiedSignature).toBe(true);
       expect(itemEntry?.verifiedSignature).toBe(false);
@@ -2426,7 +2427,7 @@ describe('Media Library', () => {
 
   it('lets friends see replaced and removed photos when they sync', async () => {
     const owner = makeSite('erin');
-    const album = owner.db.createAlbum({ title: 'Shared' });
+    const album = owner.db.createAlbum({ title: 'Shared', postToFeed: true });
     const files = [0, 1].map((n) => {
       const f = path.join(tempRoot, `s${n}.jpg`);
       fs.writeFileSync(f, makePhoneJpeg(32, 32, 1, n * 70));
@@ -2440,7 +2441,7 @@ describe('Media Library', () => {
     const crawler = new RingCrawler(friend.db);
     await crawler.crawlFriendSite('https://erin.example', out);
     const [keep, drop] = owner.db.getAlbums()[0].photos;
-    expect(friend.db.getNetworkFeed().filter((e) => e.entryType === 'photo')).toHaveLength(2);
+    expect(friend.db.getFeedAlbumPhotos(album.canonicalUrl)).toHaveLength(2);
 
     const replacement = path.join(tempRoot, 'swap.jpg');
     fs.writeFileSync(replacement, makePhoneJpeg(32, 32, 1, 222));
@@ -2449,7 +2450,7 @@ describe('Media Library', () => {
     owner.publisher.publishToLocalDirectory(out);
     await crawler.crawlFriendSite('https://erin.example', out);
 
-    const photos = friend.db.getNetworkFeed().filter((e) => e.entryType === 'photo');
+    const photos = friend.db.getFeedAlbumPhotos(album.canonicalUrl);
     expect(photos).toHaveLength(1);
     expect(photos[0].canonicalUrl).toBe(keep.canonicalUrl);
     expect(photos[0].mediaUrl).toContain(owner.db.getAlbums()[0].photos[0].sha256!.slice(0, 20));
@@ -3868,5 +3869,257 @@ describe('Album cards', () => {
     loc.hash = '';
     listeners.close({});
     expect(urls).toEqual(['/albums/trips/?x=1#photo-p1', '/albums/trips/?x=1']);
+  });
+});
+
+describe('Album feed cards (syncing friends)', () => {
+  let tempRoot: string;
+
+  beforeEach(() => {
+    tempRoot = fs.mkdtempSync(path.join(os.tmpdir(), 'webring-album-sync-'));
+  });
+
+  afterEach(() => {
+    fs.rmSync(tempRoot, { recursive: true, force: true });
+  });
+
+  const DAY = 86400000;
+  const daysAgo = (n: number) => new Date(Date.now() - n * DAY).toISOString();
+  const raw = (db: StudioDatabase) => (db as unknown as { db: DatabaseSync }).db;
+  const makeSite = (name: string) => {
+    const dir = path.join(tempRoot, name);
+    const db = new StudioDatabase(dir, `${name}.sqlite`);
+    const siteUrl = `https://${name}.ring.test`;
+    db.updateProfile({ siteUrl, handle: `${name}.ring.test`, displayName: name });
+    const outDir = path.join(dir, 'public_html');
+    const publish = () => new StaticSiteGenerator(db).generateToDirectory(outDir);
+    return { db, dir, siteUrl, outDir, publish };
+  };
+  /** Adds photos dated `days` days ago (one minute apart, in album order). */
+  const addPhotos = (db: StudioDatabase, albumId: string, names: string[], days: number) =>
+    names.map((n, i) => {
+      const photo = db.addPhotoToAlbum({ albumId, url: `media/${n}.jpg`, thumbUrl: `media/${n}-t.jpg`, caption: n });
+      const createdAt = new Date(Date.now() - days * DAY + i * 60000).toISOString();
+      raw(db).prepare('UPDATE photos SET created_at = ? WHERE id = ?').run(createdAt, photo.id);
+      return { ...photo, createdAt };
+    });
+  const crawl = (alice: ReturnType<typeof makeSite>, carol: ReturnType<typeof makeSite>) =>
+    new RingCrawler(alice.db).crawlFriendSite(carol.siteUrl, carol.outDir);
+  const albumCard = (db: StudioDatabase) => db.getNetworkFeed().find((e) => e.entryType === 'album');
+
+  it('shows a friend album as one feed card and keeps its photos for the album view', async () => {
+    const alice = makeSite('alice');
+    const carol = makeSite('carol');
+    try {
+      const album = carol.db.createAlbum({ title: 'Trips', description: 'Summer', postToFeed: true });
+      const photos = addPhotos(carol.db, album.id, ['p0', 'p1', 'p2'], 3);
+      carol.publish();
+      const res = await crawl(alice, carol);
+      expect(res.verifiedSignature).toBe(true);
+
+      const feed = alice.db.getNetworkFeed();
+      expect(feed.filter((e) => e.entryType === 'photo')).toHaveLength(0);
+      const card = feed.find((e) => e.entryType === 'album')!;
+      expect(card).toMatchObject({
+        title: 'Trips',
+        commentary: 'Summer',
+        canonicalUrl: album.canonicalUrl,
+        photoCount: 3,
+        newCount: 0,
+        targetUrl: 'https://carol.ring.test/albums/trips/',
+        mediaUrl: 'https://carol.ring.test/media/p0-t.jpg',
+        createdAt: photos[2].createdAt,
+        verifiedSignature: true,
+      });
+      expect(card.peekUrls).toEqual(['p0', 'p1', 'p2'].map((n) => `https://carol.ring.test/media/${n}-t.jpg`));
+      const albumPhotos = alice.db.getFeedAlbumPhotos(card.canonicalUrl);
+      expect(albumPhotos).toHaveLength(3);
+      expect(albumPhotos.map((p) => p.canonicalUrl)).toEqual(photos.map((p) => p.canonicalUrl));
+      expect(albumPhotos.every((p) => p.entryType === 'photo' && p.albumUrl === album.canonicalUrl && p.verifiedSignature)).toBe(true);
+      // Album cards and their photos can both be saved
+      expect(alice.db.saveFeedEntry(card.canonicalUrl).entryType).toBe('album');
+      expect(alice.db.saveFeedEntry(photos[0].canonicalUrl).entryType).toBe('photo');
+    } finally {
+      alice.db.close();
+      carol.db.close();
+    }
+  });
+
+  it('counts photos added later as new and clears the count when opened', async () => {
+    const alice = makeSite('alice');
+    const carol = makeSite('carol');
+    try {
+      const album = carol.db.createAlbum({ title: 'Trips', postToFeed: true });
+      addPhotos(carol.db, album.id, ['p0', 'p1', 'p2'], 3);
+      carol.publish();
+      await crawl(alice, carol);
+      expect(albumCard(alice.db)?.newCount).toBe(0);
+
+      const added = addPhotos(carol.db, album.id, ['n0', 'n1'], 1);
+      carol.publish();
+      await crawl(alice, carol);
+      const card = albumCard(alice.db)!;
+      expect(card).toMatchObject({ newCount: 2, photoCount: 5, createdAt: added[1].createdAt });
+      expect(card.peekUrls![0]).toBe('https://carol.ring.test/media/n1-t.jpg');
+      expect(card.peekUrls).toHaveLength(3);
+      expect(alice.db.getFeedAlbumPhotos(album.canonicalUrl)).toHaveLength(5);
+
+      // Reprocessing the same document adds nothing
+      alice.db.clearFetchCache();
+      await crawl(alice, carol);
+      expect(albumCard(alice.db)?.newCount).toBe(2);
+
+      alice.db.markFeedAlbumSeen(album.canonicalUrl);
+      expect(albumCard(alice.db)?.newCount).toBe(0);
+      await crawl(alice, carol);
+      expect(albumCard(alice.db)?.newCount).toBe(0);
+    } finally {
+      alice.db.close();
+      carol.db.close();
+    }
+  });
+
+  it('leaves unposted albums out of the feed, and removes one that is unposted later, only on a verified sync', async () => {
+    const alice = makeSite('alice');
+    const carol = makeSite('carol');
+    try {
+      const hidden = carol.db.createAlbum({ title: 'Private-ish' });
+      addPhotos(carol.db, hidden.id, ['h0', 'h1'], 2);
+      carol.publish();
+      await crawl(alice, carol);
+      expect(alice.db.getNetworkFeed()).toHaveLength(0);
+      expect(alice.db.getFeedAlbumPhotos(hidden.canonicalUrl)).toHaveLength(0);
+
+      const posted = carol.db.createAlbum({ title: 'Trips', postToFeed: true });
+      const photos = addPhotos(carol.db, posted.id, ['p0', 'p1'], 2);
+      carol.publish();
+      await crawl(alice, carol);
+      expect(albumCard(alice.db)?.canonicalUrl).toBe(posted.canonicalUrl);
+      expect(alice.db.getFeedAlbumPhotos(posted.canonicalUrl)).toHaveLength(2);
+      expect(alice.db.getFeedAlbumPhotos(hidden.canonicalUrl)).toHaveLength(0);
+      alice.db.saveFeedEntry(photos[0].canonicalUrl, 'keep');
+
+      carol.db.updateAlbum(posted.id, { postToFeed: false });
+      carol.publish();
+      const albumsPath = path.join(carol.outDir, 'api/albums.json');
+      const original = fs.readFileSync(albumsPath, 'utf8');
+      const tampered = JSON.parse(original);
+      tampered.albums[0].description = 'tampered';
+      fs.writeFileSync(albumsPath, JSON.stringify(tampered));
+      const tamperedRes = await crawl(alice, carol);
+      expect(tamperedRes.entriesPruned).toBe(0);
+      expect(albumCard(alice.db)?.canonicalUrl).toBe(posted.canonicalUrl);
+      expect(alice.db.getFeedAlbumPhotos(posted.canonicalUrl)).toHaveLength(2);
+
+      fs.writeFileSync(albumsPath, original);
+      const res = await crawl(alice, carol);
+      expect(res.entriesPruned).toBe(3);
+      expect(albumCard(alice.db)).toBeUndefined();
+      expect(alice.db.getFeedAlbumPhotos(posted.canonicalUrl)).toHaveLength(0);
+      expect(alice.db.getSavedPosts()).toMatchObject([{ canonicalUrl: photos[0].canonicalUrl, note: 'keep' }]);
+    } finally {
+      alice.db.close();
+      carol.db.close();
+    }
+  });
+
+  it('treats albums from older Studios (no settings) as posted cards', async () => {
+    const alice = makeSite('alice');
+    const carol = makeSite('carol');
+    try {
+      const album = carol.db.createAlbum({ title: 'Old style' });
+      addPhotos(carol.db, album.id, ['p0', 'p1'], 2);
+      carol.publish();
+      const albumsPath = path.join(carol.outDir, 'api/albums.json');
+      const { proof: _proof, ...doc } = JSON.parse(fs.readFileSync(albumsPath, 'utf8'));
+      for (const a of doc.albums) {
+        delete a.postToFeed;
+        delete a.display;
+        delete a.slug;
+        delete a.pageUrl;
+      }
+      fs.writeFileSync(albumsPath, JSON.stringify(signDocument(doc, siteUrlToDidWeb(carol.siteUrl), carol.db.getKeys().privateKeyPem)));
+
+      const res = await crawl(alice, carol);
+      expect(res.verifiedSignature).toBe(true);
+      expect(albumCard(alice.db)).toMatchObject({
+        canonicalUrl: album.canonicalUrl,
+        title: 'Old style',
+        photoCount: 2,
+        newCount: 0,
+        targetUrl: 'https://carol.ring.test',
+      });
+      expect(alice.db.getFeedAlbumPhotos(album.canonicalUrl)).toHaveLength(2);
+    } finally {
+      alice.db.close();
+      carol.db.close();
+    }
+  });
+
+  it('keeps every photo of a recently updated album inside the feed window', async () => {
+    const alice = makeSite('alice');
+    const carol = makeSite('carol');
+    try {
+      expect(alice.db.getFeedRetentionDays()).toBe(90);
+      const album = carol.db.createAlbum({ title: 'Long trip', postToFeed: true });
+      addPhotos(carol.db, album.id, ['o0', 'o1', 'o2'], 200);
+      const fresh = addPhotos(carol.db, album.id, ['new'], 1);
+      const stale = carol.db.createAlbum({ title: 'Ancient', postToFeed: true });
+      addPhotos(carol.db, stale.id, ['a0'], 200);
+      carol.publish();
+      await crawl(alice, carol);
+
+      const cards = alice.db.getNetworkFeed().filter((e) => e.entryType === 'album');
+      expect(cards.map((c) => c.canonicalUrl)).toEqual([album.canonicalUrl]);
+      expect(cards[0].createdAt).toBe(fresh[0].createdAt);
+      expect(alice.db.getFeedAlbumPhotos(album.canonicalUrl)).toHaveLength(4);
+      expect(alice.db.getFeedAlbumPhotos(stale.canonicalUrl)).toHaveLength(0);
+      alice.db.pruneFeedOutsideWindow();
+      expect(alice.db.getFeedAlbumPhotos(album.canonicalUrl)).toHaveLength(4);
+
+      // Once the album itself is outside the window, its photos go too
+      expect(alice.db.pruneFeedOutsideWindow(Date.now() + 100 * DAY)).toBe(5);
+      expect(alice.db.getFeedAlbumPhotos(album.canonicalUrl)).toHaveLength(0);
+    } finally {
+      alice.db.close();
+      carol.db.close();
+    }
+  });
+
+  it('upgrades per-photo feed rows to album cards on the first sync without new badges', async () => {
+    const alice = makeSite('alice');
+    const carol = makeSite('carol');
+    const album = carol.db.createAlbum({ title: 'Trips', postToFeed: true });
+    const photos = addPhotos(carol.db, album.id, ['p0', 'p1'], 2);
+    carol.publish();
+    for (const p of photos) {
+      alice.db.upsertNetworkFeedEntry({
+        friendSiteUrl: carol.siteUrl, friendName: 'carol', friendAvatarUrl: '', friendDid: '', entryType: 'photo', title: p.caption,
+        canonicalUrl: p.canonicalUrl, targetUrl: '', commentary: '', mediaUrl: '', tags: [], createdAt: p.createdAt, verifiedSignature: true,
+      });
+    }
+    alice.db.setFetchValidators(`${carol.siteUrl}/api/albums.json`, carol.siteUrl, { etag: '"v1"' });
+    alice.db.close();
+
+    // A database from before album cards: network_feed without the new columns
+    const old = new DatabaseSync(path.join(alice.dir, 'alice.sqlite'));
+    old.exec('DROP INDEX IF EXISTS idx_network_feed_album');
+    for (const column of ['album_url', 'photo_count', 'new_count', 'peek_json']) {
+      old.exec(`ALTER TABLE network_feed DROP COLUMN ${column}`);
+    }
+    old.close();
+
+    const reopened = { ...alice, db: new StudioDatabase(alice.dir, 'alice.sqlite') };
+    try {
+      expect(reopened.db.getFetchValidators(`${carol.siteUrl}/api/albums.json`)).toBeNull();
+      await crawl(reopened, carol);
+      const feed = reopened.db.getNetworkFeed();
+      expect(feed.filter((e) => e.entryType === 'photo')).toHaveLength(0);
+      expect(feed.find((e) => e.entryType === 'album')).toMatchObject({ canonicalUrl: album.canonicalUrl, newCount: 0, photoCount: 2 });
+      expect(reopened.db.getFeedAlbumPhotos(album.canonicalUrl)).toHaveLength(2);
+    } finally {
+      reopened.db.close();
+      carol.db.close();
+    }
   });
 });
