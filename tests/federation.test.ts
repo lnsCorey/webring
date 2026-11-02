@@ -2764,6 +2764,41 @@ describe('Media Library references', () => {
   });
 });
 
+/** Runs the published page's scripts against a tiny fake DOM and returns what they render. */
+const renderPage = async (html: string) => {
+  const scripts = [...html.matchAll(/<script(?![^>]*src)[^>]*>([\s\S]*?)<\/script>/g)].map((m) => m[1]);
+  const root = { innerHTML: '', addEventListener: () => undefined, querySelectorAll: () => [] };
+  const attrs = new Map<string, string>();
+  const styles = new Map<string, string>();
+  const body = {
+    className: '',
+    setAttribute: (k: string, v: string) => attrs.set(k, v),
+    removeAttribute: (k: string) => attrs.delete(k),
+    style: { setProperty: (k: string, v: string) => styles.set(k, v) },
+  };
+  const windowStub: Record<string, unknown> = { location: { protocol: 'file:' } };
+  const context = vm.createContext({
+    window: windowStub,
+    document: {
+      body,
+      getElementById: (id: string) => (id === 'profile-root' ? root : null),
+      addEventListener: () => undefined,
+      createElement: () => ({ setAttribute: () => undefined }),
+    },
+    URLSearchParams,
+    console,
+    setTimeout,
+    parent: { postMessage: () => undefined },
+  });
+  windowStub.document = (context as { document: unknown }).document;
+  for (const code of scripts) {
+    // `window.__WEBRING_BUNDLE__ = …` must land on the window stub
+    vm.runInContext(code.replace(/^\s*window\./, 'window.'), context);
+  }
+  await new Promise((r) => setTimeout(r, 20)); // let the async page script finish
+  return { html: root.innerHTML, attrs, styles };
+};
+
 describe('Site Design (look & feel, page layout)', () => {
   let tempRoot: string;
 
@@ -2774,41 +2809,6 @@ describe('Site Design (look & feel, page layout)', () => {
   afterEach(() => {
     fs.rmSync(tempRoot, { recursive: true, force: true });
   });
-
-  /** Runs the published page's scripts against a tiny fake DOM and returns what they render. */
-  const renderPage = async (html: string) => {
-    const scripts = [...html.matchAll(/<script(?![^>]*src)[^>]*>([\s\S]*?)<\/script>/g)].map((m) => m[1]);
-    const root = { innerHTML: '', addEventListener: () => undefined, querySelectorAll: () => [] };
-    const attrs = new Map<string, string>();
-    const styles = new Map<string, string>();
-    const body = {
-      className: '',
-      setAttribute: (k: string, v: string) => attrs.set(k, v),
-      removeAttribute: (k: string) => attrs.delete(k),
-      style: { setProperty: (k: string, v: string) => styles.set(k, v) },
-    };
-    const windowStub: Record<string, unknown> = { location: { protocol: 'file:' } };
-    const context = vm.createContext({
-      window: windowStub,
-      document: {
-        body,
-        getElementById: (id: string) => (id === 'profile-root' ? root : null),
-        addEventListener: () => undefined,
-        createElement: () => ({ setAttribute: () => undefined }),
-      },
-      URLSearchParams,
-      console,
-      setTimeout,
-      parent: { postMessage: () => undefined },
-    });
-    windowStub.document = (context as { document: unknown }).document;
-    for (const code of scripts) {
-      // `window.__WEBRING_BUNDLE__ = …` must land on the window stub
-      vm.runInContext(code.replace(/^\s*window\./, 'window.'), context);
-    }
-    await new Promise((r) => setTimeout(r, 20)); // let the async page script finish
-    return { html: root.innerHTML, attrs, styles };
-  };
 
   const blockOrder = (html: string) => [...html.matchAll(/data-block="([a-z]+)"/g)].map((m) => m[1]);
 
@@ -3798,5 +3798,75 @@ describe('Album cards', () => {
     expect(albumDisplay({})).toBe('card');
     expect(albumDisplay({ display: 'bogus' })).toBe('card');
     expect(AlbumItemSchema.parse({ id: 'x', canonicalUrl: 'u', title: 't', createdAt: 'c', updatedAt: 'c', display: 'bogus' }).display).toBeUndefined();
+  });
+
+  const makeAlbumSite = () => {
+    const db = new StudioDatabase(dir, 'a.sqlite');
+    db.updateProfile({ siteUrl: 'https://alice.ring.test/', displayName: 'Alice' });
+    const album = db.createAlbum({ title: 'Trips', description: 'Summer **2026** <b>x</b>' });
+    for (let n = 1; n <= 5; n++) db.addPhotoToAlbum({ albumId: album.id, url: `media/albums/trips/p${n}.jpg`, caption: `Photo ${n}` });
+    return { db, album };
+  };
+
+  it('writes a shareable page for each album', async () => {
+    const { db } = makeAlbumSite();
+    db.createItem({ type: 'post', title: 'Unrelated post', commentary: 'x' });
+    const out = path.join(dir, 'out');
+    const result = new StaticSiteGenerator(db).generateToDirectory(out);
+    expect(result.filesWritten).toContain('albums/trips/index.html');
+    const page = fs.readFileSync(path.join(out, 'albums/trips/index.html'), 'utf8');
+    expect(page).toContain('<base href="../../">');
+    expect(page).toContain('<title>Trips · Alice</title>');
+    expect(page).toContain('<meta property="og:title" content="Trips · Alice"');
+    expect(page).toContain('<meta property="og:description" content="Summer 2026 &lt;b&gt;x&lt;/b&gt;"');
+    expect(page).toContain('<meta property="og:image" content="https://alice.ring.test/media/albums/');
+    expect(page).toContain('<meta property="og:url" content="https://alice.ring.test/albums/trips/"');
+    expect(page).toContain('<meta name="twitter:card" content="summary_large_image"');
+    const { html } = await renderPage(page);
+    expect(html).toContain('Back to Alice');
+    expect(html).toContain('5 photos');
+    expect(html).toContain('Share album');
+    expect(html.match(/data-photo-id=/g)!.length).toBe(5);
+    expect(html).not.toContain('data-block=');
+    // The embedded bundle carries just this album
+    expect(page).not.toContain('Unrelated post');
+    db.close();
+  });
+
+  it('removes an album page from the destination when the album is deleted', () => {
+    const { db, album } = makeAlbumSite();
+    const out = path.join(dir, 'dest');
+    const publisher = new SitePublisher(new StaticSiteGenerator(db));
+    expect(publisher.publishToLocalDirectory(out).success).toBe(true);
+    expect(fs.existsSync(path.join(out, 'albums/trips/index.html'))).toBe(true);
+    db.deleteAlbum(album.id);
+    expect(publisher.publishToLocalDirectory(out).success).toBe(true);
+    expect(fs.existsSync(path.join(out, 'albums/trips/index.html'))).toBe(false);
+    db.close();
+  });
+
+  it('keeps the album page address when a photo opens and closes', () => {
+    const urls: string[] = [];
+    const listeners: Record<string, (ev: unknown) => void> = {};
+    const dialog: Record<string, unknown> = {
+      className: '', open: false, innerHTML: '', showModal() { this.open = true; }, close() { this.open = false; },
+      addEventListener: (t: string, f: (ev: unknown) => void) => { listeners[t] = f; },
+      setAttribute: () => undefined, querySelector: () => null, querySelectorAll: () => [],
+    };
+    const doc = {
+      createElement: () => dialog,
+      body: { appendChild: () => undefined },
+      addEventListener: () => undefined,
+    };
+    const root = { querySelectorAll: () => [], addEventListener: () => undefined, querySelector: () => null };
+    const loc = { pathname: '/albums/trips/', search: '?x=1', hash: '#photo-p1', protocol: 'https:', href: 'https://alice.ring.test/albums/trips/' };
+    const run = new Function('document', 'history', 'location', 'window', 'HTMLDialogElement', `return ${installPageEnhancements.toString()}`);
+    const install = run(doc, { replaceState: (_a: unknown, _b: unknown, url: string) => urls.push(url) }, loc, { addEventListener: () => undefined }, class {});
+    const esc = (v: unknown) => String(v);
+    install({ root, profile: {}, albums: [{ id: 'a', title: 'Trips', photos: [{ id: 'p1', url: 'u', caption: 'c' }] }], items: [], esc, safeUrl: esc, buildDeepLink: () => '#', renderItem: () => '' });
+    expect(urls).toEqual(['/albums/trips/?x=1#photo-p1']); // opened from the address
+    loc.hash = '';
+    listeners.close({});
+    expect(urls).toEqual(['/albums/trips/?x=1#photo-p1', '/albums/trips/?x=1']);
   });
 });

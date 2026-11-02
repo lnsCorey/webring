@@ -14,6 +14,7 @@ import {
   isValidGa4MeasurementId,
   normalizeAdSensePublisherId,
   ProfileThemeSchema,
+  albumPagePath,
   WebringHubDocument,
   WEBRING_SCHEMA_VERSION,
 } from '../../src/shared/schema';
@@ -166,6 +167,16 @@ export class StaticSiteGenerator {
     fs.writeFileSync(path.join(outputDir, 'index.html'), indexHtml, 'utf8');
     filesWritten.push('index.html');
 
+    // 4b. A shareable page for each album (the publish ledger deletes pages of removed albums)
+    for (const album of bundle.albums.albums) {
+      if (!album.slug) continue;
+      const relPath = albumPagePath(album.slug);
+      const fullPath = path.join(outputDir, relPath);
+      fs.mkdirSync(path.dirname(fullPath), { recursive: true });
+      fs.writeFileSync(fullPath, this.buildStandaloneProfileHtml(bundle, { albumId: album.id }), 'utf8');
+      filesWritten.push(relPath);
+    }
+
     // 5. Write .nojekyll so GitHub Pages serves /.well-known/did.json without ignoring dot-folders
     fs.writeFileSync(path.join(outputDir, '.nojekyll'), '', 'utf8');
     filesWritten.push('.nojekyll');
@@ -233,15 +244,21 @@ export class StaticSiteGenerator {
    * same page plus a base URL for local Media Library images and a bridge that sends link clicks
    * to Studio. Preview extras are never part of a published file.
    */
-  public buildStandaloneProfileHtml(bundle: CompleteSiteBundle, options: { preview?: boolean } = {}): string {
+  public buildStandaloneProfileHtml(bundle: CompleteSiteBundle, options: { preview?: boolean; albumId?: string } = {}): string {
     const preview = options.preview === true;
+    const album = options.albumId ? bundle.albums.albums.find((a) => a.id === options.albumId) : undefined;
+    const albumId = album ? album.id : '';
     const markdownSource = renderMarkdown.toString();
     const templateSource = renderTemplatePage.toString();
     const plainTextSource = markdownToPlainText.toString();
     const appearance = bundle.profile.appearance || {};
     // Archives aren't embedded in the published page (it fetches them); the preview, which can't
     // fetch, gets them embedded so "Older posts" works there too
-    const { archives = [], ...pageBundle } = bundle;
+    const { archives = [], ...fullBundle } = bundle;
+    // An album's page carries only that album: no posts, and no other albums
+    const pageBundle = album
+      ? { ...fullBundle, items: { ...fullBundle.items, items: [] }, albums: { ...fullBundle.albums, albums: [album] } }
+      : fullBundle;
     const archivesJson = preview ? embedJson(Object.fromEntries(archives.map((a) => ['/' + a.path, a.doc]))) : '';
     // Interactive extras are on unless turned off in Site Design; when off they aren't embedded
     const enhancementsSource = appearance.interactions === 'off' ? 'null' : installPageEnhancements.toString();
@@ -300,17 +317,36 @@ export class StaticSiteGenerator {
   <script async src="https://pagead2.googlesyndication.com/pagead/js/adsbygoogle.js?client=${adsPubId}" crossorigin="anonymous"></script>`
       : '';
 
+    let albumHead = '';
+    if (album) {
+      const siteUrl = String(bundle.profile.siteUrl || '').replace(/\/+$/, '');
+      const cover = album.coverUrl || (album.photos?.[0] ? album.photos[0].thumbUrl || album.photos[0].url : '');
+      const absolute = (u: string) => (/^https?:\/\//i.test(u) ? u : `${siteUrl}/${u.replace(/^(\.\/|\/)+/, '')}`);
+      const description = markdownToPlainText(album.description || '').slice(0, 200);
+      const og = (property: string, content: string) => `\n  <meta property="${property}" content="${this.escapeHtml(content)}" />`;
+      albumHead =
+        '\n  <base href="../../">' +
+        og('og:title', `${album.title} · ${bundle.profile.displayName}`) +
+        og('og:description', description) +
+        (cover ? og('og:image', absolute(cover)) : '') +
+        og('og:url', absolute(album.pageUrl || albumPagePath(album.slug || '').replace(/index\.html$/, ''))) +
+        '\n  <meta name="twitter:card" content="summary_large_image" />';
+    }
+    const pageTitle = album
+      ? `${album.title} · ${bundle.profile.displayName}`
+      : `${bundle.profile.displayName} — Federated Profile & Webring`;
+
     return `<!DOCTYPE html>
 <html lang="en">
 <head>
   <meta charset="UTF-8" />
   <meta name="viewport" content="width=device-width, initial-scale=1.0" />
   <meta http-equiv="Content-Security-Policy" content="default-src 'self'; script-src 'self' 'unsafe-inline' https://cdn.tailwindcss.com https://giscus.app https://utteranc.es${scriptSrcExtras ? ' ' + scriptSrcExtras : ''}; style-src 'self' 'unsafe-inline'; img-src 'self' https: http: data:${preview ? ' studio-media:' : ''}; frame-src https://giscus.app https://utteranc.es${frameSrcExtras}; connect-src 'self' https: http:;" />
-  <title>${this.escapeHtml(bundle.profile.displayName)} — Federated Profile & Webring</title>${preview ? '\n  <base href="studio-media://local/" />' : ''}
+  <title>${this.escapeHtml(pageTitle)}</title>${albumHead}${preview ? '\n  <base href="studio-media://local/" />' : ''}
   <link rel="alternate" type="application/json" title="Webring Manifest" href="./api/manifest.json" />
   <link rel="me" href="${this.escapeHtml(bundle.profile.siteUrl)}" />
   <script src="https://cdn.tailwindcss.com"></script>${analyticsHeadSnippet}${adsHeadSnippet}
-  <script>window.__WEBRING_BUNDLE__ = ${safeJson};${archivesJson ? `\n  window.__WEBRING_ARCHIVES__ = ${archivesJson};` : ''}</script>
+  <script>window.__WEBRING_BUNDLE__ = ${safeJson};${albumId ? `\n  window.__WEBRING_ALBUM_ID__ = ${embedJson(albumId)};` : ''}${archivesJson ? `\n  window.__WEBRING_ARCHIVES__ = ${archivesJson};` : ''}</script>
   <style>
     body.theme-neo-webring { background: #0f172a; color: #f8fafc; font-family: system-ui, -apple-system, sans-serif; }
     body.theme-minimal-zine { background: #fafaf9; color: #1c1917; font-family: Georgia, Cambria, serif; }
@@ -981,7 +1017,25 @@ ${TEMPLATE_CSS}${appearance.interactions === 'off' ? '' : ENHANCEMENTS_CSS}
           <p>Self-contained static profile powered by <strong>Webring Studio JSON Protocol v\${esc(data.manifest.schemaVersion)}</strong> • Cryptographically signed via <code>\${esc(profile.did)}</code></p>
         </footer>\`;
 
-      if (template.shell !== 'stack') {
+      // An album's own page: just the album, no profile layout
+      function renderAlbumPage(album) {
+        const back = '<a href="./" class="text-sm underline opacity-80 hover:opacity-100">← Back to ' + esc(profile.displayName) + '\\'s page</a>';
+        if (!album) return '<div class="mb-8">' + back + '</div>' + emptyNote('This album is no longer available.');
+        const photos = (album.photos || []).map(photo => renderPhotoCard(photo, album, '')).join('');
+        return '<div class="mb-6">' + back + '</div>' +
+          '<div class="flex items-start justify-between gap-4 mb-4">' +
+            '<div class="min-w-0 flex-1"><h1 class="text-2xl sm:text-3xl font-extrabold">' + esc(album.title) + '</h1>' +
+            (album.description ? '<div class="prose-block album-description text-sm opacity-90">' + renderMarkdown(album.description) + '</div>' : '') +
+            '<p class="text-xs opacity-70 mt-1">' + albumPhotosLabel(album) + '</p></div>' +
+            '<a href="' + buildDeepLink('share', album.canonicalUrl, album.title, album.coverUrl, 'photo') + '" class="accent-soft shrink-0 text-xs px-3 py-1 rounded-lg bg-indigo-500/20 text-indigo-300 hover:bg-indigo-500/30">↻ Share album</a>' +
+          '</div>' +
+          (photos ? '<div class="grid grid-cols-1 sm:grid-cols-2 md:grid-cols-3 gap-4 mb-8">' + photos + '</div>' : emptyNote('No photos yet.')) +
+          footerHtml;
+      }
+
+      if (window.__WEBRING_ALBUM_ID__) {
+        root.innerHTML = renderAlbumPage(allAlbums.find(a => a.id === window.__WEBRING_ALBUM_ID__));
+      } else if (template.shell !== 'stack') {
         root.innerHTML = renderTemplatePage({
           shell: template.shell, profile, albums: allAlbums, items: allItems, friends: allFriends,
           endorsementCount: (connections.endorsements || []).length, layout: visibleBlocks,
