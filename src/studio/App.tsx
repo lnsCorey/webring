@@ -1,6 +1,8 @@
 import React, { useEffect, useRef, useState } from 'react';
 import {
   AlbumDisplay,
+  albumDisplay,
+  albumIsPosted,
   CompleteSiteBundle,
   CreatePersonaInput,
   EndorsementItem,
@@ -2451,8 +2453,8 @@ export const App: React.FC = () => {
                   title: album.title,
                   description: album.description,
                   tags: album.tags.join(', '),
-                  postToFeed: album.postToFeed ?? false,
-                  display: album.display ?? 'card',
+                  postToFeed: albumIsPosted(album),
+                  display: albumDisplay(album),
                 }
               : null;
             return (
