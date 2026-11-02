@@ -1,6 +1,7 @@
 import React, { useState } from 'react';
 import { ArrowLeft, ExternalLink, Heart, MessageSquare, Repeat2, X } from 'lucide-react';
 import type { WebringDeepLinkAction } from '../shared/schema';
+import { renderMarkdown } from '../shared/markdown';
 
 /** The feed-entry shape the album view needs (matches NetworkFeedEntry in App.tsx). */
 export interface AlbumViewEntry {
@@ -119,7 +120,10 @@ export function FriendAlbumView(props: {
       <div className="bg-slate-900 border border-slate-800 rounded-2xl p-5 space-y-3">
         <p className="text-xs text-slate-400">{album.friendName}</p>
         <h3 className="font-bold text-lg">{album.title}</h3>
-        {album.commentary && <p className="text-sm text-slate-300 whitespace-pre-line">{album.commentary}</p>}
+        {album.commentary && (
+          // Album descriptions are Markdown; the renderer escapes everything first
+          <div className="studio-prose text-sm text-slate-300" dangerouslySetInnerHTML={{ __html: renderMarkdown(album.commentary) }} />
+        )}
         <p className="text-xs text-slate-400">
           {count} photo{count === 1 ? '' : 's'}
         </p>

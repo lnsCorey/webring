@@ -268,7 +268,8 @@ function formatRelativeTime(iso: string): string {
 function openLiveSite(siteUrl: string, publishedAt: string): void {
   try {
     const url = new URL(siteUrl);
-    url.searchParams.set('v', String(new Date(publishedAt).getTime()));
+    const time = new Date(publishedAt).getTime();
+    if (!Number.isNaN(time)) url.searchParams.set('v', String(time));
     window.studioApi?.openExternal(url.toString());
   } catch {
     window.studioApi?.openExternal(siteUrl);
@@ -943,9 +944,14 @@ export const App: React.FC = () => {
   useEffect(() => {
     const onMessage = (event: MessageEvent) => {
       if (!previewFrameRef.current || event.source !== previewFrameRef.current.contentWindow) return;
-      const data = event.data as { type?: string; href?: string } | null;
+      const data = event.data as { type?: string; href?: string; albumId?: string; slug?: string } | null;
       if (!data || typeof data.href !== 'string') return;
-      if (data.type === 'webring-preview-deeplink') {
+      if (data.type === 'webring-preview-album') {
+        // An album card or post in the preview opens that album in the Albums tab
+        const album = bundle?.albums.albums.find((a) => (data.albumId && a.id === data.albumId) || (data.slug && a.slug === data.slug));
+        if (album) setSelectedAlbumId(album.id);
+        setActiveTab('albums');
+      } else if (data.type === 'webring-preview-deeplink') {
         const parsed = parseWebringUri(data.href);
         if (parsed) handleIncomingDeepLink(parsed);
       } else if (data.type === 'webring-preview-open' && /^https?:/i.test(data.href)) {
@@ -1894,7 +1900,13 @@ export const App: React.FC = () => {
       .filter((album) => albumIsPosted(album) && album.photos.length > 0)
       .map((album) => {
         const newest = album.photos.reduce((a, b) => (b.createdAt > a.createdAt ? b : a), album.photos[0]);
-        const thumbs = album.photos.slice(0, 3).map((photo) => photo.thumbUrl || photo.url);
+        // Same tiles as the published peek: the cover, then photos that aren't the cover
+        const cover = album.coverUrl || album.photos[0].thumbUrl || album.photos[0].url;
+        const side = album.photos
+          .filter((photo) => (photo.thumbUrl || photo.url) !== cover && photo.url !== cover)
+          .slice(0, 2)
+          .map((photo) => photo.thumbUrl || photo.url);
+        const thumbs = [cover, ...side].map(mediaSrc);
         return {
           id: `mine-${album.id}`,
           friendSiteUrl: bundle.profile.siteUrl,
@@ -4533,8 +4545,8 @@ export const App: React.FC = () => {
                                 entry.title
                               )}
                             </h4>
-                            {entry.entryType === 'post' ? (
-                              // Friends' posts are Markdown too; the renderer escapes everything first
+                            {entry.entryType === 'post' || entry.entryType === 'album' ? (
+                              // Posts and album descriptions are Markdown; the renderer escapes everything first
                               <div
                                 className="studio-prose text-sm text-slate-300"
                                 dangerouslySetInnerHTML={{ __html: renderMarkdown(entry.commentary) }}
