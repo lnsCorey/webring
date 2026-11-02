@@ -2921,8 +2921,10 @@ describe('Site Design (look & feel, page layout)', () => {
     const XSS = '<img src=x onerror=alert(1)>';
     const setUp = (file: string, theme: ProfileTheme) => {
       const db = new StudioDatabase(tempRoot, file);
-      const album = db.createAlbum({ title: 'Trips' });
+      const album = db.createAlbum({ title: 'Gallery', display: 'expanded', postToFeed: false });
       db.addPhotoToAlbum({ albumId: album.id, url: 'media/albums/a1/p.jpg' });
+      const trips = db.createAlbum({ title: 'Trips', display: 'card', postToFeed: true });
+      for (let i = 0; i < 5; i++) db.addPhotoToAlbum({ albumId: trips.id, url: `media/albums/t1/p${i}.jpg` });
       db.createItem({ type: 'post', title: 'Hello world', commentary: XSS, mediaUrl: 'media/albums/wall-posts/x.jpg' });
       db.createItem({ type: 'recommendation', title: 'A great book', commentary: 'Read it' });
       db.updateProfile({
@@ -3012,7 +3014,7 @@ describe('Site Design (look & feel, page layout)', () => {
         const html = new StaticSiteGenerator(db).buildStandaloneProfileHtml(db.buildSignedSiteBundle());
         expect(html).toContain('function installPageEnhancements');
         const page = await renderPage(html); // no <dialog> in the harness: plain links stay
-        const photo = db.getAlbums()[0].photos[0];
+        const photo = db.getAlbums().find((a) => a.display === 'expanded')!.photos[0];
         expect(page.html).toContain(`data-lightbox data-photo-id="${photo.id}"`);
         expect(page.html).toMatch(/data-open-post="[^"]+"/);
         expect(page.html).not.toContain('Untitled Photo');
@@ -3028,11 +3030,53 @@ describe('Site Design (look & feel, page layout)', () => {
       db.close();
     });
 
+    for (const theme of ['neo-webring', 'facepace', 'tweetdeck', 'xtraspecial', 'instapick', 'tiktalk'] as ProfileTheme[]) {
+      it(`shows card albums as cards and posted albums in the timeline in ${theme}`, async () => {
+        const db = setUp(`cards-${theme}.sqlite`, theme);
+        const albums = db.getAlbums();
+        const expandedPhoto = albums.find((a) => a.display === 'expanded')!.photos[0];
+        const cardPhotos = albums.find((a) => a.title === 'Trips')!.photos;
+        const { html } = await renderPage(new StaticSiteGenerator(db).buildStandaloneProfileHtml(db.buildSignedSiteBundle({ publish: true })));
+        expect(html).toContain('href="albums/trips/"');
+        expect(html.match(/data-album-link="[^"]+"/g)!.length).toBeGreaterThanOrEqual(2);
+        expect(html).toContain('+2');
+        expect(html).not.toMatch(/\+0|\+-/);
+        expect(html).toContain('data-photo-id="' + expandedPhoto.id + '"');
+        expect(html).not.toContain('data-photo-id="' + cardPhotos[4].id + '"');
+        db.close();
+      });
+    }
+
+    it('leaves album posts out of item blocks that exclude posts', async () => {
+      const db = setUp('no-album-posts.sqlite', 'neo-webring');
+      db.updateProfile({ layout: [{ id: 'items', type: 'items', visible: true, options: { kinds: ['recommendation'] } }] });
+      const { html } = await renderPage(new StaticSiteGenerator(db).buildStandaloneProfileHtml(db.buildSignedSiteBundle()));
+      expect(html).toContain('A great book');
+      expect(html).not.toContain('data-album-link');
+      db.close();
+    });
+
+    it('draws a 1-photo and an empty album card without empty peek tiles', async () => {
+      const db = new StudioDatabase(tempRoot, 'peek.sqlite');
+      const one = db.createAlbum({ title: 'One', postToFeed: true });
+      db.addPhotoToAlbum({ albumId: one.id, url: 'media/albums/o/p.jpg' });
+      db.createAlbum({ title: 'Empty' });
+      const { html } = await renderPage(new StaticSiteGenerator(db).buildStandaloneProfileHtml(db.buildSignedSiteBundle()));
+      const peek = html.match(/<a href="albums\/one\/" class="album-peek[^"]*"[\s\S]*?<\/a>/)![0];
+      expect(peek.match(/<img/g)).toHaveLength(1);
+      expect(peek).not.toContain('+');
+      const empty = html.match(/<a class="album-card" href="albums\/empty\/"[\s\S]*?<\/a>/)![0];
+      expect(empty).not.toContain('<img');
+      expect(empty).toContain('0 photos');
+      db.close();
+    });
+
     it('renders album descriptions as safe Markdown in every arrangement', async () => {
       for (const theme of ['neo-webring', 'facepace', 'instapick'] as ProfileTheme[]) {
         const db = new StudioDatabase(tempRoot, `album-md-${theme}.sqlite`);
         const album = db.createAlbum({
           title: 'Trip',
+          display: 'expanded',
           description: '## Day one\n\nWe saw [the lake](https://lake.example) and:\n\n- hills\n- birds\n\n<script>alert(1)</script> [bad](javascript:alert(1))',
         });
         db.addPhotoToAlbum({ albumId: album.id, url: 'media/albums/a1/p.jpg' });

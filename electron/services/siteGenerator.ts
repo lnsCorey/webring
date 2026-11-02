@@ -339,6 +339,20 @@ export class StaticSiteGenerator {
     body[data-background="gradient"] { background-image: linear-gradient(160deg, color-mix(in srgb, var(--accent, #6366f1) 24%, transparent), transparent 60%) !important; background-attachment: fixed; }
     body[data-background="banner-blur"]::before { content: ""; position: fixed; inset: -60px; z-index: -1; background-image: var(--banner-image); background-size: cover; background-position: center; filter: blur(48px) saturate(1.2); opacity: 0.35; }
     /* Text blocks */
+    .album-peek { display: grid; grid-template-columns: 2fr 1fr; grid-template-rows: 1fr 1fr; gap: 3px; aspect-ratio: 16 / 9; overflow: hidden; border-radius: 0.6rem; background: rgba(128, 128, 128, 0.2); }
+    .album-peek .album-tile { position: relative; display: block; overflow: hidden; min-height: 0; }
+    .album-peek .album-tile img { width: 100%; height: 100%; object-fit: cover; display: block; }
+    .album-peek .album-tile-cover { grid-row: 1 / span 2; }
+    .album-peek-1 { grid-template-columns: 1fr; }
+    .album-peek-2 .album-tile:last-child { grid-row: 1 / span 2; }
+    .album-plus { position: absolute; inset: 0; display: flex; align-items: center; justify-content: center; background: rgba(0, 0, 0, 0.55); color: #fff; font-weight: 800; font-size: 1.1rem; }
+    .album-card { display: flex; flex-direction: column; gap: 0.2rem; min-width: 0; text-decoration: none; color: inherit; }
+    .album-cards-row .album-card { flex: 0 0 11rem; }
+    .album-card-cover { display: block; aspect-ratio: 4 / 3; overflow: hidden; border-radius: 0.6rem; background: rgba(128, 128, 128, 0.2); }
+    .album-card-cover img { width: 100%; height: 100%; object-fit: cover; display: block; }
+    .album-card-blank { display: block; width: 100%; height: 100%; }
+    .album-card-title { font-weight: 700; font-size: 0.9rem; }
+    .album-card-count { font-size: 0.75rem; opacity: 0.65; }
     .prose-block h2 { font-size: 1.4rem; font-weight: 700; margin: 1.1rem 0 0.5rem; }
     .prose-block h3 { font-size: 1.2rem; font-weight: 700; margin: 1rem 0 0.4rem; }
     .prose-block h4, .prose-block h5 { font-weight: 700; margin: 0.9rem 0 0.3rem; }
@@ -416,7 +430,8 @@ ${TEMPLATE_CSS}${appearance.interactions === 'off' ? '' : ENHANCEMENTS_CSS}
           lower.startsWith('webring://') ||
           lower.startsWith('./') ||
           lower.startsWith('/') ||
-          lower.startsWith('media/')
+          lower.startsWith('media/') ||
+          lower.startsWith('albums/')
         ) {
           return esc(raw);
         }
@@ -680,6 +695,61 @@ ${TEMPLATE_CSS}${appearance.interactions === 'off' ? '' : ENHANCEMENTS_CSS}
         \`;
       }
 
+      // Albums are posted to the feed unless turned off, and shown as a card unless set to expanded
+      const albumPosted = (a) => a.postToFeed !== false;
+      const albumShownExpanded = (a) => a.display === 'expanded';
+      const albumCover = (a) => a.coverUrl || ((a.photos || [])[0] ? (a.photos[0].thumbUrl || a.photos[0].url) : '');
+      const albumPhotoTotal = (a) => (a.photos || []).length;
+      const albumHref = (a) => a.pageUrl ? safeUrl(a.pageUrl) : '#photos';
+
+      // Cover large on the left, two more photos stacked on the right, "+N" on the last tile
+      function albumPeek(album) {
+        const photos = album.photos || [];
+        const cover = albumCover(album);
+        const side = photos.slice(1, 3).map(p => p.thumbUrl || p.url);
+        const extra = photos.length - 3;
+        const tiles = [];
+        if (cover) tiles.push('<span class="album-tile album-tile-cover"><img src="' + safeUrl(cover) + '" alt="" loading="lazy" /></span>');
+        side.forEach(function(src, i) {
+          tiles.push('<span class="album-tile"><img src="' + safeUrl(src) + '" alt="" loading="lazy" />' +
+            (extra > 0 && i === side.length - 1 ? '<span class="album-plus">+' + extra + '</span>' : '') + '</span>');
+        });
+        return '<a href="' + albumHref(album) + '" class="album-peek album-peek-' + Math.min(tiles.length, 3) + '" data-album-link="' + esc(album.id) + '">' + tiles.join('') + '</a>';
+      }
+
+      function renderAlbumCard(album) {
+        const cover = albumCover(album);
+        const total = albumPhotoTotal(album);
+        return '<a class="album-card" href="' + albumHref(album) + '" data-album-link="' + esc(album.id) + '">' +
+          '<span class="album-card-cover">' + (cover ? '<img src="' + safeUrl(cover) + '" alt="" loading="lazy" />' : '<span class="album-card-blank"></span>') + '</span>' +
+          '<span class="album-card-title">' + esc(album.title) + '</span>' +
+          '<span class="album-card-count">' + total + (total === 1 ? ' photo' : ' photos') + '</span></a>';
+      }
+
+      function renderAlbumPost(album) {
+        const d = album.createdAt ? new Date(album.createdAt) : null;
+        const when = d && !isNaN(d.getTime()) ? ' · ' + esc(d.toLocaleDateString()) : '';
+        return '<div class="card-surface rounded-xl p-4 md:col-span-2 album-post">' +
+          '<p class="text-xs opacity-70 mb-2">' + esc(profile.displayName) + ' posted an album' + when + '</p>' +
+          albumPeek(album) +
+          '<p class="font-bold mt-2">' + esc(album.title) + '</p>' +
+          '<a href="' + albumHref(album) + '" class="text-sm underline">Open album →</a></div>';
+      }
+
+      // Items plus posted albums, newest first. Albums count as posts, so a kind filter without posts leaves them out.
+      function timelineEntries(list, kinds, limit) {
+        const wanted = !kinds || !kinds.length || kinds.indexOf('post') !== -1;
+        let entries = kinds && kinds.length ? list.filter(i => kinds.indexOf(i.type) !== -1) : list.slice();
+        if (wanted) {
+          allAlbums.filter(albumPosted).forEach(function(a) {
+            entries.push({ type: 'album', id: 'album-' + a.id, createdAt: a.createdAt, album: a });
+          });
+        }
+        const time = (e) => { const t = Date.parse(e.createdAt); return isNaN(t) ? 0 : t; };
+        entries = entries.map((e, i) => ({ e: e, i: i })).sort((x, y) => (time(y.e) - time(x.e)) || (x.i - y.i)).map(x => x.e);
+        return limit ? entries.slice(0, limit) : entries;
+      }
+
       // A post whose title is just its opening Markdown heading shows the heading only
       function titleIsOpeningHeading(item) {
         if (item.type !== 'post') return false;
@@ -804,9 +874,12 @@ ${TEMPLATE_CSS}${appearance.interactions === 'off' ? '' : ENHANCEMENTS_CSS}
       const footerAdHtml = renderAdSlot(profile.adsAddon && profile.adsAddon.footerSlotId, 'Footer Slot');
 
       // Page blocks (Site Design). A block's title replaces the default heading; an empty title hides it.
+      let photosAnchorUsed = false;
       function section(block, defaultTitle, inner) {
         const title = typeof block.title === 'string' ? block.title : defaultTitle;
-        return '<section class="mb-12" data-block="' + esc(block.type) + '">' +
+        // The first albums section is where "Albums" links from friends land
+        const anchorId = block.type === 'albums' && !photosAnchorUsed ? (photosAnchorUsed = true, ' id="photos"') : '';
+        return '<section class="mb-12"' + anchorId + ' data-block="' + esc(block.type) + '">' +
           (title ? '<h2 class="text-2xl font-bold mb-4 flex items-center gap-2">' + esc(title) + '</h2>' : '') +
           inner + '</section>';
       }
@@ -830,15 +903,19 @@ ${TEMPLATE_CSS}${appearance.interactions === 'off' ? '' : ENHANCEMENTS_CSS}
         albums: (b) => {
           const ids = b.options && Array.isArray(b.options.albumIds) && b.options.albumIds.length ? b.options.albumIds : null;
           const list = ids ? allAlbums.filter(a => ids.includes(a.id)) : allAlbums;
-          const html = list.map(a => renderAlbum(a, b.options && b.options.style)).join('');
+          const carousel = b.options && b.options.style === 'carousel';
+          const cards = list.filter(a => !albumShownExpanded(a));
+          const cardsHtml = cards.length
+            ? '<div class="mb-8 ' + (carousel ? 'flex gap-4 overflow-x-auto snap-x pb-2 album-cards-row' : 'grid grid-cols-2 md:grid-cols-3 gap-4 album-cards-grid') + '">' + cards.map(renderAlbumCard).join('') + '</div>'
+            : '';
+          const html = cardsHtml + list.filter(albumShownExpanded).map(a => renderAlbum(a, b.options && b.options.style)).join('');
           return section(b, '📸 Photo Albums', html || emptyNote('No photo albums published yet.'));
         },
         items: (b) => {
           const kinds = b.options && Array.isArray(b.options.kinds) ? b.options.kinds : null;
-          let list = kinds ? allItems.filter(i => kinds.includes(i.type)) : allItems;
-          if (b.options && b.options.limit) list = list.slice(0, b.options.limit);
+          const list = timelineEntries(allItems, kinds, b.options && b.options.limit);
           return section(b, '✨ Shared Items & Things I Like',
-            '<div class="grid grid-cols-1 md:grid-cols-2 gap-4">' + (list.map(renderItem).join('') || emptyNote('Nothing shared here yet.')) + '</div>');
+            '<div class="grid grid-cols-1 md:grid-cols-2 gap-4">' + (list.map(i => i.type === 'album' ? renderAlbumPost(i.album) : renderItem(i)).join('') || emptyNote('Nothing shared here yet.')) + '</div>');
         },
         friends: (b) => allFriends.length
           ? section(b, '🤝 Friend Ring & Connections (' + allFriends.length + ')',
@@ -863,7 +940,7 @@ ${TEMPLATE_CSS}${appearance.interactions === 'off' ? '' : ENHANCEMENTS_CSS}
           const item = allItems.find(i => i.canonicalUrl === target);
           if (item) return section(b, '⭐ Featured', '<div class="grid grid-cols-1 md:grid-cols-2 gap-4">' + renderItem(item) + '</div>');
           const album = allAlbums.find(a => a.canonicalUrl === target);
-          if (album) return section(b, '⭐ Featured', renderAlbum(album, 'grid'));
+          if (album) return section(b, '⭐ Featured', '<div class="grid grid-cols-2 md:grid-cols-3 gap-4">' + renderAlbumCard(album) + '</div>');
           for (const a of allAlbums) {
             const photo = (a.photos || []).find(p => p.canonicalUrl === target);
             if (photo) return section(b, '⭐ Featured', '<div class="grid grid-cols-1 sm:grid-cols-2 gap-4">' + renderPhotoCard(photo, a, '') + '</div>');
@@ -915,7 +992,7 @@ ${TEMPLATE_CSS}${appearance.interactions === 'off' ? '' : ENHANCEMENTS_CSS}
         root.innerHTML = renderTemplatePage({
           shell: template.shell, profile, albums: allAlbums, items: allItems, friends: allFriends,
           endorsementCount: (connections.endorsements || []).length, layout: visibleBlocks,
-          blockRenderers, section, emptyNote, esc, safeUrl, buildDeepLink, getEndorsementsFor, getCommentsFor, renderMarkdown, markdownToPlainText,
+          blockRenderers, section, emptyNote, albumPeek, renderAlbumPost, timelineEntries, esc, safeUrl, buildDeepLink, getEndorsementsFor, getCommentsFor, renderMarkdown, markdownToPlainText,
           hasLiveProvider: Boolean(commentCfg.provider && commentCfg.provider !== 'none'),
           webringBars, headerAdHtml, inFeedAdHtml, footerAdHtml, footerHtml, olderPostsHtml, archiveView
         });
