@@ -1197,7 +1197,8 @@ const WEBRING_STUDIO_URL = 'https://github.com/lnsCorey/webring';
 
 /**
  * Studio preview only (sandboxed iframe): links never navigate the preview. webring:// actions
- * open the matching form in Studio and web links open in the browser, via postMessage.
+ * open the matching form in Studio, album links open the album in Studio's Albums tab, and web
+ * links open in the browser, via postMessage.
  */
 const PREVIEW_BRIDGE = `
   <script>
@@ -1209,7 +1210,11 @@ const PREVIEW_BRIDGE = `
       if (anchor.closest('[data-lightbox], [data-open-post]')) return; // opens in the page's own viewer
       ev.preventDefault();
       ev.stopPropagation();
-      if (/^webring:/i.test(href)) parent.postMessage({ type: 'webring-preview-deeplink', href: href }, '*');
+      // Album pages aren't in the preview: Studio opens the album in its Albums tab instead
+      var albumPage = /^(?:\\.\\/)?albums\\/([^\\/?#]+)\\/?(?:index\\.html)?$/i.exec(href);
+      if (anchor.hasAttribute('data-album-link') || albumPage) {
+        parent.postMessage({ type: 'webring-preview-album', href: href, albumId: anchor.getAttribute('data-album-link') || '', slug: albumPage ? albumPage[1] : '' }, '*');
+      } else if (/^webring:/i.test(href)) parent.postMessage({ type: 'webring-preview-deeplink', href: href }, '*');
       else if (/^https?:/i.test(anchor.href)) parent.postMessage({ type: 'webring-preview-open', href: anchor.href }, '*');
     }, true);
   </script>`;

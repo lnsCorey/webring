@@ -600,6 +600,9 @@ export class RingCrawler {
             }
 
             const cover = absoluteUrl(album.coverUrl);
+            // The card links to the album's page only when it's on the friend's own site
+            const pageUrl = album.pageUrl ? absoluteUrl(album.pageUrl) : '';
+            const albumTargetUrl = pageUrl && isUrlWithinSite(pageUrl, normalizedFriendUrl) ? pageUrl : normalizedFriendUrl;
             // The card shows the new photos first; otherwise the cover, then the album's order
             const byNewest = (a: { createdAt: string }, b: { createdAt: string }) =>
               a.createdAt < b.createdAt ? 1 : a.createdAt > b.createdAt ? -1 : 0;
@@ -615,7 +618,7 @@ export class RingCrawler {
               entryType: 'album',
               title: album.title,
               canonicalUrl: album.canonicalUrl,
-              targetUrl: album.pageUrl ? absoluteUrl(album.pageUrl) : normalizedFriendUrl,
+              targetUrl: albumTargetUrl,
               commentary: album.description,
               mediaUrl: cover,
               tags: album.tags,

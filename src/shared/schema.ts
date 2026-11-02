@@ -358,9 +358,9 @@ export const AlbumItemSchema = z.object({
   slug: z.string().optional(),
   /** Relative URL of the album's page (albums/<slug>/). */
   pageUrl: z.string().optional(),
-  /** Whether the album appears in the feed. Missing means posted. */
-  postToFeed: z.boolean().optional(),
-  /** How the feed shows the album. Missing or unknown means card. */
+  /** Whether the album appears in the feed. Missing or not a boolean means posted. */
+  postToFeed: z.boolean().optional().catch(undefined),
+  /** How the Photos section shows the album. Missing or unknown means card. */
   display: z.enum(['card', 'expanded']).optional().catch(undefined),
 });
 export type AlbumItem = z.infer<typeof AlbumItemSchema>;

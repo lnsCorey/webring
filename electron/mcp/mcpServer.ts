@@ -437,7 +437,7 @@ export class WebringMcpServer {
             coverUrl: { type: 'string', description: 'Optional cover image URL.' },
             tags: { type: 'array', items: { type: 'string' } },
             postToFeed: { type: 'boolean', description: 'Show the album in the feed. Default false.' },
-            display: { type: 'string', enum: ['card', 'expanded'], description: 'How the feed shows the album. Default card.' },
+            display: { type: 'string', enum: ['card', 'expanded'], description: 'How the Photos section of the published page shows the album: card (one card linking to the album page) or expanded (its photos in a grid). Default card.' },
           },
           required: ['title'],
         },
@@ -647,7 +647,7 @@ export class WebringMcpServer {
       {
         name: 'webring_get_neighborhood_feed',
         description:
-          'Query chronological posts, photos, likes, shares, and comments pulled from friends in the Neighborhood Feed.',
+          'Query chronological posts, albums, likes, shares, and comments pulled from friends in the Neighborhood Feed. Friends\' photos arrive inside album entries (entryType "album", with photoCount, newCount and peekUrls) rather than as separate photo entries.',
         inputSchema: {
           type: 'object',
           properties: {
