@@ -13,6 +13,7 @@ import {
   AnalyticsAddon,
   buildCanonicalUrl,
   buildDidDocument,
+  canonicalizeJson,
   CompleteSiteBundle,
   ConnectionsDocument,
   EndorsementItem,
@@ -24,6 +25,7 @@ import {
   isValidGa4MeasurementId,
   ItemsDocument,
   computeRingNeighbors,
+  documentFingerprint,
   ModerationAction,
   normalizeAdSensePublisherId,
   PLACEHOLDER_DISPLAY_NAME,
@@ -375,6 +377,16 @@ export interface StudioDatabaseOptions {
 
 /** Friends' posts stay in the feed this many days unless the user picks another window (0 = forever). */
 export const DEFAULT_FEED_RETENTION_DAYS = 90;
+
+/** A published document's content, ignoring its own `updatedAt` and signature. */
+function publishedContentHash(doc: Record<string, unknown>): string {
+  const { updatedAt: _updatedAt, proof: _proof, ...content } = doc;
+  return crypto.createHash('sha256').update(canonicalizeJson(content)).digest('hex');
+}
+
+/** Sync All skips an unreachable friend for 15 min after a failure, doubling up to a day. */
+const SYNC_BACKOFF_BASE_MS = 15 * 60 * 1000;
+const SYNC_BACKOFF_MAX_MS = 24 * 60 * 60 * 1000;
 
 /** Published items.json keeps the last PUBLISH_WINDOW_DAYS, and never fewer than PUBLISH_MIN_RECENT items. */
 export const PUBLISH_WINDOW_DAYS = 90;
@@ -785,12 +797,22 @@ export class StudioDatabase {
         value TEXT NOT NULL
       );
 
+      -- When each of our published documents last changed, so republishing unchanged content
+      -- gives byte-identical files (stable ETags for friends, nothing to re-upload)
+      CREATE TABLE IF NOT EXISTS published_documents (
+        key TEXT PRIMARY KEY,
+        content_hash TEXT NOT NULL,
+        updated_at TEXT NOT NULL
+      );
+
       -- HTTP validators for friends' JSON files, so unchanged files aren't downloaded again
       CREATE TABLE IF NOT EXISTS fetch_cache (
         url TEXT PRIMARY KEY,
         site_url TEXT NOT NULL,
         etag TEXT NOT NULL DEFAULT '',
-        last_modified TEXT NOT NULL DEFAULT ''
+        last_modified TEXT NOT NULL DEFAULT '',
+        body TEXT NOT NULL DEFAULT '',
+        fingerprint TEXT NOT NULL DEFAULT ''
       );
 
       -- Friends' posts and photos the user saved: a private copy, kept beyond the feed window
@@ -844,6 +866,28 @@ export class StudioDatabase {
     if (!columns.some((c) => c.name === 'lists_me_at')) {
       this.db.exec('ALTER TABLE friends ADD COLUMN lists_me_at TEXT;');
     }
+    // Sync backoff for unreachable friends (local only, never exported)
+    if (!columns.some((c) => c.name === 'sync_failures')) {
+      this.db.exec('ALTER TABLE friends ADD COLUMN sync_failures INTEGER NOT NULL DEFAULT 0;');
+    }
+    if (!columns.some((c) => c.name === 'retry_after')) {
+      this.db.exec('ALTER TABLE friends ADD COLUMN retry_after TEXT;');
+    }
+    // Saved copies of friends' small documents (manifest, did.json, profile), used when the host answers 304
+    const fetchCacheColumns = this.db.prepare('PRAGMA table_info(fetch_cache)').all() as Array<{ name: string }>;
+    if (!fetchCacheColumns.some((c) => c.name === 'body')) {
+      this.db.exec("ALTER TABLE fetch_cache ADD COLUMN body TEXT NOT NULL DEFAULT '';");
+    }
+    // Fingerprint of the copy last verified, compared with the friend's manifest `documents`
+    if (!fetchCacheColumns.some((c) => c.name === 'fingerprint')) {
+      this.db.exec("ALTER TABLE fetch_cache ADD COLUMN fingerprint TEXT NOT NULL DEFAULT '';");
+    }
+    // Sync prunes by friend and by date; without these each prune scans the whole feed
+    this.db.exec(`
+      CREATE INDEX IF NOT EXISTS idx_network_feed_friend ON network_feed(friend_site_url);
+      CREATE INDEX IF NOT EXISTS idx_network_feed_created ON network_feed(created_at);
+      CREATE INDEX IF NOT EXISTS idx_endorsements_author ON endorsements(author_site_url);
+    `);
 
     // Joined-ring tracking. Rows that predate it become 'legacy' (still published, never auto-removed)
     const ringColumns = this.db
@@ -1740,8 +1784,24 @@ export class StudioDatabase {
     const rows = this.db
       .prepare('SELECT * FROM friends ORDER BY added_at DESC')
       .all() as Array<Record<string, unknown>>;
+    return rows.map((r) => this.rowToFriend(r));
+  }
 
-    return rows.map((r) => ({
+  /** One friend by site URL, without reading the whole list (sync does this for every friend). */
+  public getFriendBySiteUrl(siteUrl: string): FriendConnection | undefined {
+    const row = this.db.prepare('SELECT * FROM friends WHERE site_url = ?').get(normalizeSiteUrl(siteUrl)) as
+      | Record<string, unknown>
+      | undefined;
+    return row ? this.rowToFriend(row) : undefined;
+  }
+
+  private getFriendById(id: string): FriendConnection | undefined {
+    const row = this.db.prepare('SELECT * FROM friends WHERE id = ?').get(id) as Record<string, unknown> | undefined;
+    return row ? this.rowToFriend(row) : undefined;
+  }
+
+  private rowToFriend(r: Record<string, unknown>): FriendConnection {
+    return {
       id: String(r.id),
       siteUrl: String(r.site_url),
       did: r.did ? String(r.did) : siteUrlToDidWeb(String(r.site_url)),
@@ -1757,7 +1817,7 @@ export class StudioDatabase {
         : 'unverified') as FriendKeyStatus,
       lastCrawledAt: r.last_crawled_at ? String(r.last_crawled_at) : undefined,
       addedAt: String(r.added_at),
-    }));
+    };
   }
 
   public addOrUpdateFriend(input: {
@@ -1811,7 +1871,7 @@ export class StudioDatabase {
           input.lastCrawledAt ?? null,
           existing.id
         );
-      return this.getFriends().find((f) => f.id === existing.id)!;
+      return this.getFriendById(existing.id)!;
     }
 
     const id = `friend-${crypto.randomBytes(4).toString('hex')}`;
@@ -1837,7 +1897,7 @@ export class StudioDatabase {
       );
     this.db.prepare('DELETE FROM friend_notices WHERE site_url = ?').run(normalizedUrl);
 
-    return this.getFriends().find((f) => f.id === id)!;
+    return this.getFriendById(id)!;
   }
 
   public setFriendVisibility(friendId: string, visibility: FriendVisibility): FriendConnection | undefined {
@@ -1949,7 +2009,8 @@ export class StudioDatabase {
       .run(new Date().toISOString(), normalizeSiteUrl(siteUrl));
   }
 
-  private transaction(fn: () => void): void {
+  /** Runs `fn` in one transaction. `fn` must be synchronous: nothing may await inside it. */
+  public transaction(fn: () => void): void {
     this.db.exec('BEGIN');
     try {
       fn();
@@ -2054,17 +2115,79 @@ export class StudioDatabase {
     return row && (row.etag || row.last_modified) ? { etag: row.etag, lastModified: row.last_modified } : null;
   }
 
-  public setFetchValidators(url: string, siteUrl: string, validators: { etag?: string; lastModified?: string }): void {
-    if (!validators.etag && !validators.lastModified) {
+  /** The saved copy of a document with its validators and fingerprint, when a copy was saved. */
+  public getCachedDocument(url: string): { etag: string; lastModified: string; body: string; fingerprint: string } | null {
+    const row = this.db.prepare('SELECT etag, last_modified, body, fingerprint FROM fetch_cache WHERE url = ?').get(url) as
+      | { etag: string; last_modified: string; body: string; fingerprint: string }
+      | undefined;
+    return row && row.body
+      ? { etag: row.etag, lastModified: row.last_modified, body: row.body, fingerprint: row.fingerprint }
+      : null;
+  }
+
+  /** Fingerprint (`documentFingerprint`) of the copy of this document last verified, if known. */
+  public getFetchedFingerprint(url: string): string {
+    const row = this.db.prepare('SELECT fingerprint FROM fetch_cache WHERE url = ?').get(url) as
+      | { fingerprint: string }
+      | undefined;
+    return row?.fingerprint || '';
+  }
+
+  /**
+   * Remembers a verified document: its validators, its fingerprint, and (`body`) a copy to reuse
+   * after a 304. With none of those it's forgotten, so it's downloaded in full next time.
+   */
+  public setFetchValidators(
+    url: string,
+    siteUrl: string,
+    validators: { etag?: string; lastModified?: string },
+    body = '',
+    fingerprint = ''
+  ): void {
+    if (!validators.etag && !validators.lastModified && !fingerprint) {
       this.db.prepare('DELETE FROM fetch_cache WHERE url = ?').run(url);
       return;
     }
     this.db
       .prepare(
-        `INSERT INTO fetch_cache (url, site_url, etag, last_modified) VALUES (?, ?, ?, ?)
-         ON CONFLICT(url) DO UPDATE SET site_url = excluded.site_url, etag = excluded.etag, last_modified = excluded.last_modified`
+        `INSERT INTO fetch_cache (url, site_url, etag, last_modified, body, fingerprint) VALUES (?, ?, ?, ?, ?, ?)
+         ON CONFLICT(url) DO UPDATE SET site_url = excluded.site_url, etag = excluded.etag,
+           last_modified = excluded.last_modified, body = excluded.body, fingerprint = excluded.fingerprint`
       )
-      .run(url, normalizeSiteUrl(siteUrl), validators.etag || '', validators.lastModified || '');
+      .run(url, normalizeSiteUrl(siteUrl), validators.etag || '', validators.lastModified || '', body, fingerprint);
+  }
+
+  /** Friends Sync All should skip for now, with the time each may be tried again. */
+  public getSyncRetryTimes(nowMs = Date.now()): Map<string, string> {
+    const rows = this.db
+      .prepare('SELECT site_url, retry_after FROM friends WHERE retry_after IS NOT NULL AND retry_after > ?')
+      .all(new Date(nowMs).toISOString()) as Array<{ site_url: string; retry_after: string }>;
+    return new Map(rows.map((r) => [r.site_url, r.retry_after]));
+  }
+
+  /**
+   * Records a failed sync of a friend and returns when Sync All may try again: 15 minutes after
+   * the first failure, doubling each time, at most a day.
+   */
+  public recordSyncFailure(siteUrl: string, nowMs = Date.now()): string | undefined {
+    const normalized = normalizeSiteUrl(siteUrl);
+    const row = this.db.prepare('SELECT sync_failures FROM friends WHERE site_url = ?').get(normalized) as
+      | { sync_failures: number }
+      | undefined;
+    if (!row) return undefined;
+    const failures = Number(row.sync_failures || 0) + 1;
+    const waitMs = Math.min(SYNC_BACKOFF_BASE_MS * 2 ** (failures - 1), SYNC_BACKOFF_MAX_MS);
+    const retryAfter = new Date(nowMs + waitMs).toISOString();
+    this.db
+      .prepare('UPDATE friends SET sync_failures = ?, retry_after = ? WHERE site_url = ?')
+      .run(failures, retryAfter, normalized);
+    return retryAfter;
+  }
+
+  public clearSyncFailures(siteUrl: string): void {
+    this.db
+      .prepare('UPDATE friends SET sync_failures = 0, retry_after = NULL WHERE site_url = ? AND sync_failures > 0')
+      .run(normalizeSiteUrl(siteUrl));
   }
 
   /** Forgets cached validators (all, or one site's), so the next sync downloads everything. */
@@ -2812,6 +2935,33 @@ export class StudioDatabase {
    * Records a successful static-site generation without bumping the profile's `updated_at`
    * (which would make the profile look "changed since publish").
    */
+  private getPublishedDocumentStamps(): Map<string, { contentHash: string; updatedAt: string }> {
+    const rows = this.db.prepare('SELECT key, content_hash, updated_at FROM published_documents').all() as Array<{
+      key: string;
+      content_hash: string;
+      updated_at: string;
+    }>;
+    return new Map(rows.map((r) => [r.key, { contentHash: r.content_hash, updatedAt: r.updated_at }]));
+  }
+
+  /** Remembers what each published document contained and when it changed (see `buildSignedSiteBundle`). */
+  public recordPublishedDocuments(bundle: CompleteSiteBundle): void {
+    const docs: Array<[string, Record<string, unknown> & { updatedAt: string }]> = [
+      ['manifest', bundle.manifest],
+      ['profile', bundle.profile],
+      ['albums', bundle.albums],
+      ['items', bundle.items],
+      ['connections', bundle.connections],
+    ];
+    const upsert = this.db.prepare(
+      `INSERT INTO published_documents (key, content_hash, updated_at) VALUES (?, ?, ?)
+       ON CONFLICT(key) DO UPDATE SET content_hash = excluded.content_hash, updated_at = excluded.updated_at`
+    );
+    this.transaction(() => {
+      for (const [key, doc] of docs) upsert.run(key, publishedContentHash(doc), doc.updatedAt);
+    });
+  }
+
   public recordPublished(publishedAt: string, counts: PublishedCounts, fingerprint?: string): void {
     const row = this.db.prepare('SELECT publish_settings_json FROM profile WHERE id = 1').get() as {
       publish_settings_json: string;
@@ -2884,6 +3034,14 @@ export class StudioDatabase {
     const siteUrl = normalizeSiteUrl(rawProfile.siteUrl);
     const did = siteUrlToDidWeb(siteUrl);
     const now = new Date().toISOString();
+    // Each document keeps the time its content last changed, and is signed with it, so republishing
+    // leaves unchanged files byte-identical: hosts keep their ETags and friends skip them
+    const stamps = this.getPublishedDocumentStamps();
+    const signStable = <T extends Record<string, unknown> & { updatedAt: string }>(key: string, unsigned: T) => {
+      const previous = stamps.get(key);
+      const updatedAt = previous?.contentHash === publishedContentHash(unsigned) ? previous.updatedAt : now;
+      return signDocument({ ...unsigned, updatedAt }, did, privateKeyPem, updatedAt);
+    };
 
     const didDocument = buildDidDocument(
       siteUrl,
@@ -2914,7 +3072,7 @@ export class StudioDatabase {
       ...(rawProfile.adsAddon ? { adsAddon: rawProfile.adsAddon } : {}),
       updatedAt: now,
     };
-    const profile = signDocument(profileUnsigned, did, privateKeyPem);
+    const profile = signStable('profile', profileUnsigned);
 
     const albumList = this.getAlbums();
     const albumsUnsigned: AlbumsDocument = {
@@ -2924,7 +3082,7 @@ export class StudioDatabase {
       updatedAt: now,
       albums: albumList,
     };
-    const albums = signDocument(albumsUnsigned, did, privateKeyPem);
+    const albums = signStable('albums', albumsUnsigned);
 
     const rawItems = this.getItems();
     const exportedItems: SharedItem[] = publishSettings?.redactItemSourceAuthors
@@ -2971,7 +3129,7 @@ export class StudioDatabase {
           }
         : {}),
     };
-    const items = signDocument(itemsUnsigned, did, privateKeyPem);
+    const items = signStable('items', itemsUnsigned);
 
     const allFriends = this.getFriends();
     const exportedFriends: FriendConnection[] = publishSettings?.publishFriendsList
@@ -2997,7 +3155,7 @@ export class StudioDatabase {
       webrings: webringList,
       endorsements: exportedEndorsements,
     };
-    const connections = signDocument(connectionsUnsigned, did, privateKeyPem);
+    const connections = signStable('connections', connectionsUnsigned);
 
     const totalPhotos = albumList.reduce((acc, a) => acc + a.photos.length, 0);
     const manifestUnsigned: WebringManifest = {
@@ -3019,8 +3177,15 @@ export class StudioDatabase {
         friendCount: exportedFriends.length,
         webringCount: webringList.length,
       },
+      documents: {
+        did: { sha256: documentFingerprint(didDocument) },
+        profile: { sha256: documentFingerprint(profile) },
+        albums: { sha256: documentFingerprint(albums) },
+        items: { sha256: documentFingerprint(items) },
+        connections: { sha256: documentFingerprint(connections) },
+      },
     };
-    const manifest = signDocument(manifestUnsigned, did, privateKeyPem);
+    const manifest = signStable('manifest', manifestUnsigned);
 
     return {
       didDocument,

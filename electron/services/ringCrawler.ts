@@ -3,14 +3,17 @@ import * as path from 'path';
 import * as http from 'http';
 import * as https from 'https';
 import * as net from 'net';
+import * as zlib from 'zlib';
 import { StudioDatabase } from '../db/database';
 import {
   AlbumsDocumentSchema,
   ConnectionsDocumentSchema,
   DidDocumentSchema,
+  documentFingerprint,
   FriendKeyStatus,
   isUrlWithinSite,
   ItemsDocumentSchema,
+  ManifestDocumentKey,
   normalizeSiteUrl,
   ProfileDocumentSchema,
   verifyDocumentSignature,
@@ -40,6 +43,10 @@ export interface CrawlSiteResult {
   blocked?: boolean;
   /** Documents the host said hadn't changed since the last sync, so they weren't downloaded. */
   unchanged?: string[];
+  /** Set when Sync All skipped this friend because recent syncs couldn't reach it. */
+  deferred?: boolean;
+  /** After a failed sync: when Sync All will try this friend again. */
+  retryAfter?: string;
   error?: string;
 }
 
@@ -59,7 +66,7 @@ export type ConditionalJsonFetcher = (
 /** HTTP(S) URLs are asked conditionally; local paths are always read in full. */
 export const defaultConditionalJsonFetcher: ConditionalJsonFetcher = async (url, validators) => {
   if (!/^https?:\/\//i.test(url)) return { json: await defaultJsonFetcher(url) };
-  const res = await fetchPublic(url, { accept: 'application/json', maxBytes: MAX_JSON_BYTES, validators });
+  const res = await fetchPublic(url, { accept: 'application/json', maxBytes: MAX_JSON_BYTES, validators, compressed: true });
   if (res.status === 'not-modified') return { notModified: true };
   return { json: JSON.parse(res.body.toString('utf8')), etag: res.etag, lastModified: res.lastModified };
 };
@@ -98,7 +105,7 @@ export async function defaultJsonFetcher(urlOrPath: string): Promise<unknown> {
     const raw = fs.readFileSync(urlOrPath, 'utf8');
     return JSON.parse(raw);
   }
-  const res = await fetchPublic(urlOrPath, { accept: 'application/json', maxBytes: MAX_JSON_BYTES, validators: null });
+  const res = await fetchPublic(urlOrPath, { accept: 'application/json', maxBytes: MAX_JSON_BYTES, validators: null, compressed: true });
   if (res.status === 'not-modified') throw new Error(`Unexpected 304 fetching ${urlOrPath}`);
   return JSON.parse(res.body.toString('utf8'));
 }
@@ -110,14 +117,39 @@ type PublicFetchResult =
   | { status: 'not-modified' }
   | { status: 'ok'; body: Buffer; contentType: string; etag: string; lastModified: string };
 
+interface PublicFetchOptions {
+  accept: string;
+  /** Limit on the body after unpacking, so a small compressed file can't expand without bound. */
+  maxBytes: number;
+  validators: FetchValidators | null;
+  /** Ask for gzip / brotli (JSON compresses about 5x; images don't, so they don't ask). */
+  compressed?: boolean;
+}
+
+/** Errors where the connection dropped (often a reused keep-alive socket the host had closed). */
+function isConnectionReset(err: unknown): boolean {
+  const code = (err as NodeJS.ErrnoException | undefined)?.code;
+  return code === 'ECONNRESET' || code === 'EPIPE';
+}
+
 /**
  * GETs a URL on the public internet only (see `electron/security/networkGuard.ts`). Every hop,
  * including redirects, is checked against the address actually connected to. With validators,
- * the host can answer 304 Not Modified instead of sending the file again.
+ * the host can answer 304 Not Modified instead of sending the file again. A dropped connection
+ * is retried once; timeouts aren't, so an unreachable site costs one timeout.
  */
-function fetchPublic(
+async function fetchPublic(rawUrl: string, options: PublicFetchOptions): Promise<PublicFetchResult> {
+  try {
+    return await fetchPublicOnce(rawUrl, options);
+  } catch (err) {
+    if (!isConnectionReset(err)) throw err;
+    return fetchPublicOnce(rawUrl, options);
+  }
+}
+
+function fetchPublicOnce(
   rawUrl: string,
-  options: { accept: string; maxBytes: number; validators: FetchValidators | null },
+  options: PublicFetchOptions,
   redirectsLeft = MAX_REDIRECTS
 ): Promise<PublicFetchResult> {
   return new Promise((resolve, reject) => {
@@ -147,6 +179,7 @@ function fetchPublic(
         headers: {
           Accept: options.accept,
           'User-Agent': 'WebringStudio/1.0 (+ring crawler)',
+          ...(options.compressed ? { 'Accept-Encoding': 'gzip, br' } : {}),
           ...(options.validators?.etag ? { 'If-None-Match': options.validators.etag } : {}),
           ...(options.validators?.lastModified ? { 'If-Modified-Since': options.validators.lastModified } : {}),
         },
@@ -166,7 +199,7 @@ function fetchPublic(
             reject(new Error(`Too many redirects fetching ${rawUrl}`));
             return;
           }
-          fetchPublic(new URL(res.headers.location, url).toString(), options, redirectsLeft - 1).then(resolve, reject);
+          fetchPublicOnce(new URL(res.headers.location, url).toString(), options, redirectsLeft - 1).then(resolve, reject);
           return;
         }
         if (status < 200 || status >= 300) {
@@ -174,21 +207,41 @@ function fetchPublic(
           reject(new Error(`HTTP ${status} fetching ${rawUrl}`));
           return;
         }
-        const chunks: Buffer[] = [];
-        let total = 0;
-        res.on('data', (chunk: Buffer) => {
-          total += chunk.length;
-          if (total > options.maxBytes) {
-            req.destroy(new Error(`Response from ${rawUrl} exceeds the ${Math.round(options.maxBytes / 1048576)}MB safety limit`));
-            return;
-          }
-          chunks.push(chunk);
-        });
         const header = (name: string) => {
           const value = res.headers[name];
           return (Array.isArray(value) ? value[0] : value || '').slice(0, 512);
         };
-        res.on('end', () =>
+        const encoding = header('content-encoding').trim().toLowerCase();
+        const decoder =
+          encoding === 'gzip' || encoding === 'x-gzip'
+            ? zlib.createGunzip()
+            : encoding === 'br'
+              ? zlib.createBrotliDecompress()
+              : encoding === 'deflate'
+                ? zlib.createInflate()
+                : null;
+        if (!decoder && encoding && encoding !== 'identity') {
+          res.resume();
+          reject(new Error(`Unsupported content encoding "${encoding}" fetching ${rawUrl}`));
+          return;
+        }
+        const fail = (err: Error) => {
+          decoder?.destroy();
+          req.destroy(err);
+          reject(err);
+        };
+        const body = decoder ? res.pipe(decoder) : res;
+        const chunks: Buffer[] = [];
+        let total = 0;
+        body.on('data', (chunk: Buffer) => {
+          total += chunk.length;
+          if (total > options.maxBytes) {
+            fail(new Error(`Response from ${rawUrl} exceeds the ${Math.round(options.maxBytes / 1048576)}MB safety limit`));
+            return;
+          }
+          chunks.push(chunk);
+        });
+        body.on('end', () =>
           resolve({
             status: 'ok',
             body: Buffer.concat(chunks),
@@ -198,6 +251,7 @@ function fetchPublic(
           })
         );
         res.on('error', reject);
+        decoder?.on('error', (err) => fail(new Error(`Couldn't unpack ${rawUrl}: ${err.message}`)));
       }
     );
     // `timeout` only covers idle sockets; also cap the whole request
@@ -211,19 +265,30 @@ function fetchPublic(
   });
 }
 
+/**
+ * Friend sites crawled at once by Sync All. Each site's own documents are still fetched one
+ * after another; the local load test (`npm run loadtest:sync`) measures the effect.
+ */
+export const SYNC_CONCURRENCY = 16;
+
+/** Reported by Sync All after each friend, so the Studio window can show progress. */
+export interface SyncProgress {
+  done: number;
+  total: number;
+  result: CrawlSiteResult;
+}
+
 /** Thrown inside a document's section to skip it when the host reported it unchanged. */
 class UnchangedDocument extends Error {}
 
 export class RingCrawler {
-  private fetcher: JsonFetcher;
   private conditionalFetcher: ConditionalJsonFetcher;
 
   /**
    * `customFetcher` replaces the network (tests, offline folders) and always fetches in full;
-   * `conditionalFetcher` lets items.json and albums.json skip when unchanged.
+   * `conditionalFetcher` lets a friend's documents skip downloading when unchanged.
    */
   constructor(private db: StudioDatabase, customFetcher?: JsonFetcher, conditionalFetcher?: ConditionalJsonFetcher) {
-    this.fetcher = customFetcher || defaultJsonFetcher;
     this.conditionalFetcher =
       conditionalFetcher ||
       (customFetcher ? async (url: string) => ({ json: await customFetcher(url) }) : defaultConditionalJsonFetcher);
@@ -235,9 +300,31 @@ export class RingCrawler {
    * on EVERY document, enforces TOFU public key pinning, populates the local `network_feed`,
    * and discovers any likes/shares/comments of OUR items (`endorsements`).
    */
-  public async crawlFriendSite(
+  public async crawlFriendSite(friendSiteUrl: string, localDirOverride?: string): Promise<CrawlSiteResult> {
+    return this.crawlAndTrack(friendSiteUrl, localDirOverride, true);
+  }
+
+  /** Crawls one site and updates its sync backoff: a failure delays the next Sync All attempt. */
+  private async crawlAndTrack(
     friendSiteUrl: string,
-    localDirOverride?: string
+    localDirOverride: string | undefined,
+    applyFeedWindow: boolean
+  ): Promise<CrawlSiteResult> {
+    const result = await this.crawlSite(friendSiteUrl, localDirOverride, applyFeedWindow);
+    if (localDirOverride || result.blocked) return result;
+    if (result.success) {
+      this.db.clearSyncFailures(result.siteUrl);
+    } else {
+      const retryAfter = this.db.recordSyncFailure(result.siteUrl);
+      if (retryAfter) result.retryAfter = retryAfter;
+    }
+    return result;
+  }
+
+  private async crawlSite(
+    friendSiteUrl: string,
+    localDirOverride: string | undefined,
+    applyFeedWindow: boolean
   ): Promise<CrawlSiteResult> {
     const normalizedFriendUrl = normalizeSiteUrl(friendSiteUrl);
     if (this.db.getModerationAction(normalizedFriendUrl) === 'block') {
@@ -277,24 +364,50 @@ export class RingCrawler {
       return `${normalizedFriendUrl}/${cleanRel}`;
     };
 
+    const unchanged: string[] = [];
+    // The manifest, did.json and profile are small and needed in full every time, so when the
+    // manifest lists the same fingerprint as the copy saved when they last verified (no request),
+    // or the host answers 304, that copy is used and checked again as if just downloaded.
+    const fetchWithSavedCopy = async (endpoint: string, fingerprint?: string) => {
+      const url = resolveEndpoint(endpoint);
+      const remote = /^https?:\/\//i.test(url);
+      const saved = remote ? this.db.getCachedDocument(url) : null;
+      if (saved && fingerprint && saved.fingerprint === fingerprint) {
+        unchanged.push(endpoint);
+        return { url, remote, json: JSON.parse(saved.body) as unknown, etag: saved.etag, lastModified: saved.lastModified };
+      }
+      const validators = saved && (saved.etag || saved.lastModified) ? { etag: saved.etag, lastModified: saved.lastModified } : null;
+      const res = await this.conditionalFetcher(url, validators);
+      if (res.notModified) {
+        if (!saved) throw new Error(`Unexpected 304 fetching ${url}`);
+        unchanged.push(endpoint);
+        return { url, remote, json: JSON.parse(saved.body) as unknown, etag: saved.etag, lastModified: saved.lastModified };
+      }
+      return { url, remote, json: res.json, etag: res.etag, lastModified: res.lastModified };
+    };
+    type SavedCopyFetch = Awaited<ReturnType<typeof fetchWithSavedCopy>>;
+
     try {
-      const rawManifest = await this.fetcher(resolveEndpoint('/api/manifest.json'));
+      const manifestFetch = await fetchWithSavedCopy('/api/manifest.json');
+      const rawManifest = manifestFetch.json;
       const manifest = WebringManifestSchema.parse(rawManifest);
+      // Fingerprints the manifest lists for each document (sites from older versions list none)
+      const listedFingerprint = (key: ManifestDocumentKey) => manifest.documents?.[key]?.sha256;
 
       // Fetch DID document for public key signature verification
       let fetchedPublicKeyPem = '';
+      let didFetch: SavedCopyFetch | null = null;
       try {
-        const rawDid = await this.fetcher(resolveEndpoint(manifest.endpoints.did));
-        const didDoc = DidDocumentSchema.parse(rawDid);
+        didFetch = await fetchWithSavedCopy(manifest.endpoints.did, listedFingerprint('did'));
+        const didDoc = DidDocumentSchema.parse(didFetch.json);
         fetchedPublicKeyPem = didDoc.verificationMethod[0]?.publicKeyPem || '';
       } catch {
         // Optional if DID doc isn't reachable
+        didFetch = null;
       }
 
       // Check Trust-On-First-Use (TOFU) public key pinning against existing friend record
-      const existingFriend = this.db
-        .getFriends()
-        .find((f) => normalizeSiteUrl(f.siteUrl) === normalizedFriendUrl);
+      const existingFriend = this.db.getFriendBySiteUrl(normalizedFriendUrl);
       // One pinned key per site, shared with ring hubs and members (site_keys)
       const existingPinnedKey =
         this.db.getSiteKey(normalizedFriendUrl)?.publicKeyPem || existingFriend?.pinnedPublicKeyPem || '';
@@ -322,7 +435,8 @@ export class RingCrawler {
         }
       }
 
-      const rawProfile = await this.fetcher(resolveEndpoint(manifest.endpoints.profile));
+      const profileFetch = await fetchWithSavedCopy(manifest.endpoints.profile, listedFingerprint('profile'));
+      const rawProfile = profileFetch.json;
       const profile = ProfileDocumentSchema.parse(rawProfile);
 
       const isManifestVerified =
@@ -356,6 +470,23 @@ export class RingCrawler {
         lastCrawledAt: new Date().toISOString(),
       });
 
+      // Save copies only of documents that verified; otherwise forget them so they're downloaded next time
+      const keepCopies = isManifestVerified && isProfileVerified;
+      for (const doc of [manifestFetch, profileFetch, ...(didFetch && fetchedPublicKeyPem ? [didFetch] : [])]) {
+        if (!doc.remote) continue;
+        if (keepCopies) {
+          this.db.setFetchValidators(
+            doc.url,
+            normalizedFriendUrl,
+            { etag: doc.etag, lastModified: doc.lastModified },
+            JSON.stringify(doc.json),
+            documentFingerprint(doc.json as Record<string, unknown>)
+          );
+        } else {
+          this.db.setFetchValidators(doc.url, normalizedFriendUrl, {});
+        }
+      }
+
       let photosIndexed = 0;
       let itemsIndexed = 0;
       let endorsementsFound = 0;
@@ -363,17 +494,23 @@ export class RingCrawler {
       let entriesPruned = 0;
       let isAlbumsVerified = true;
       let isItemsVerified = true;
-      const unchanged: string[] = [];
       // Entries older than the feed window aren't added (endorsements of our items still are)
       const feedCutoff = this.db.feedCutoffIso();
       const inWindow = (createdAt: string) => !feedCutoff || createdAt >= feedCutoff;
       // items.json and albums.json are asked for conditionally: an unchanged file isn't downloaded
       // or reprocessed. Validators are kept only for files that verified, so anything else is
       // fetched in full next time.
-      const fetchDocument = async (endpoint: string) => {
+      // A document whose fingerprint in the verified manifest matches the copy last processed
+      // isn't requested at all.
+      const fetchDocument = async (endpoint: string, fingerprint?: string) => {
         const url = resolveEndpoint(endpoint);
         const remote = /^https?:\/\//i.test(url);
-        const validators = remote && !keyChangedWarning ? this.db.getFetchValidators(url) : null;
+        const trusted = remote && !keyChangedWarning;
+        if (trusted && isManifestVerified && fingerprint && this.db.getFetchedFingerprint(url) === fingerprint) {
+          unchanged.push(endpoint);
+          return { url, notModified: true as const };
+        }
+        const validators = trusted ? this.db.getFetchValidators(url) : null;
         const res = await this.conditionalFetcher(url, validators);
         if (res.notModified) {
           unchanged.push(endpoint);
@@ -381,13 +518,22 @@ export class RingCrawler {
         }
         return { url, notModified: false as const, json: res.json, remote, etag: res.etag, lastModified: res.lastModified };
       };
-      const rememberValidators = (doc: { url: string; remote?: boolean; etag?: string; lastModified?: string }) => {
-        if (doc.remote) this.db.setFetchValidators(doc.url, normalizedFriendUrl, { etag: doc.etag, lastModified: doc.lastModified });
+      // The fingerprint is of the copy actually processed: if a host served a stale file, it won't
+      // match the manifest, so the next sync fetches it again
+      const rememberValidators = (doc: { url: string; remote?: boolean; json: unknown; etag?: string; lastModified?: string }) => {
+        if (!doc.remote) return;
+        this.db.setFetchValidators(
+          doc.url,
+          normalizedFriendUrl,
+          { etag: doc.etag, lastModified: doc.lastModified },
+          '',
+          documentFingerprint(doc.json as Record<string, unknown>)
+        );
       };
 
       // Crawl albums.json and independently verify its Ed25519 signature
       try {
-        const albumsFetch = await fetchDocument(manifest.endpoints.albums);
+        const albumsFetch = await fetchDocument(manifest.endpoints.albums, listedFingerprint('albums'));
         if (albumsFetch.notModified) throw new UnchangedDocument();
         const rawAlbums = albumsFetch.json;
         const albumsDoc = AlbumsDocumentSchema.parse(rawAlbums);
@@ -402,35 +548,38 @@ export class RingCrawler {
         const photoVerified = isManifestVerified && isProfileVerified && isAlbumsVerified;
         const seenPhotoUrls: string[] = [];
 
-        for (const album of albumsDoc.albums) {
-          for (const photo of album.photos) {
-            if (!isUrlWithinSite(photo.canonicalUrl, normalizedFriendUrl)) {
-              entriesRejected++;
-              continue;
+        // One transaction per document: far faster than committing every row
+        this.db.transaction(() => {
+          for (const album of albumsDoc.albums) {
+            for (const photo of album.photos) {
+              if (!isUrlWithinSite(photo.canonicalUrl, normalizedFriendUrl)) {
+                entriesRejected++;
+                continue;
+              }
+              seenPhotoUrls.push(photo.canonicalUrl);
+              if (!inWindow(photo.createdAt)) continue;
+              const fullPhotoUrl = photo.url.startsWith('http')
+                ? photo.url
+                : `${normalizedFriendUrl}/${photo.url.replace(/^\/+/, '')}`;
+              this.db.upsertNetworkFeedEntry({
+                friendSiteUrl: normalizedFriendUrl,
+                friendName: profile.displayName,
+                friendAvatarUrl: profile.avatarUrl,
+                friendDid: profile.did,
+                entryType: 'photo',
+                title: photo.caption || `${album.title} Photo`,
+                canonicalUrl: photo.canonicalUrl,
+                targetUrl: fullPhotoUrl,
+                commentary: `Published in album "${album.title}"`,
+                mediaUrl: fullPhotoUrl,
+                tags: photo.tags.length > 0 ? photo.tags : album.tags,
+                createdAt: photo.createdAt,
+                verifiedSignature: photoVerified,
+              });
+              photosIndexed++;
             }
-            seenPhotoUrls.push(photo.canonicalUrl);
-            if (!inWindow(photo.createdAt)) continue;
-            const fullPhotoUrl = photo.url.startsWith('http')
-              ? photo.url
-              : `${normalizedFriendUrl}/${photo.url.replace(/^\/+/, '')}`;
-            this.db.upsertNetworkFeedEntry({
-              friendSiteUrl: normalizedFriendUrl,
-              friendName: profile.displayName,
-              friendAvatarUrl: profile.avatarUrl,
-              friendDid: profile.did,
-              entryType: 'photo',
-              title: photo.caption || `${album.title} Photo`,
-              canonicalUrl: photo.canonicalUrl,
-              targetUrl: fullPhotoUrl,
-              commentary: `Published in album "${album.title}"`,
-              mediaUrl: fullPhotoUrl,
-              tags: photo.tags.length > 0 ? photo.tags : album.tags,
-              createdAt: photo.createdAt,
-              verifiedSignature: photoVerified,
-            });
-            photosIndexed++;
           }
-        }
+        });
 
         // Only a verified document may delete rows, so a hijacked or tampered site can't wipe the feed
         if (photoVerified) {
@@ -443,7 +592,7 @@ export class RingCrawler {
 
       // Crawl items.json (posts, shares, likes, recommendations, comments) and independently verify its Ed25519 signature
       try {
-        const itemsFetch = await fetchDocument(manifest.endpoints.items);
+        const itemsFetch = await fetchDocument(manifest.endpoints.items, listedFingerprint('items'));
         if (itemsFetch.notModified) throw new UnchangedDocument();
         const rawItems = itemsFetch.json;
         const itemsDoc = ItemsDocumentSchema.parse(rawItems);
@@ -458,45 +607,47 @@ export class RingCrawler {
         const itemVerified = isManifestVerified && isProfileVerified && isItemsVerified;
         const seenItemUrls: string[] = [];
 
-        for (const item of itemsDoc.items) {
-          if (!isUrlWithinSite(item.canonicalUrl, normalizedFriendUrl)) {
-            entriesRejected++;
-            continue;
-          }
-          seenItemUrls.push(item.canonicalUrl);
-          if (inWindow(item.createdAt)) this.db.upsertNetworkFeedEntry({
-            friendSiteUrl: normalizedFriendUrl,
-            friendName: profile.displayName,
-            friendAvatarUrl: profile.avatarUrl,
-            friendDid: profile.did,
-            entryType: item.type,
-            title: item.title,
-            canonicalUrl: item.canonicalUrl,
-            targetUrl: item.targetUrl,
-            commentary: item.commentary,
-            mediaUrl: item.mediaUrl,
-            tags: item.tags,
-            createdAt: item.createdAt,
-            verifiedSignature: itemVerified,
-          });
-          itemsIndexed++;
-
-          // Check if this friend liked/shared/recommended/commented on an item or photo belonging to OUR site!
-          if (item.targetUrl.startsWith(mySiteUrl)) {
-            this.db.upsertEndorsement({
-              targetCanonicalUrl: item.targetUrl,
-              authorSiteUrl: normalizedFriendUrl,
-              authorName: profile.displayName,
-              authorAvatarUrl: profile.avatarUrl,
-              type: item.type,
+        this.db.transaction(() => {
+          for (const item of itemsDoc.items) {
+            if (!isUrlWithinSite(item.canonicalUrl, normalizedFriendUrl)) {
+              entriesRejected++;
+              continue;
+            }
+            seenItemUrls.push(item.canonicalUrl);
+            if (inWindow(item.createdAt)) this.db.upsertNetworkFeedEntry({
+              friendSiteUrl: normalizedFriendUrl,
+              friendName: profile.displayName,
+              friendAvatarUrl: profile.avatarUrl,
+              friendDid: profile.did,
+              entryType: item.type,
+              title: item.title,
+              canonicalUrl: item.canonicalUrl,
+              targetUrl: item.targetUrl,
               commentary: item.commentary,
-              sourceItemUrl: item.canonicalUrl,
+              mediaUrl: item.mediaUrl,
+              tags: item.tags,
               createdAt: item.createdAt,
               verifiedSignature: itemVerified,
             });
-            endorsementsFound++;
+            itemsIndexed++;
+
+            // Check if this friend liked/shared/recommended/commented on an item or photo belonging to OUR site!
+            if (item.targetUrl.startsWith(mySiteUrl)) {
+              this.db.upsertEndorsement({
+                targetCanonicalUrl: item.targetUrl,
+                authorSiteUrl: normalizedFriendUrl,
+                authorName: profile.displayName,
+                authorAvatarUrl: profile.avatarUrl,
+                type: item.type,
+                commentary: item.commentary,
+                sourceItemUrl: item.canonicalUrl,
+                createdAt: item.createdAt,
+                verifiedSignature: itemVerified,
+              });
+              endorsementsFound++;
+            }
           }
-        }
+        });
 
         if (itemVerified) {
           // A friend who publishes only recent items has archived the older ones, not deleted them
@@ -512,7 +663,7 @@ export class RingCrawler {
       // connections.json: does this friend list us back ("Mutual")? Only a verified copy that
       // belongs to this site can set or clear it; it's never re-published.
       try {
-        const connectionsFetch = await fetchDocument(manifest.endpoints.connections);
+        const connectionsFetch = await fetchDocument(manifest.endpoints.connections, listedFingerprint('connections'));
         if (connectionsFetch.notModified) throw new UnchangedDocument();
         const rawConnections = connectionsFetch.json;
         const connections = ConnectionsDocumentSchema.parse(rawConnections);
@@ -537,7 +688,8 @@ export class RingCrawler {
         // Optional: missing, unchanged or unverifiable leaves "Mutual" as it was
       }
 
-      entriesPruned += this.db.pruneFeedOutsideWindow();
+      // Sync All does this once at the end instead of once per friend
+      if (applyFeedWindow) entriesPruned += this.db.pruneFeedOutsideWindow();
 
       const allVerified =
         !keyChangedWarning &&
@@ -575,15 +727,45 @@ export class RingCrawler {
   }
 
   /**
-   * Crawls all friends in the user's friend ring.
+   * Crawls all friends in the user's friend ring, `concurrency` sites at a time, so slow or
+   * unreachable sites don't hold up the rest. Results are in the same order as the friends.
    */
-  public async crawlAllFriends(): Promise<CrawlSiteResult[]> {
+  public async crawlAllFriends(
+    options: { concurrency?: number; onProgress?: (progress: SyncProgress) => void } = {}
+  ): Promise<CrawlSiteResult[]> {
+    const concurrency = options.concurrency ?? SYNC_CONCURRENCY;
     const friends = this.db.getFriends();
-    const results: CrawlSiteResult[] = [];
-    for (const friend of friends) {
-      const res = await this.crawlFriendSite(friend.siteUrl);
-      results.push(res);
-    }
+    // Friends that recent syncs couldn't reach wait out their backoff (a single-friend sync still tries)
+    const retryTimes = this.db.getSyncRetryTimes();
+    const results: CrawlSiteResult[] = new Array(friends.length);
+    let next = 0;
+    let done = 0;
+    const worker = async () => {
+      while (next < friends.length) {
+        const index = next++;
+        const siteUrl = normalizeSiteUrl(friends[index].siteUrl);
+        const retryAfter = retryTimes.get(siteUrl);
+        results[index] = retryAfter
+          ? {
+              siteUrl,
+              success: false,
+              itemsIndexed: 0,
+              photosIndexed: 0,
+              endorsementsFound: 0,
+              entriesRejected: 0,
+              entriesPruned: 0,
+              verifiedSignature: false,
+              deferred: true,
+              retryAfter,
+              error: `Unreachable on recent syncs; next try after ${retryAfter}.`,
+            }
+          : await this.crawlAndTrack(siteUrl, undefined, false);
+        options.onProgress?.({ done: ++done, total: friends.length, result: results[index] });
+      }
+    };
+    const workers = Math.min(Math.max(1, Math.floor(concurrency)), friends.length);
+    await Promise.all(Array.from({ length: workers }, worker));
+    this.db.pruneFeedOutsideWindow();
     return results;
   }
 }

@@ -231,6 +231,9 @@ interface CrawlSiteResult {
   verifiedSignature: boolean;
   keyChangedWarning?: boolean;
   blocked?: boolean;
+  /** Skipped by Sync All because recent syncs couldn't reach it. */
+  deferred?: boolean;
+  retryAfter?: string;
   error?: string;
 }
 
@@ -402,6 +405,7 @@ declare global {
       deleteWebring: (ringId: string) => Promise<unknown>;
       crawlFriend: (siteUrl: string, localDirOverride?: string) => Promise<CrawlSiteResult>;
       crawlAllFriends: () => Promise<CrawlSiteResult[]>;
+      onSyncProgress?: (callback: (progress: { done: number; total: number }) => void) => () => void;
       requestToJoinRing: (
         hubUrl: string
       ) => Promise<{ ring: JoinedRing; requestLink: string; warning?: string }>;
@@ -1474,18 +1478,36 @@ export const App: React.FC = () => {
     }
     setIsSyncingFriends(true);
     notify(`Syncing ${allFriends.length} friend site(s) and your rings...`);
+    // Show a running count, and refresh the feed every few seconds so new posts appear as friends finish
+    const stopProgress = window.studioApi.onSyncProgress?.(({ done, total }) => {
+      notify(`Syncing friends… ${done} / ${total}`);
+    });
+    let refreshing = false;
+    const feedRefresh = setInterval(() => {
+      if (refreshing) return;
+      refreshing = true;
+      refreshStudioData()
+        .catch(() => undefined)
+        .finally(() => (refreshing = false));
+    }, 3000);
     try {
-      const results = await window.studioApi.crawlAllFriends();
+      const results = await window.studioApi.crawlAllFriends().finally(() => {
+        stopProgress?.();
+        clearInterval(feedRefresh);
+      });
+      notify('Checking your rings...');
       const rings = await window.studioApi.syncRings();
       await refreshStudioData();
       const ok = results.filter((r) => r.success).length;
-      const failed = results.filter((r) => !r.success && !r.blocked).length;
+      const failed = results.filter((r) => !r.success && !r.blocked && !r.deferred).length;
       const blocked = results.filter((r) => r.blocked).length;
+      const deferred = results.filter((r) => r.deferred).length;
       const keyChanged = results.filter((r) => r.keyChangedWarning).length;
       const rejected = results.reduce((acc, r) => acc + (r.entriesRejected || 0), 0);
       const parts = [`${ok} synced`];
       if (failed) parts.push(`${failed} failed`);
       if (blocked) parts.push(`${blocked} blocked (skipped)`);
+      if (deferred) parts.push(`${deferred} unreachable lately (skipped for now)`);
       if (keyChanged) parts.push(`${keyChanged} key changed`);
       if (rejected) parts.push(`${rejected} spoofed entries rejected`);
       const newMember = rings.joined.filter((r) => r.outcome === 'member').length;

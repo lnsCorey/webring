@@ -16,7 +16,8 @@
     "start": "npm run build && node scripts/brand-dev-electron.mjs && electron .",
     "mcp": "npm run build:electron && ELECTRON_RUN_AS_NODE=1 electron dist-electron/electron/mcp/cli.js",
     "test": "vitest run",
-    "postinstall": "node scripts/brand-dev-electron.mjs"
+    "postinstall": "node scripts/brand-dev-electron.mjs",
+    "loadtest:sync": "vitest run --config vitest.load.config.mts"
   },
   "dependencies": {
     "basic-ftp": "^6.2.3",

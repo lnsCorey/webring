@@ -5,13 +5,17 @@ import * as fs from 'fs';
 import * as path from 'path';
 import * as os from 'os';
 import * as vm from 'vm';
+import * as crypto from 'crypto';
 import * as http from 'http';
+import * as zlib from 'zlib';
 import {
   buildCanonicalUrl,
   buildDidDocument,
   buildWebringUri,
+  documentFingerprint,
   generateIdentityKeyPair,
   isPlaceholderSiteUrl,
+  normalizeSiteUrl,
   parseLayout,
   ProfileDocumentSchema,
   type Appearance,
@@ -28,7 +32,13 @@ import { LEGACY_DEMO_PHOTOS, LEGACY_DEMO_PROFILE } from '../electron/db/legacyDe
 import { StaticSiteGenerator } from '../electron/services/siteGenerator';
 import { renderTemplatePage } from '../electron/services/siteTemplates';
 import { installPageEnhancements } from '../electron/services/pageEnhancements';
-import { defaultJsonFetcher, RingCrawler } from '../electron/services/ringCrawler';
+import {
+  defaultConditionalJsonFetcher,
+  defaultJsonFetcher,
+  RingCrawler,
+  SYNC_CONCURRENCY,
+  type CrawlSiteResult,
+} from '../electron/services/ringCrawler';
 import { RingService } from '../electron/services/ringService';
 import { jobNextRunAt, nextRunAt, Scheduler } from '../electron/services/scheduler';
 import { runScheduledPublish } from '../electron/services/jobs';
@@ -2639,11 +2649,22 @@ describe('History window: published archives, feed window, conditional sync, sav
 
     sent.length = 0;
     const second = await crawler.crawlFriendSite('https://alice.ring.test');
-    expect(second.unchanged).toEqual(['/api/albums.json', '/api/items.json', '/api/connections.json']);
-    expect(sent.find((s) => s.url.endsWith('/api/items.json'))!.validators).toEqual({
-      etag: '"items.json"',
-      lastModified: 'Mon, 26 Oct 2026 10:00:00 GMT',
-    });
+    expect(second.unchanged).toEqual([
+      '/api/manifest.json',
+      '/.well-known/did.json',
+      '/api/profile.json',
+      '/api/albums.json',
+      '/api/items.json',
+      '/api/connections.json',
+    ]);
+    expect(second.verifiedSignature).toBe(true); // checked again from the saved copies
+    // The manifest is unchanged, so its fingerprints say nothing else needs asking for
+    expect(sent).toEqual([
+      {
+        url: 'https://alice.ring.test/api/manifest.json',
+        validators: { etag: '"manifest.json"', lastModified: 'Mon, 26 Oct 2026 10:00:00 GMT' },
+      },
+    ]);
     expect(bobDb.getNetworkFeed()).toHaveLength(feedSize); // nothing reprocessed or pruned
     alice.db.close();
     bobDb.close();
@@ -3310,5 +3331,341 @@ describe('Letting people know you added them (friend notices, mutual, "Added you
     cat.publish();
     await maya.rings.syncHostedRings();
     expect(maya.db.getFriendNotices().map((n) => n.siteUrl)).toEqual([cat.siteUrl]);
+  });
+});
+
+describe('Sync at scale', () => {
+  let tempRoot: string;
+
+  beforeEach(() => {
+    tempRoot = fs.mkdtempSync(path.join(os.tmpdir(), 'webring-scale-'));
+  });
+
+  afterEach(() => {
+    vi.useRealTimers();
+    fs.rmSync(tempRoot, { recursive: true, force: true });
+  });
+
+  const makePersona = (name: string) => {
+    const db = new StudioDatabase(path.join(tempRoot, name), `${name}.sqlite`);
+    db.updateProfile({ siteUrl: `https://${name}.ring.test`, displayName: name });
+    return db;
+  };
+
+  /** Published friend sites served from disk, with a switch to take one offline. */
+  const makeFriendSites = (names: string[]) => {
+    const sites = names.map((name) => {
+      const db = makePersona(name);
+      db.createItem({ type: 'post', commentary: `Hello from ${name}` });
+      const out = path.join(tempRoot, name, 'out');
+      new StaticSiteGenerator(db).generateToDirectory(out);
+      db.close();
+      return { siteUrl: `https://${name}.ring.test`, out };
+    });
+    const offline = new Set<string>();
+    const fetched: string[] = [];
+    const fetcher = async (url: string): Promise<unknown> => {
+      fetched.push(url);
+      const site = sites.find((s) => url.startsWith(`${s.siteUrl}/`));
+      if (!site || offline.has(site.siteUrl)) throw new Error(`offline: ${url}`);
+      return JSON.parse(fs.readFileSync(path.join(site.out, new URL(url).pathname), 'utf8'));
+    };
+    return { sites, offline, fetched, fetcher };
+  };
+
+  it('syncs several friends at once, up to the limit, and reports them in friend order', async () => {
+    const addPeers = (db: StudioDatabase) => {
+      for (let i = 0; i < 20; i++) db.addOrUpdateFriend({ siteUrl: `https://peer${i}.ring.test`, displayName: `Peer ${i}` });
+    };
+    let inFlight = 0;
+    let maxInFlight = 0;
+    const fetcher = async (url: string): Promise<unknown> => {
+      inFlight++;
+      maxInFlight = Math.max(maxInFlight, inFlight);
+      // Later friends answer sooner, so finishing order differs from friend order
+      const index = Number(/peer(\d+)/.exec(url)?.[1] ?? 0);
+      await new Promise((r) => setTimeout(r, 25 - index));
+      inFlight--;
+      throw new Error(`offline: ${url}`);
+    };
+
+    const db = makePersona('me');
+    addPeers(db);
+    const results = await new RingCrawler(db, fetcher).crawlAllFriends();
+    expect(maxInFlight).toBe(SYNC_CONCURRENCY);
+    expect(results.map((r) => r.siteUrl)).toEqual(db.getFriends().map((f) => normalizeSiteUrl(f.siteUrl)));
+    expect(results.every((r) => !r.success && r.error?.startsWith('offline'))).toBe(true);
+    db.close();
+
+    // One at a time when asked
+    const sequential = makePersona('me2');
+    addPeers(sequential);
+    maxInFlight = 0;
+    await new RingCrawler(sequential, fetcher).crawlAllFriends({ concurrency: 1 });
+    expect(maxInFlight).toBe(1);
+    sequential.close();
+  });
+
+  it('does the feed-window clean-up once per Sync All and looks friends up one at a time', async () => {
+    const { sites, fetcher } = makeFriendSites(['ann', 'ben', 'cat']);
+    const db = makePersona('me');
+    for (const site of sites) db.addOrUpdateFriend({ siteUrl: site.siteUrl, displayName: site.siteUrl });
+    const prune = vi.spyOn(db, 'pruneFeedOutsideWindow');
+    const listAll = vi.spyOn(db, 'getFriends');
+
+    const results = await new RingCrawler(db, fetcher).crawlAllFriends();
+    expect(results.every((r) => r.success)).toBe(true);
+    expect(db.getNetworkFeed()).toHaveLength(3);
+    expect(prune).toHaveBeenCalledTimes(1);
+    expect(listAll).toHaveBeenCalledTimes(1); // the list to crawl; each crawl reads only its own friend
+
+    // A single friend's sync still applies the window itself
+    prune.mockClear();
+    await new RingCrawler(db, fetcher).crawlFriendSite(sites[0].siteUrl);
+    expect(prune).toHaveBeenCalledTimes(1);
+    db.close();
+  });
+
+  it('backs off from unreachable friends in Sync All, but a single-friend sync always tries', async () => {
+    vi.useFakeTimers({ toFake: ['Date'] });
+    const start = new Date('2026-11-01T10:00:00Z').getTime();
+    vi.setSystemTime(start);
+    const { sites, offline, fetched, fetcher } = makeFriendSites(['ann', 'gone']);
+    const gone = sites[1].siteUrl;
+    const db = makePersona('me');
+    for (const site of sites) db.addOrUpdateFriend({ siteUrl: site.siteUrl, displayName: site.siteUrl });
+    const crawler = new RingCrawler(db, fetcher);
+    const resultFor = (results: CrawlSiteResult[]) => results.find((r) => r.siteUrl === gone)!;
+
+    offline.add(gone);
+    const first = resultFor(await crawler.crawlAllFriends());
+    expect(first.success).toBe(false);
+    expect(first.retryAfter).toBe(new Date(start + 15 * 60_000).toISOString());
+
+    // Skipped (not fetched) until the retry time
+    fetched.length = 0;
+    const skipped = resultFor(await crawler.crawlAllFriends());
+    expect(skipped).toMatchObject({ success: false, deferred: true, retryAfter: first.retryAfter });
+    expect(fetched.some((u) => u.startsWith(gone))).toBe(false);
+
+    // Each failure doubles the wait
+    vi.setSystemTime(start + 16 * 60_000);
+    const again = resultFor(await crawler.crawlAllFriends());
+    expect(again.deferred).toBeUndefined();
+    expect(again.retryAfter).toBe(new Date(start + 16 * 60_000 + 30 * 60_000).toISOString());
+
+    // Syncing just that friend ignores the wait, and success clears it
+    offline.delete(gone);
+    const single = await crawler.crawlFriendSite(gone);
+    expect(single.success).toBe(true);
+    expect(single.retryAfter).toBeUndefined();
+    const back = resultFor(await crawler.crawlAllFriends());
+    expect(back.success).toBe(true);
+    db.close();
+  });
+});
+
+describe('One request per unchanged friend (manifest fingerprints)', () => {
+  let tempRoot: string;
+
+  beforeEach(() => {
+    tempRoot = fs.mkdtempSync(path.join(os.tmpdir(), 'webring-fp-'));
+  });
+
+  afterEach(() => {
+    fs.rmSync(tempRoot, { recursive: true, force: true });
+  });
+
+  const DOCS = ['.well-known/did.json', 'api/manifest.json', 'api/profile.json', 'api/albums.json', 'api/items.json', 'api/connections.json'];
+
+  /** Alice's persona, published to a local folder the way a deploy would. */
+  const makeAlice = () => {
+    const db = new StudioDatabase(path.join(tempRoot, 'alice'), 'alice.sqlite');
+    db.updateProfile({ siteUrl: 'https://alice.ring.test', displayName: 'Alice' });
+    db.createItem({ type: 'post', commentary: 'First post' });
+    const out = path.join(tempRoot, 'alice', 'out');
+    const publisher = new SitePublisher(new StaticSiteGenerator(db));
+    const publish = async () => {
+      await new Promise((r) => setTimeout(r, 5)); // a different "now" each time
+      expect(publisher.publishToLocalDirectory(out).success).toBe(true);
+    };
+    const read = () => Object.fromEntries(DOCS.map((d) => [d, fs.readFileSync(path.join(out, d), 'utf8')]));
+    return { db, out, publish, read };
+  };
+
+  /** Serves Alice's folder like a static host (content ETags, 304s) and logs what's requested. */
+  const hostFor = (out: string) => {
+    const requested: string[] = [];
+    const overrides = new Map<string, string>();
+    const conditional = async (url: string, validators: { etag: string; lastModified: string } | null) => {
+      const rel = new URL(url).pathname.slice(1);
+      requested.push(rel);
+      const body = overrides.get(rel) ?? fs.readFileSync(path.join(out, rel), 'utf8');
+      const etag = `"${crypto.createHash('sha1').update(body).digest('hex')}"`;
+      if (validators?.etag === etag) return { notModified: true as const };
+      return { json: JSON.parse(body), etag, lastModified: '' };
+    };
+    return { requested, overrides, conditional };
+  };
+
+  it('republishing unchanged content gives byte-identical files, and a new post changes only items and the manifest', async () => {
+    const alice = makeAlice();
+    await alice.publish();
+    const first = alice.read();
+    await alice.publish();
+    expect(alice.read()).toEqual(first);
+
+    alice.db.createItem({ type: 'post', commentary: 'Second post' });
+    await alice.publish();
+    const after = alice.read();
+    const changed = DOCS.filter((d) => after[d] !== first[d]);
+    expect(changed).toEqual(['api/manifest.json', 'api/items.json']);
+
+    // The manifest lists each document's fingerprint, and its signature still verifies
+    const manifest = JSON.parse(after['api/manifest.json']);
+    const items = JSON.parse(after['api/items.json']);
+    const did = JSON.parse(after['.well-known/did.json']);
+    expect(manifest.documents.items.sha256).toBe(documentFingerprint(items));
+    expect(manifest.documents.did.sha256).toBe(documentFingerprint(did));
+    expect(verifyDocumentSignature(manifest, did.verificationMethod[0].publicKeyPem)).toBe(true);
+    expect(verifyDocumentSignature(items, did.verificationMethod[0].publicKeyPem)).toBe(true);
+    // The publish snapshot is when it went live, not when content last changed
+    expect(alice.db.getProfile().publishSettings.lastPublishedAt! >= manifest.updatedAt).toBe(true);
+    alice.db.close();
+  });
+
+  it('a friend with nothing new costs one request; after one new post, only the manifest and items.json', async () => {
+    const alice = makeAlice();
+    await alice.publish();
+    const host = hostFor(alice.out);
+    const bobDb = new StudioDatabase(path.join(tempRoot, 'bob'), 'bob.sqlite');
+    bobDb.updateProfile({ siteUrl: 'https://bob.ring.test', displayName: 'Bob' });
+    bobDb.addOrUpdateFriend({ siteUrl: 'https://alice.ring.test', displayName: 'Alice' });
+    const crawler = new RingCrawler(bobDb, undefined, host.conditional);
+
+    expect((await crawler.crawlFriendSite('https://alice.ring.test')).success).toBe(true);
+    expect(host.requested).toHaveLength(6);
+
+    host.requested.length = 0;
+    const quiet = await crawler.crawlFriendSite('https://alice.ring.test');
+    expect(quiet).toMatchObject({ success: true, verifiedSignature: true });
+    expect(host.requested).toEqual(['api/manifest.json']);
+
+    alice.db.createItem({ type: 'post', commentary: 'Fresh news' });
+    await alice.publish();
+    host.requested.length = 0;
+    const fresh = await crawler.crawlFriendSite('https://alice.ring.test');
+    expect(fresh).toMatchObject({ success: true, verifiedSignature: true });
+    expect(host.requested).toEqual(['api/manifest.json', 'api/items.json']);
+    expect(bobDb.getNetworkFeed().some((f) => f.commentary === 'Fresh news')).toBe(true);
+    alice.db.close();
+    bobDb.close();
+  });
+
+  it('uses a stale file the host still serves, but fetches it again next time', async () => {
+    const alice = makeAlice();
+    await alice.publish();
+    const host = hostFor(alice.out);
+    const bobDb = new StudioDatabase(path.join(tempRoot, 'bob'), 'bob.sqlite');
+    bobDb.updateProfile({ siteUrl: 'https://bob.ring.test', displayName: 'Bob' });
+    const crawler = new RingCrawler(bobDb, undefined, host.conditional);
+    await crawler.crawlFriendSite('https://alice.ring.test');
+
+    // Alice posts, but the host (a lagging CDN) still serves the old items.json
+    const oldItems = alice.read()['api/items.json'];
+    alice.db.createItem({ type: 'post', commentary: 'Stuck in a cache' });
+    await alice.publish();
+    host.overrides.set('api/items.json', oldItems);
+    host.requested.length = 0;
+    expect((await crawler.crawlFriendSite('https://alice.ring.test')).success).toBe(true);
+    expect(host.requested).toEqual(['api/manifest.json', 'api/items.json']);
+    expect(bobDb.getNetworkFeed().some((f) => f.commentary === 'Stuck in a cache')).toBe(false);
+
+    // Its fingerprint didn't match the manifest, so the next sync asks again and gets the post
+    host.overrides.clear();
+    host.requested.length = 0;
+    await crawler.crawlFriendSite('https://alice.ring.test');
+    expect(host.requested).toEqual(['api/manifest.json', 'api/items.json']);
+    expect(bobDb.getNetworkFeed().some((f) => f.commentary === 'Stuck in a cache')).toBe(true);
+    alice.db.close();
+    bobDb.close();
+  });
+
+  it('reports progress after every friend in Sync All', async () => {
+    const db = new StudioDatabase(path.join(tempRoot, 'me'), 'me.sqlite');
+    for (let i = 0; i < 5; i++) db.addOrUpdateFriend({ siteUrl: `https://peer${i}.ring.test`, displayName: `Peer ${i}` });
+    const seen: Array<{ done: number; total: number }> = [];
+    const offline = async (url: string): Promise<unknown> => {
+      throw new Error(`offline: ${url}`);
+    };
+    await new RingCrawler(db, offline).crawlAllFriends({ onProgress: ({ done, total }) => seen.push({ done, total }) });
+    expect(seen).toEqual([1, 2, 3, 4, 5].map((done) => ({ done, total: 5 })));
+    db.close();
+  });
+});
+
+describe('Fetching friends\' files over HTTP', () => {
+  let server: http.Server;
+  let base: string;
+  let handler: http.RequestListener;
+  let requests = 0;
+
+  beforeEach(async () => {
+    process.env.WEBRING_ALLOW_PRIVATE_PEERS = '1';
+    requests = 0;
+    server = http.createServer((req, res) => {
+      requests++;
+      handler(req, res);
+    });
+    await new Promise<void>((resolve) => server.listen(0, '127.0.0.1', resolve));
+    base = `http://127.0.0.1:${(server.address() as { port: number }).port}`;
+  });
+
+  afterEach(async () => {
+    delete process.env.WEBRING_ALLOW_PRIVATE_PEERS;
+    server.closeAllConnections();
+    await new Promise<void>((resolve) => server.close(() => resolve()));
+  });
+
+  it('asks for compressed JSON and unpacks gzip and brotli', async () => {
+    const doc = { hello: 'ring', items: Array.from({ length: 200 }, (_, i) => `post ${i}`) };
+    handler = (req, res) => {
+      const accepts = String(req.headers['accept-encoding'] || '');
+      if (req.url === '/gz' && accepts.includes('gzip')) {
+        res.writeHead(200, { 'Content-Encoding': 'gzip', ETag: '"gz"' }).end(zlib.gzipSync(JSON.stringify(doc)));
+      } else if (req.url === '/br' && accepts.includes('br')) {
+        res.writeHead(200, { 'Content-Encoding': 'br' }).end(zlib.brotliCompressSync(JSON.stringify(doc)));
+      } else {
+        res.writeHead(406).end();
+      }
+    };
+    await expect(defaultJsonFetcher(`${base}/gz`)).resolves.toEqual(doc);
+    await expect(defaultJsonFetcher(`${base}/br`)).resolves.toEqual(doc);
+    await expect(defaultConditionalJsonFetcher(`${base}/gz`, null)).resolves.toMatchObject({ json: doc, etag: '"gz"' });
+  });
+
+  it('applies the size limit to the unpacked file, so a small compressed bomb is refused', async () => {
+    const huge = JSON.stringify({ padding: '0'.repeat(6 * 1024 * 1024) });
+    const packed = zlib.gzipSync(huge);
+    expect(packed.length).toBeLessThan(100 * 1024);
+    handler = (_req, res) => res.writeHead(200, { 'Content-Encoding': 'gzip' }).end(packed);
+    await expect(defaultJsonFetcher(`${base}/bomb`)).rejects.toThrow(/safety limit/);
+  });
+
+  it('retries once when the connection is reset, then gives up', async () => {
+    handler = (req, res) => {
+      if (requests === 1) {
+        req.socket.destroy();
+        return;
+      }
+      res.writeHead(200).end('{"ok":true}');
+    };
+    await expect(defaultJsonFetcher(`${base}/flaky`)).resolves.toEqual({ ok: true });
+    expect(requests).toBe(2);
+
+    requests = 0;
+    handler = (req) => req.socket.destroy();
+    await expect(defaultJsonFetcher(`${base}/down`)).rejects.toThrow(/socket hang up|ECONNRESET/);
+    expect(requests).toBe(2);
   });
 });

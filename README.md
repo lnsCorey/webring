@@ -208,6 +208,7 @@ Then configure your MCP client to run:
 | `npm run build` | Build both without launching |
 | `npm run build:vite` / `npm run build:electron` | Build just the UI / just the Electron code |
 | `npm test` | Run the test suite (Vitest, `tests/federation.test.ts`) |
+| `npm run loadtest:sync` | Measure how syncing scales with 50–2000 friends ([tests/load/README.md](tests/load/README.md)) |
 | `npx tsc -p tsconfig.json --noEmit` | Type-check the UI |
 | `npx tsc -p tsconfig.electron.json --noEmit` | Type-check the Electron code |
 | `npm run mcp` | Build and start the stdio MCP server |
