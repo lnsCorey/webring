@@ -121,6 +121,8 @@ The **Media Library** tab holds your photo albums. Add JPEG or PNG photos with *
 
 Album descriptions are written in **Markdown** (headings, links, lists, quotes and tables), with a Write / Preview switch. They're rendered safely on your page: HTML and unsafe links are never passed through. Site Design text blocks use the same editor.
 
+- **Post to feed and Card / Expanded:** each album has a **Post to feed** checkbox (off for new albums) that also announces it in your posts as "posted an album", and a **Card / Expanded** choice for Photos. Card shows the cover, title and photo count; Expanded shows every photo.
+- **Album pages and link previews:** every album gets its own page at `albums/<name>/`, which keeps its address after it's first published. Shared links show the album's cover and title as a preview.
 - **What gets published:** a web copy of each photo (longest side up to 2048 px) and a 480 px thumbnail, rotated upright, with all camera metadata, including GPS location, removed. Your originals stay on your computer.
 - **Signed album manifests:** each album is published with `media/albums/<album>/manifest.json`, signed with your key, listing every photo and the exact file behind it (URL, SHA-256 hash, size, dimensions). File names are based on the content, so a replaced photo gets a new URL and nobody sees a stale copy.
 - **Publishing only sends changes:** to a local folder, SFTP/FTP or GitHub Pages, Studio uploads only new or changed files and removes photos you deleted. It only ever removes files it published itself; anything else on your server or in your repo is left alone. If files there were changed by hand, use **Re-upload everything at next publish**.
@@ -131,6 +133,7 @@ Album descriptions are written in **Markdown** (headings, links, lists, quotes a
 History grows forever, so Studio keeps syncing small on both sides:
 
 - **Your feed keeps a window.** On the Neighborhood Feed, **Keep** sets how long friends' posts stay: 1 week, 1 month, 3 months (the default), 1 year or forever. Older posts aren't synced and are cleared from your feed. Friends' likes and comments on *your* posts are always kept.
+- **Albums are one card.** A friend's album appears as one card, with a **N new** badge when they add photos, never one entry per photo. Click it to open the album view, where you can like, share, comment or save the album or any photo. Albums a friend didn't post to their feed aren't shown; use **Albums ↗** on their card to open their Photos section.
 - **Save what matters.** **☆ Save** on a friend's post or photo keeps a private copy under **Saved**, with a local copy of its image (re-encoded without metadata) and your own note. Saved posts stay after they leave your feed window or your friend removes them, and they're never published.
 - **Unchanged files aren't downloaded.** Syncing asks each host whether a friend's `items.json` and `albums.json` changed since last time (ETag / Last-Modified); if not, nothing is downloaded or reprocessed.
 - **You publish recent posts, with archives.** Your `items.json` holds the last 90 days of posts (at least your 50 newest). Older ones move to signed monthly archives (`api/archive/items-YYYY-MM.json`), so friends download less. Your page lists them under **Older posts**, and each month loads when a visitor opens it. Studio itself still shows all your posts.

@@ -191,6 +191,10 @@ function makeAlbums(site: FleetSite, rng: () => number, options: FleetOptions): 
       photos,
       createdAt,
       updatedAt: createdAt,
+      slug: albumId,
+      pageUrl: `albums/${albumId}/`,
+      postToFeed: true,
+      display: 'card',
     });
   }
   return albums;
