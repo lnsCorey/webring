@@ -50,8 +50,10 @@ export class StaticSiteGenerator {
    * show when the public snapshot was taken. Test previews don't call this.
    */
   public recordPublished(bundle: CompleteSiteBundle): void {
+    this.db.recordPublishedDocuments(bundle);
+    // The snapshot time is when this went live; the manifest's updatedAt is when content last changed
     this.db.recordPublished(
-      bundle.manifest.updatedAt,
+      new Date().toISOString(),
       {
         ...bundle.manifest.stats,
         endorsementCount: bundle.connections.endorsements.length,
@@ -83,9 +85,11 @@ export class StaticSiteGenerator {
       return stat ? `${url}:${stat.size}:${Math.floor(stat.mtimeMs)}` : `${url}:missing`;
     });
     const hubs = this.db.buildSignedHubDocuments().map(({ ring, doc }) => ({ path: ring.hubPath, doc }));
+    // The manifest's document fingerprints cover timestamps too; the documents themselves are hashed here
+    const { documents: _documents, ...manifest } = bundle.manifest;
     return crypto
       .createHash('sha256')
-      .update(JSON.stringify(stripVolatile({ bundle, hubs, media })))
+      .update(JSON.stringify(stripVolatile({ bundle: { ...bundle, manifest }, hubs, media })))
       .digest('hex');
   }
 

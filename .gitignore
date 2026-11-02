@@ -9,3 +9,6 @@ CLAUDE.local.md
 # Python bytecode
 __pycache__/
 *.pyc
+
+# Load test output
+tests/load/results/

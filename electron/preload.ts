@@ -48,6 +48,11 @@ contextBridge.exposeInMainWorld('studioApi', {
   crawlFriend: (siteUrl: string, localDirOverride?: string) =>
     ipcRenderer.invoke('studio:crawl-friend', siteUrl, localDirOverride),
   crawlAllFriends: () => ipcRenderer.invoke('studio:crawl-all-friends'),
+  onSyncProgress: (callback: (progress: { done: number; total: number }) => void) => {
+    const listener = (_event: unknown, progress: { done: number; total: number }) => callback(progress);
+    ipcRenderer.on('studio:sync-progress', listener);
+    return () => ipcRenderer.removeListener('studio:sync-progress', listener);
+  },
   requestToJoinRing: (hubUrl: string) => ipcRenderer.invoke('studio:ring-request-join', hubUrl),
   reviewRingRequest: (link: string) => ipcRenderer.invoke('studio:ring-review-request', link),
   decideRingRequest: (link: string, decision: 'approve' | 'decline' | 'ban', reason?: string) =>

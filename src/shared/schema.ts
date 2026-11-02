@@ -73,9 +73,16 @@ export const WebringManifestSchema = z.object({
     friendCount: z.number(),
     webringCount: z.number(),
   }),
+  /**
+   * Fingerprint of each published document, keyed like `endpoints` (see `documentFingerprint`).
+   * The manifest changes whenever one of them does, so a reader whose copy of the manifest is
+   * current can skip the site, and otherwise fetch only the documents whose fingerprint changed.
+   */
+  documents: z.record(z.string(), z.object({ sha256: z.string() })).optional().catch(undefined),
   proof: SignatureProofSchema.optional(),
 });
 export type WebringManifest = z.infer<typeof WebringManifestSchema>;
+export type ManifestDocumentKey = keyof WebringManifest['endpoints'];
 
 /**
  * Theme options for the standalone Profile Website
@@ -843,6 +850,15 @@ export function canonicalizeJson(obj: Record<string, unknown>): string {
     }
   }
   return JSON.stringify(clone);
+}
+
+/**
+ * A published document's fingerprint: SHA-256 (hex) of exactly what its signature covers
+ * (`canonicalizeJson`, which leaves out `proof`). Readers hash the JSON as fetched, before any
+ * schema parsing, so writer and reader agree.
+ */
+export function documentFingerprint(doc: Record<string, unknown>): string {
+  return getNodeCrypto().createHash('sha256').update(canonicalizeJson(doc), 'utf8').digest('hex');
 }
 
 /**

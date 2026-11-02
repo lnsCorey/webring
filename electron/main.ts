@@ -663,8 +663,15 @@ function registerIpcHandlers() {
   const withActiveLock = <T>(fn: () => Promise<T>) =>
     scheduler.runExclusive(personaManager.getActivePersonaId(), fn);
 
-  ipcMain.handle('studio:crawl-all-friends', async () => {
-    return withActiveLock(() => personaManager.getActiveContext().ringCrawler.crawlAllFriends());
+  ipcMain.handle('studio:crawl-all-friends', async (event) => {
+    return withActiveLock(() =>
+      personaManager.getActiveContext().ringCrawler.crawlAllFriends({
+        // Progress for the Sync button: counts only, nothing about the sites
+        onProgress: ({ done, total }) => {
+          if (!event.sender.isDestroyed()) event.sender.send('studio:sync-progress', { done, total });
+        },
+      })
+    );
   });
 
   ipcMain.handle('studio:ring-request-join', async (_e, hubUrl: string) => {
