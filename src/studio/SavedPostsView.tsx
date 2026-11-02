@@ -9,7 +9,7 @@ export interface SavedPostView {
   friendSiteUrl: string;
   friendName: string;
   friendAvatarUrl: string;
-  entryType: 'photo' | 'post' | 'like' | 'share' | 'recommendation' | 'comment';
+  entryType: 'photo' | 'album' | 'post' | 'like' | 'share' | 'recommendation' | 'comment';
   title: string;
   commentary: string;
   targetUrl: string;

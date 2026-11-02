@@ -32,6 +32,8 @@ contextBridge.exposeInMainWorld('studioApi', {
   createItem: (input: unknown) => ipcRenderer.invoke('studio:create-item', input),
   deleteItem: (itemId: string) => ipcRenderer.invoke('studio:delete-item', itemId),
   savePost: (canonicalUrl: string) => ipcRenderer.invoke('studio:save-post', canonicalUrl),
+  getFeedAlbumPhotos: (albumUrl: string) => ipcRenderer.invoke('studio:get-feed-album-photos', albumUrl),
+  markFeedAlbumSeen: (albumUrl: string) => ipcRenderer.invoke('studio:mark-feed-album-seen', albumUrl),
   unsavePost: (savedId: string) => ipcRenderer.invoke('studio:unsave-post', savedId),
   updateSavedNote: (savedId: string, note: string) => ipcRenderer.invoke('studio:saved-note', savedId, note),
   setFeedRetention: (days: number) => ipcRenderer.invoke('studio:set-feed-retention', days),
