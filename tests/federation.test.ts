@@ -1005,6 +1005,14 @@ describe('Two-Peer Pull Federation, Static Site Generation & Endorsement Discove
       expect(adsGen.filesWritten).toContain('.htaccess');
       const htaccess = fs.readFileSync(path.join(outDir, '.htaccess'), 'utf8');
       expect(htaccess).toContain('DirectoryIndex index.html');
+      // Pages and JSON are rechecked on each visit so a new publish shows up right away
+      expect(htaccess).toMatch(/<FilesMatch "\\\.\(html\|json\)\$">\s*Header set Cache-Control "no-cache"/);
+
+      // The page revalidates live JSON and keeps the embedded copy when the fetched one is older
+      expect(htmlWithAds).toContain("fetch(url, { cache: 'no-cache' })");
+      expect(htmlWithAds).toContain("live('./api/items.json', data.items)");
+      expect(htmlWithAds).toContain('fetchedAt < embeddedAt');
+      expect(htmlWithAds).not.toMatch(/fetch\('\.\/api\/[a-z]+\.json'\)/);
 
       // Verify all inline <script> blocks in index.html are 100% syntactically valid JavaScript
       const scriptBlocks = Array.from(

@@ -260,6 +260,17 @@ function formatRelativeTime(iso: string): string {
   return `${days} day${days === 1 ? '' : 's'} ago`;
 }
 
+// A per-publish query string makes the browser and any CDN treat the page as new, so it shows the latest publish
+function openLiveSite(siteUrl: string, publishedAt: string): void {
+  try {
+    const url = new URL(siteUrl);
+    url.searchParams.set('v', String(new Date(publishedAt).getTime()));
+    window.studioApi?.openExternal(url.toString());
+  } catch {
+    window.studioApi?.openExternal(siteUrl);
+  }
+}
+
 type FeedScope = 'friends' | 'everyone' | 'me' | 'saved';
 const FEED_SCOPE_KEY = 'webring-studio.feedScope';
 
@@ -4766,6 +4777,17 @@ export const App: React.FC = () => {
                     {changesSinceLastPublish} change{changesSinceLastPublish === 1 ? '' : 's'} since
                     last publish
                   </span>
+                )}
+                {publishSettings.lastPublishedAt && !isPlaceholderSiteUrl(bundle.profile.siteUrl) && (
+                  <button
+                    type="button"
+                    onClick={() => openLiveSite(bundle.profile.siteUrl, publishSettings.lastPublishedAt!)}
+                    title="Opens your site with the publish time added to the address, so the browser and any host cache fetch a fresh copy"
+                    className="text-xs px-2.5 py-1 rounded-lg bg-slate-800 hover:bg-slate-700 border border-slate-700 text-slate-200 font-medium flex items-center gap-1"
+                  >
+                    View live site
+                    <ExternalLink className="w-3 h-3" />
+                  </button>
                 )}
               </div>
 

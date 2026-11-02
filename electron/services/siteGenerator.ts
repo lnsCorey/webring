@@ -170,12 +170,16 @@ export class StaticSiteGenerator {
     fs.writeFileSync(path.join(outputDir, '.nojekyll'), '', 'utf8');
     filesWritten.push('.nojekyll');
 
-    // 5b. Write .htaccess so Apache / LiteSpeed hosts resolve DirectoryIndex index.html on subdirectories (preventing 403 Forbidden on /social/) and allow CORS on JSON endpoints
+    // 5b. Write .htaccess so Apache / LiteSpeed hosts resolve DirectoryIndex index.html on subdirectories (preventing 403 Forbidden on /social/), allow CORS on JSON endpoints,
+    // and make browsers recheck pages and JSON on each visit so a new publish shows up right away (media names are content-hashed, so they can stay cached)
     const htaccessContent = [
       'DirectoryIndex index.html',
       '<IfModule mod_headers.c>',
       '  <FilesMatch "\\.(json)$">',
       '    Header set Access-Control-Allow-Origin "*"',
+      '  </FilesMatch>',
+      '  <FilesMatch "\\.(html|json)$">',
+      '    Header set Cache-Control "no-cache"',
       '  </FilesMatch>',
       '</IfModule>',
       '',
@@ -365,14 +369,24 @@ ${TEMPLATE_CSS}${appearance.interactions === 'off' ? '' : ENHANCEMENTS_CSS}
       let data = window.__WEBRING_BUNDLE__;
       // Try fetching live JSON files if hosted over HTTP(S)
       if (window.location.protocol.startsWith('http')) {
+        // Revalidate each file (a 304 when unchanged) and keep whichever copy is newer, so a cached file never replaces fresher embedded data
+        const live = (url, embedded) => fetch(url, { cache: 'no-cache' })
+          .then(r => r.ok ? r.json() : null)
+          .then(doc => {
+            if (!doc || typeof doc !== 'object') return embedded;
+            const fetchedAt = Date.parse(doc.updatedAt);
+            const embeddedAt = Date.parse(embedded && embedded.updatedAt);
+            return !Number.isNaN(embeddedAt) && (Number.isNaN(fetchedAt) || fetchedAt < embeddedAt) ? embedded : doc;
+          })
+          .catch(() => embedded);
         try {
           const [manifest, profile, albums, items, connections, didDocument] = await Promise.all([
-            fetch('./api/manifest.json').then(r => r.ok ? r.json() : data.manifest),
-            fetch('./api/profile.json').then(r => r.ok ? r.json() : data.profile),
-            fetch('./api/albums.json').then(r => r.ok ? r.json() : data.albums),
-            fetch('./api/items.json').then(r => r.ok ? r.json() : data.items),
-            fetch('./api/connections.json').then(r => r.ok ? r.json() : data.connections),
-            fetch('./.well-known/did.json').then(r => r.ok ? r.json() : data.didDocument)
+            live('./api/manifest.json', data.manifest),
+            live('./api/profile.json', data.profile),
+            live('./api/albums.json', data.albums),
+            live('./api/items.json', data.items),
+            live('./api/connections.json', data.connections),
+            live('./.well-known/did.json', data.didDocument)
           ]);
           data = { manifest, profile, albums, items, connections, didDocument };
         } catch (err) {
@@ -967,7 +981,7 @@ ${TEMPLATE_CSS}${appearance.interactions === 'off' ? '' : ENHANCEMENTS_CSS}
         const embedded = window.__WEBRING_ARCHIVES__;
         let doc = embedded && Object.prototype.hasOwnProperty.call(embedded, url) ? embedded[url] : null;
         if (!doc && window.location.protocol.startsWith('http')) {
-          const res = await fetch('./' + String(url).replace(/^\\/+/, ''), { credentials: 'omit' });
+          const res = await fetch('./' + String(url).replace(/^\\/+/, ''), { credentials: 'omit', cache: 'no-cache' });
           if (res.ok) doc = await res.json();
         }
         if (!doc || !Array.isArray(doc.items)) throw new Error('Archive unavailable');
