@@ -595,7 +595,7 @@ function registerIpcHandlers() {
 
   ipcMain.handle(
     'studio:media-update-album',
-    (_e, albumId: string, updates: { title?: string; description?: string; tags?: string[]; coverUrl?: string }) => {
+    (_e, albumId: string, updates: { title?: string; description?: string; tags?: string[]; coverUrl?: string; postToFeed?: boolean; display?: 'card' | 'expanded' }) => {
       return personaManager.getActiveContext().db.updateAlbum(albumId, updates);
     }
   );

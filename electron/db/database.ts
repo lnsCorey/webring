@@ -3,6 +3,7 @@ import * as fs from 'fs';
 import * as crypto from 'crypto';
 import {
   AdsAddon,
+  AlbumDisplay,
   AlbumItem,
   AlbumManifest,
   Appearance,
@@ -10,6 +11,8 @@ import {
   LayoutBlock,
   parseLayout,
   AlbumsDocument,
+  albumDisplay,
+  slugifyAlbumTitle,
   AnalyticsAddon,
   buildCanonicalUrl,
   buildDidDocument,
@@ -935,6 +938,23 @@ export class StudioDatabase {
     addPhotoColumn('thumb_height', 'INTEGER');
     addPhotoColumn('position', 'INTEGER NOT NULL DEFAULT 0');
 
+    // Album cards: a stable page address plus feed and display settings
+    const albumColumns = this.db.prepare('PRAGMA table_info(albums)').all() as Array<{ name: string }>;
+    const addAlbumColumn = (name: string, ddl: string) => {
+      if (!albumColumns.some((c) => c.name === name)) {
+        this.db.exec(`ALTER TABLE albums ADD COLUMN ${name} ${ddl};`);
+      }
+    };
+    addAlbumColumn('slug', 'TEXT');
+    addAlbumColumn('post_to_feed', 'INTEGER NOT NULL DEFAULT 1');
+    addAlbumColumn('display', "TEXT NOT NULL DEFAULT 'card'");
+    const unslugged = this.db
+      .prepare('SELECT id, title FROM albums WHERE slug IS NULL ORDER BY created_at ASC')
+      .all() as Array<{ id: string; title: string }>;
+    for (const row of unslugged) {
+      this.db.prepare('UPDATE albums SET slug = ? WHERE id = ?').run(this.uniqueAlbumSlug(row.title), row.id);
+    }
+
     // Edited items keep their id and canonical URL; updated_at records the last edit
     const itemColumns = this.db.prepare('PRAGMA table_info(items)').all() as Array<{ name: string }>;
     if (!itemColumns.some((c) => c.name === 'updated_at')) {
@@ -1309,17 +1329,37 @@ export class StudioDatabase {
         createdAt: String(a.created_at),
         updatedAt: String(a.updated_at),
         manifestUrl: albumManifestPath(albumId),
+        slug: String(a.slug),
+        pageUrl: `albums/${String(a.slug)}/`,
+        postToFeed: a.post_to_feed !== 0,
+        display: albumDisplay({ display: String(a.display) }),
       };
     });
   }
 
-  public createAlbum(input: { title: string; description?: string; coverUrl?: string; tags?: string[] }): AlbumItem {
+  private uniqueAlbumSlug(title: string): string {
+    const base = slugifyAlbumTitle(title);
+    let slug = base;
+    for (let n = 2; this.db.prepare('SELECT 1 FROM albums WHERE slug = ?').get(slug); n++) {
+      slug = `${base}-${n}`;
+    }
+    return slug;
+  }
+
+  public createAlbum(input: {
+    title: string;
+    description?: string;
+    coverUrl?: string;
+    tags?: string[];
+    postToFeed?: boolean;
+    display?: AlbumDisplay;
+  }): AlbumItem {
     const id = `album-${crypto.randomBytes(4).toString('hex')}`;
     const now = new Date().toISOString();
     this.db
       .prepare(
-        `INSERT INTO albums (id, title, description, cover_url, tags_json, created_at, updated_at)
-         VALUES (?, ?, ?, ?, ?, ?, ?)`
+        `INSERT INTO albums (id, title, description, cover_url, tags_json, created_at, updated_at, slug, post_to_feed, display)
+         VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?)`
       )
       .run(
         id,
@@ -1328,7 +1368,10 @@ export class StudioDatabase {
         input.coverUrl || '',
         JSON.stringify(input.tags || []),
         now,
-        now
+        now,
+        this.uniqueAlbumSlug(input.title),
+        input.postToFeed ? 1 : 0,
+        albumDisplay(input)
       );
 
     return this.getAlbums().find((a) => a.id === id)!;
@@ -1485,7 +1528,14 @@ export class StudioDatabase {
 
   public updateAlbum(
     albumId: string,
-    updates: { title?: string; description?: string; tags?: string[]; coverUrl?: string }
+    updates: {
+      title?: string;
+      description?: string;
+      tags?: string[];
+      coverUrl?: string;
+      postToFeed?: boolean;
+      display?: AlbumDisplay;
+    }
   ): AlbumItem {
     const current = this.getAlbums().find((a) => a.id === albumId);
     if (!current) throw new Error(`Album "${albumId}" not found.`);
@@ -1493,12 +1543,16 @@ export class StudioDatabase {
       cover_url: string;
     }).cover_url;
     this.db
-      .prepare('UPDATE albums SET title = ?, description = ?, tags_json = ?, cover_url = ?, updated_at = ? WHERE id = ?')
+      .prepare(
+        'UPDATE albums SET title = ?, description = ?, tags_json = ?, cover_url = ?, post_to_feed = ?, display = ?, updated_at = ? WHERE id = ?'
+      )
       .run(
         updates.title?.trim() || current.title,
         updates.description ?? current.description,
         JSON.stringify(updates.tags ?? current.tags),
         updates.coverUrl ?? storedCover,
+        (updates.postToFeed ?? current.postToFeed) ? 1 : 0,
+        updates.display ?? albumDisplay(current),
         new Date().toISOString(),
         albumId
       );

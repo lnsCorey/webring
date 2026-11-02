@@ -436,6 +436,8 @@ export class WebringMcpServer {
             description: { type: 'string', description: 'Album description, in Markdown (headings, links, lists, tables; no HTML).' },
             coverUrl: { type: 'string', description: 'Optional cover image URL.' },
             tags: { type: 'array', items: { type: 'string' } },
+            postToFeed: { type: 'boolean', description: 'Show the album in the feed. Default false.' },
+            display: { type: 'string', enum: ['card', 'expanded'], description: 'How the feed shows the album. Default card.' },
           },
           required: ['title'],
         },
@@ -1259,6 +1261,8 @@ export class WebringMcpServer {
             description: args.description ? String(args.description) : undefined,
             coverUrl: args.coverUrl ? String(args.coverUrl) : undefined,
             tags: Array.isArray(args.tags) ? args.tags.map(String) : [],
+            postToFeed: args.postToFeed === true,
+            display: args.display === 'expanded' ? 'expanded' : 'card',
           });
           resultData = album;
           summary = `Created photo album "${album.title}"`;

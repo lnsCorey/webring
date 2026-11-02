@@ -392,7 +392,7 @@ declare global {
       movePhoto: (photoId: string, direction: 'up' | 'down') => Promise<unknown>;
       updateAlbum: (
         albumId: string,
-        updates: { title?: string; description?: string; tags?: string[]; coverUrl?: string }
+        updates: { title?: string; description?: string; tags?: string[]; coverUrl?: string; postToFeed?: boolean; display?: 'card' | 'expanded' }
       ) => Promise<unknown>;
       getMediaUsage: () => Promise<{ files: number; bytes: number }>;
       forgetPublishHistory: () => Promise<unknown>;

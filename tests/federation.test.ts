@@ -8,7 +8,12 @@ import * as vm from 'vm';
 import * as crypto from 'crypto';
 import * as http from 'http';
 import * as zlib from 'zlib';
+import { DatabaseSync } from 'node:sqlite';
 import {
+  albumDisplay,
+  AlbumItemSchema,
+  albumIsPosted,
+  AlbumsDocumentSchema,
   buildCanonicalUrl,
   buildDidDocument,
   buildWebringUri,
@@ -3675,5 +3680,62 @@ describe('Fetching friends\' files over HTTP', () => {
     handler = (req) => req.socket.destroy();
     await expect(defaultJsonFetcher(`${base}/down`)).rejects.toThrow(/socket hang up|ECONNRESET/);
     expect(requests).toBe(2);
+  });
+});
+
+describe('Album cards', () => {
+  let dir: string;
+
+  beforeEach(() => {
+    dir = fs.mkdtempSync(path.join(os.tmpdir(), 'webring-album-cards-'));
+  });
+
+  afterEach(() => {
+    fs.rmSync(dir, { recursive: true, force: true });
+  });
+
+  it('stores album settings and a stable, unique slug', () => {
+    const db = new StudioDatabase(dir, 'a.sqlite');
+    db.updateProfile({ siteUrl: 'https://alice.ring.test', displayName: 'Alice' });
+    const a = db.createAlbum({ title: 'Midjourney Images #1' });
+    expect(a).toMatchObject({ slug: 'midjourney-images-1', pageUrl: 'albums/midjourney-images-1/', postToFeed: false, display: 'card' });
+    const b = db.createAlbum({ title: 'Midjourney Images #1', postToFeed: true, display: 'expanded' });
+    expect(b).toMatchObject({ slug: 'midjourney-images-1-2', postToFeed: true, display: 'expanded' });
+    expect(db.createAlbum({ title: '🎨🎨' }).slug).toBe('album');
+    expect(db.createAlbum({ title: '!!!' }).slug).toBe('album-2');
+    const renamed = db.updateAlbum(a.id, { title: 'Renamed', postToFeed: true, display: 'expanded' });
+    expect(renamed).toMatchObject({ slug: 'midjourney-images-1', postToFeed: true, display: 'expanded' });
+    const albums = AlbumsDocumentSchema.parse(db.buildSignedSiteBundle({ publish: true }).albums);
+    expect(albums.albums.find((x) => x.id === a.id)).toMatchObject({ slug: 'midjourney-images-1', postToFeed: true, display: 'expanded' });
+  });
+
+  it('migrates existing albums to posted cards with a slug', () => {
+    const raw = new DatabaseSync(path.join(dir, 'a.sqlite'));
+    raw.exec(`CREATE TABLE albums (
+      id TEXT PRIMARY KEY,
+      title TEXT NOT NULL,
+      description TEXT NOT NULL DEFAULT '',
+      cover_url TEXT NOT NULL DEFAULT '',
+      tags_json TEXT NOT NULL DEFAULT '[]',
+      created_at TEXT NOT NULL,
+      updated_at TEXT NOT NULL
+    );`);
+    const ins = raw.prepare('INSERT INTO albums (id, title, created_at, updated_at) VALUES (?, ?, ?, ?)');
+    ins.run('album-old', 'Trip to Paris', '2024-01-01T00:00:00.000Z', '2024-01-01T00:00:00.000Z');
+    ins.run('album-new', 'Trip to Paris', '2025-01-01T00:00:00.000Z', '2025-01-01T00:00:00.000Z');
+    raw.close();
+
+    const db = new StudioDatabase(dir, 'a.sqlite');
+    const albums = db.getAlbums();
+    expect(albums.find((x) => x.id === 'album-old')).toMatchObject({ postToFeed: true, display: 'card', slug: 'trip-to-paris', pageUrl: 'albums/trip-to-paris/' });
+    expect(albums.find((x) => x.id === 'album-new')).toMatchObject({ postToFeed: true, display: 'card', slug: 'trip-to-paris-2' });
+  });
+
+  it('reads albums without the new fields as posted cards', () => {
+    expect(albumIsPosted({})).toBe(true);
+    expect(albumIsPosted({ postToFeed: false })).toBe(false);
+    expect(albumDisplay({})).toBe('card');
+    expect(albumDisplay({ display: 'bogus' })).toBe('card');
+    expect(AlbumItemSchema.parse({ id: 'x', canonicalUrl: 'u', title: 't', createdAt: 'c', updatedAt: 'c', display: 'bogus' }).display).toBeUndefined();
   });
 });
