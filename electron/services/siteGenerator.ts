@@ -355,8 +355,10 @@ export class StaticSiteGenerator {
     .prose-block th, .prose-block td { border: 1px solid rgba(148, 163, 184, 0.35); padding: 0.4rem 0.65rem; text-align: left; }
     .prose-block th { font-weight: 700; background: rgba(148, 163, 184, 0.12); }
     .prose-block hr { border: 0; border-top: 1px solid rgba(148, 163, 184, 0.3); margin: 1rem 0; }
+    .album-description { max-width: 48rem; }
     .post-body > :first-child { margin-top: 0; }
     .post-body > :last-child { margin-bottom: 0; }
+    .album-description p:first-child, .album-description h2:first-child, .album-description h3:first-child { margin-top: 0.25rem; }
 ${TEMPLATE_CSS}${appearance.interactions === 'off' ? '' : ENHANCEMENTS_CSS}
   </style>
 </head>
