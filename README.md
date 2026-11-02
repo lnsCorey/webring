@@ -132,8 +132,34 @@ History grows forever, so Studio keeps syncing small on both sides:
 
 - **Your feed keeps a window.** On the Neighborhood Feed, **Keep** sets how long friends' posts stay: 1 week, 1 month, 3 months (the default), 1 year or forever. Older posts aren't synced and are cleared from your feed. Friends' likes and comments on *your* posts are always kept.
 - **Save what matters.** **☆ Save** on a friend's post or photo keeps a private copy under **Saved**, with a local copy of its image (re-encoded without metadata) and your own note. Saved posts stay after they leave your feed window or your friend removes them, and they're never published.
-- **Unchanged files aren't downloaded.** Syncing asks each host whether a friend's `items.json` and `albums.json` changed since last time (ETag / Last-Modified); if not, nothing is downloaded or reprocessed.
+- **Unchanged files aren't downloaded.** Each friend's signed manifest lists a fingerprint for each of their files, so a friend with nothing new costs one small request. See [Syncing many friends](#syncing-many-friends).
 - **You publish recent posts, with archives.** Your `items.json` holds the last 90 days of posts (at least your 50 newest). Older ones move to signed monthly archives (`api/archive/items-YYYY-MM.json`), so friends download less. Your page lists them under **Older posts**, and each month loads when a visitor opens it. Studio itself still shows all your posts.
+
+### Syncing many friends
+
+Sync is built to stay quick with hundreds or thousands of friends:
+
+- **16 friends at a time.** **Sync All** checks 16 friends' sites at once. While it runs, the status message shows a running count (for example *Syncing friends… 340 / 1000*), and the feed refreshes as posts come in.
+- **One request when nothing changed.** Your signed manifest lists a fingerprint for each of your files. When a friend's manifest hasn't changed, or lists the same fingerprints as last time, Studio downloads nothing else from them. Publishing unchanged content produces byte-identical files, so a republish doesn't make friends download everything again.
+- **Compressed downloads.** Studio asks for gzip/brotli, which cuts downloads about 5× on hosts that compress JSON (most do, including GitHub Pages).
+- **Unreachable friends wait.** If a friend's site fails, Sync All skips it for 15 minutes, then 30, doubling up to a day, so dead sites don't slow every sync. Syncing that one friend from their card always tries, and a successful sync clears the wait.
+
+**Expected sync times.** These come from the sync load test (`npm run loadtest:sync`), with a 150 ms round trip to each friend's host, typical for a host on another continent. Hosts nearer to you are faster: at 50 ms, times are about a third of these.
+
+| Friends | First sync | Sync, nothing new | Sync, 20% posted | Download, nothing new | Download per month (hourly sync) |
+|---:|---:|---:|---:|---:|---:|
+| 100 | 8 s | 3 s | 3 s | 0.05 MB | ~40 MB |
+| 250 | 20 s | 7 s | 8 s | 0.12 MB | ~100 MB |
+| 500 | 40 s | 14 s | 16 s | 0.24 MB | ~200 MB |
+| 1,000 | 1.3 min | 29 s | 31 s | 0.5 MB | ~390 MB |
+| 2,000 | 2.7 min | 57 s | 63 s | 1 MB | ~0.8 GB |
+
+- The first sync downloads everything: about 22 MB for 1,000 friends, each with 60 posts and 24 photos' details. (Photos themselves load from friends' sites when you view them.)
+- When friends' sites are down, the first sync that finds them takes longer, since Studio waits up to 10 s for each. With 7% of 1,000 friends failing, that sync took about 55 s. The next one skips them and is back to about 27 s.
+- Studio stays responsive while syncing. The longest pause measured was under 0.2 s, even at 2,000 friends.
+- Before these changes, Studio checked friends one at a time and re-requested all six files. A 1,000-friend sync with nothing new took about 20 minutes and 6,000 requests. It now takes about 29 seconds and 1,000 requests.
+
+For the **Sync friends & rings** schedule, every 15 minutes is fine up to around 1,000 friends. With more than that, hourly keeps each sync well inside its interval. The times above are estimates from a local test with network delay added, not measurements on real hosts. [tests/load/README.md](tests/load/README.md) explains how they're calculated and how to run the test yourself.
 
 ### Letting people know you added them
 
