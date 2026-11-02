@@ -587,6 +587,9 @@ export const App: React.FC = () => {
   const [mutualFriendUrls, setMutualFriendUrls] = useState<string[]>([]);
   const [incomingFriendNotice, setIncomingFriendNotice] = useState<{ link: string; at: number } | null>(null);
   const [feedScope, setFeedScopeState] = useState<FeedScope>(loadFeedScope);
+  useEffect(() => {
+    setOpenFeedAlbum(null);
+  }, [feedScope, activeTab]);
   const setFeedScope = (scope: FeedScope) => {
     setFeedScopeState(scope);
     try {
@@ -4488,6 +4491,7 @@ export const App: React.FC = () => {
                                 {(() => {
                                   const peek = (entry.peekUrls && entry.peekUrls.length ? entry.peekUrls : [entry.mediaUrl]).filter(Boolean);
                                   const extra = (entry.photoCount ?? 0) - 3;
+                                  const side = peek.slice(1, 3);
                                   return peek.length > 0 ? (
                                     <button
                                       type="button"
@@ -4496,10 +4500,10 @@ export const App: React.FC = () => {
                                       title="Open album"
                                     >
                                       <img src={peek[0]} alt={entry.title} className={`${peek.length > 1 ? 'col-span-2' : 'col-span-3'} row-span-2 w-full h-full object-cover`} />
-                                      {peek.slice(1, 3).map((url, i) => (
-                                        <div key={url + i} className="relative w-full h-full">
+                                      {side.map((url, i) => (
+                                        <div key={url + i} className={`relative w-full h-full ${side.length === 1 ? 'row-span-2' : ''}`}>
                                           <img src={url} alt="" className="w-full h-full object-cover" />
-                                          {i === peek.slice(1, 3).length - 1 && peek.length === 3 && extra > 0 && (
+                                          {i === side.length - 1 && extra > 0 && (
                                             <span className="absolute inset-0 bg-black/55 flex items-center justify-center text-white font-bold">
                                               +{extra}
                                             </span>
