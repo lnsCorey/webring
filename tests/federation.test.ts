@@ -3071,6 +3071,23 @@ describe('Site Design (look & feel, page layout)', () => {
       db.close();
     });
 
+    it('draws an empty posted album as a placeholder post, and never repeats the cover in the peek', async () => {
+      const db = new StudioDatabase(tempRoot, 'peek-edge.sqlite');
+      db.createAlbum({ title: 'Blank', postToFeed: true });
+      const album = db.createAlbum({ title: 'Four', postToFeed: true });
+      for (let i = 0; i < 4; i++) db.addPhotoToAlbum({ albumId: album.id, url: `media/albums/f/p${i}.jpg` });
+      db.updateAlbum(album.id, { coverUrl: 'media/albums/f/p1.jpg' });
+      const { html } = await renderPage(new StaticSiteGenerator(db).buildStandaloneProfileHtml(db.buildSignedSiteBundle()));
+      const blank = html.match(/<a href="albums\/blank\/" class="album-peek[^"]*"[\s\S]*?<\/a>/)![0];
+      expect(blank).not.toContain('<img');
+      expect(blank).not.toContain('+');
+      const peek = html.match(/<a href="albums\/four\/" class="album-peek[^"]*"[\s\S]*?<\/a>/)![0];
+      expect(peek.match(/media\/albums\/f\/p1\.jpg/g)).toHaveLength(1);
+      expect(peek.match(/<img/g)).toHaveLength(3);
+      expect(peek).toContain('+1');
+      db.close();
+    });
+
     it('renders album descriptions as safe Markdown in every arrangement', async () => {
       for (const theme of ['neo-webring', 'facepace', 'instapick'] as ProfileTheme[]) {
         const db = new StudioDatabase(tempRoot, `album-md-${theme}.sqlite`);

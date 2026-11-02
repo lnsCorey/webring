@@ -178,6 +178,7 @@ export const TEMPLATE_CSS = String.raw`
     .album-card-cover { display: block; aspect-ratio: 4 / 3; overflow: hidden; border-radius: 0.6rem; background: rgba(128, 128, 128, 0.2); }
     .album-card-cover img { width: 100%; height: 100%; object-fit: cover; display: block; }
     .album-card-blank { display: block; width: 100%; height: 100%; }
+    .album-tile-blank { background: rgba(128, 128, 128, 0.2); }
     .album-card-title { font-weight: 700; font-size: 0.9rem; }
     .album-card-count { font-size: 0.75rem; opacity: 0.65; }
     .album-badge { position: absolute; top: 0.4rem; right: 0.4rem; padding: 0.1rem 0.4rem; border-radius: 0.4rem; background: rgba(0, 0, 0, 0.6); color: #fff; font-size: 0.75rem; font-weight: 700; pointer-events: none; }
@@ -325,10 +326,10 @@ export function renderTemplatePage(ctx: any): string {
     return d && !isNaN(d.getTime()) ? ' · <span class="item-edited" title="Edited ' + esc(d.toLocaleString()) + '">edited</span>' : '';
   };
   // Albums: a link to the album's page, with a cover and a photo count
-  const albumHref = (a: any) => (a.pageUrl ? safeUrl(a.pageUrl) : '#photos');
-  const albumCover = (a: any) => a.coverUrl || (a.photos && a.photos[0] ? a.photos[0].thumbUrl || a.photos[0].url : '');
-  const albumCount = (a: any) => (a.photos || []).length;
-  const photosLabel = (a: any) => albumCount(a) + (albumCount(a) === 1 ? ' photo' : ' photos') + (albumCount(a) > 3 ? ' · +' + (albumCount(a) - 3) + ' more' : '');
+  const albumHref = ctx.albumHref;
+  const albumCover = ctx.albumCover;
+  const albumCount = ctx.albumPhotoTotal;
+  const photosLabel = (a: any) => ctx.albumPhotosLabel(a, true);
   const albumOpenAttrs = (a: any) => 'href="' + albumHref(a) + '" data-album-link="' + esc(a.id) + '"';
   const albumPostBody = (a: any) =>
     ctx.albumPeek(a) + '<p class="font-bold mt-2">' + esc(a.title) + '</p><a href="' + albumHref(a) + '" class="text-sm font-semibold tpl-accent">Open album →</a>';
@@ -408,7 +409,7 @@ export function renderTemplatePage(ctx: any): string {
     const ids = b.options && Array.isArray(b.options.albumIds) && b.options.albumIds.length ? b.options.albumIds : null;
     const list = ids ? ctx.albums.filter((a: any) => ids.includes(a.id)) : ctx.albums;
     if (!list.length) return ctx.section(b, '📸 Photo Albums', ctx.emptyNote('No photo albums published yet.'));
-    const isCard = (a: any) => a.display !== 'expanded';
+    const isCard = (a: any) => !ctx.albumShownExpanded(a);
     if (shell === 'reel') {
       return ctx.section(b, '📸 Photos', '<div class="tt-reel">' + list.map((a: any) => isCard(a) ? albumReel(a) : (a.photos || []).map((p: any) => photoReel(p, a)).join('')).join('') + '</div>');
     }
@@ -511,7 +512,7 @@ export function renderTemplatePage(ctx: any): string {
       (profile.bio ? '<p class="text-sm mt-1 whitespace-pre-line">' + esc(profile.bio) + '</p>' : '') + meta() + '</div></div>';
     const highlights = ctx.albums.length
       ? '<div class="ip-highlights" data-region="highlights">' + ctx.albums.map((a: any) => {
-          const cover = a.coverUrl || (a.photos && a.photos[0] ? a.photos[0].thumbUrl || a.photos[0].url : '');
+          const cover = albumCover(a);
           return '<a href="' + albumHref(a) + '"><span class="ip-bubble">' + (cover ? '<img src="' + safeUrl(cover) + '" alt="" />' : '') + '</span>' + esc(a.title) + '</a>';
         }).join('') + '</div>'
       : '';

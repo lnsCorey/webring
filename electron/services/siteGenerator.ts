@@ -339,20 +339,7 @@ export class StaticSiteGenerator {
     body[data-background="gradient"] { background-image: linear-gradient(160deg, color-mix(in srgb, var(--accent, #6366f1) 24%, transparent), transparent 60%) !important; background-attachment: fixed; }
     body[data-background="banner-blur"]::before { content: ""; position: fixed; inset: -60px; z-index: -1; background-image: var(--banner-image); background-size: cover; background-position: center; filter: blur(48px) saturate(1.2); opacity: 0.35; }
     /* Text blocks */
-    .album-peek { display: grid; grid-template-columns: 2fr 1fr; grid-template-rows: 1fr 1fr; gap: 3px; aspect-ratio: 16 / 9; overflow: hidden; border-radius: 0.6rem; background: rgba(128, 128, 128, 0.2); }
-    .album-peek .album-tile { position: relative; display: block; overflow: hidden; min-height: 0; }
-    .album-peek .album-tile img { width: 100%; height: 100%; object-fit: cover; display: block; }
-    .album-peek .album-tile-cover { grid-row: 1 / span 2; }
-    .album-peek-1 { grid-template-columns: 1fr; }
-    .album-peek-2 .album-tile:last-child { grid-row: 1 / span 2; }
-    .album-plus { position: absolute; inset: 0; display: flex; align-items: center; justify-content: center; background: rgba(0, 0, 0, 0.55); color: #fff; font-weight: 800; font-size: 1.1rem; }
-    .album-card { display: flex; flex-direction: column; gap: 0.2rem; min-width: 0; text-decoration: none; color: inherit; }
     .album-cards-row .album-card { flex: 0 0 11rem; }
-    .album-card-cover { display: block; aspect-ratio: 4 / 3; overflow: hidden; border-radius: 0.6rem; background: rgba(128, 128, 128, 0.2); }
-    .album-card-cover img { width: 100%; height: 100%; object-fit: cover; display: block; }
-    .album-card-blank { display: block; width: 100%; height: 100%; }
-    .album-card-title { font-weight: 700; font-size: 0.9rem; }
-    .album-card-count { font-size: 0.75rem; opacity: 0.65; }
     .prose-block h2 { font-size: 1.4rem; font-weight: 700; margin: 1.1rem 0 0.5rem; }
     .prose-block h3 { font-size: 1.2rem; font-weight: 700; margin: 1rem 0 0.4rem; }
     .prose-block h4, .prose-block h5 { font-weight: 700; margin: 0.9rem 0 0.3rem; }
@@ -368,10 +355,8 @@ export class StaticSiteGenerator {
     .prose-block th, .prose-block td { border: 1px solid rgba(148, 163, 184, 0.35); padding: 0.4rem 0.65rem; text-align: left; }
     .prose-block th { font-weight: 700; background: rgba(148, 163, 184, 0.12); }
     .prose-block hr { border: 0; border-top: 1px solid rgba(148, 163, 184, 0.3); margin: 1rem 0; }
-    .album-description { max-width: 48rem; }
     .post-body > :first-child { margin-top: 0; }
     .post-body > :last-child { margin-bottom: 0; }
-    .album-description p:first-child, .album-description h2:first-child, .album-description h3:first-child { margin-top: 0.25rem; }
 ${TEMPLATE_CSS}${appearance.interactions === 'off' ? '' : ENHANCEMENTS_CSS}
   </style>
 </head>
@@ -700,13 +685,19 @@ ${TEMPLATE_CSS}${appearance.interactions === 'off' ? '' : ENHANCEMENTS_CSS}
       const albumShownExpanded = (a) => a.display === 'expanded';
       const albumCover = (a) => a.coverUrl || ((a.photos || [])[0] ? (a.photos[0].thumbUrl || a.photos[0].url) : '');
       const albumPhotoTotal = (a) => (a.photos || []).length;
+      // "5 photos", and with more=true the count hidden behind the peek: "5 photos · +2 more"
+      const albumPhotosLabel = (a, more) => {
+        const n = albumPhotoTotal(a);
+        return n + (n === 1 ? ' photo' : ' photos') + (more && n > 3 ? ' · +' + (n - 3) + ' more' : '');
+      };
       const albumHref = (a) => a.pageUrl ? safeUrl(a.pageUrl) : '#photos';
 
       // Cover large on the left, two more photos stacked on the right, "+N" on the last tile
       function albumPeek(album) {
         const photos = album.photos || [];
         const cover = albumCover(album);
-        const side = photos.slice(1, 3).map(p => p.thumbUrl || p.url);
+        // The two side tiles come from the photos that are not already the cover
+        const side = photos.filter(p => (p.thumbUrl || p.url) !== cover && p.url !== cover).slice(0, 2).map(p => p.thumbUrl || p.url);
         const extra = photos.length - 3;
         const tiles = [];
         if (cover) tiles.push('<span class="album-tile album-tile-cover"><img src="' + safeUrl(cover) + '" alt="" loading="lazy" /></span>');
@@ -714,16 +705,16 @@ ${TEMPLATE_CSS}${appearance.interactions === 'off' ? '' : ENHANCEMENTS_CSS}
           tiles.push('<span class="album-tile"><img src="' + safeUrl(src) + '" alt="" loading="lazy" />' +
             (extra > 0 && i === side.length - 1 ? '<span class="album-plus">+' + extra + '</span>' : '') + '</span>');
         });
+        if (!tiles.length) tiles.push('<span class="album-tile album-tile-blank"></span>');
         return '<a href="' + albumHref(album) + '" class="album-peek album-peek-' + Math.min(tiles.length, 3) + '" data-album-link="' + esc(album.id) + '">' + tiles.join('') + '</a>';
       }
 
       function renderAlbumCard(album) {
         const cover = albumCover(album);
-        const total = albumPhotoTotal(album);
         return '<a class="album-card" href="' + albumHref(album) + '" data-album-link="' + esc(album.id) + '">' +
           '<span class="album-card-cover">' + (cover ? '<img src="' + safeUrl(cover) + '" alt="" loading="lazy" />' : '<span class="album-card-blank"></span>') + '</span>' +
           '<span class="album-card-title">' + esc(album.title) + '</span>' +
-          '<span class="album-card-count">' + total + (total === 1 ? ' photo' : ' photos') + '</span></a>';
+          '<span class="album-card-count">' + albumPhotosLabel(album, false) + '</span></a>';
       }
 
       function renderAlbumPost(album) {
@@ -992,7 +983,7 @@ ${TEMPLATE_CSS}${appearance.interactions === 'off' ? '' : ENHANCEMENTS_CSS}
         root.innerHTML = renderTemplatePage({
           shell: template.shell, profile, albums: allAlbums, items: allItems, friends: allFriends,
           endorsementCount: (connections.endorsements || []).length, layout: visibleBlocks,
-          blockRenderers, section, emptyNote, albumPeek, renderAlbumPost, timelineEntries, esc, safeUrl, buildDeepLink, getEndorsementsFor, getCommentsFor, renderMarkdown, markdownToPlainText,
+          blockRenderers, section, emptyNote, albumHref, albumCover, albumShownExpanded, albumPhotoTotal, albumPhotosLabel, albumPeek, renderAlbumPost, timelineEntries, esc, safeUrl, buildDeepLink, getEndorsementsFor, getCommentsFor, renderMarkdown, markdownToPlainText,
           hasLiveProvider: Boolean(commentCfg.provider && commentCfg.provider !== 'none'),
           webringBars, headerAdHtml, inFeedAdHtml, footerAdHtml, footerHtml, olderPostsHtml, archiveView
         });
