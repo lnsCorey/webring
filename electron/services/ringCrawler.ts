@@ -6,6 +6,7 @@ import * as net from 'net';
 import * as zlib from 'zlib';
 import { StudioDatabase } from '../db/database';
 import {
+  albumIsPosted,
   AlbumsDocumentSchema,
   ConnectionsDocumentSchema,
   DidDocumentSchema,
@@ -548,19 +549,36 @@ export class RingCrawler {
         const photoVerified = isManifestVerified && isProfileVerified && isAlbumsVerified;
         const seenPhotoUrls: string[] = [];
 
-        // One transaction per document: far faster than committing every row
+        const absoluteUrl = (url: string) =>
+          !url ? '' : url.startsWith('http') ? url : `${normalizedFriendUrl}/${url.replace(/^\/+/, '')}`;
+
+        // One transaction per document: far faster than committing every row.
+        // Each posted album is one feed card; its photos are stored linked to it for the album view.
         this.db.transaction(() => {
           for (const album of albumsDoc.albums) {
-            for (const photo of album.photos) {
-              if (!isUrlWithinSite(photo.canonicalUrl, normalizedFriendUrl)) {
-                entriesRejected++;
-                continue;
-              }
-              seenPhotoUrls.push(photo.canonicalUrl);
-              if (!inWindow(photo.createdAt)) continue;
-              const fullPhotoUrl = photo.url.startsWith('http')
-                ? photo.url
-                : `${normalizedFriendUrl}/${photo.url.replace(/^\/+/, '')}`;
+            // An unposted album keeps no rows, so a verified sync prunes any stored before
+            if (!albumIsPosted(album)) continue;
+            if (!isUrlWithinSite(album.canonicalUrl, normalizedFriendUrl)) {
+              entriesRejected++;
+              continue;
+            }
+            const photos = album.photos.filter((photo) => {
+              if (isUrlWithinSite(photo.canonicalUrl, normalizedFriendUrl)) return true;
+              entriesRejected++;
+              return false;
+            });
+            // The album is in the window if its newest photo is; then every photo of it is kept
+            const newest = photos.reduce((max, p) => (p.createdAt > max ? p.createdAt : max), '');
+            const albumCreatedAt = newest || album.createdAt;
+            if (!inWindow(albumCreatedAt)) continue;
+
+            const before = this.db.getFeedAlbumSyncState(album.canonicalUrl);
+            // A card seen for the first time (including the first sync after upgrading) has no new photos
+            const added = before.newCount === null ? [] : photos.filter((p) => !before.photoUrls.has(p.canonicalUrl));
+            const newCount = before.newCount === null ? 0 : before.newCount + added.length;
+
+            for (const photo of photos) {
+              const fullPhotoUrl = absoluteUrl(photo.url);
               this.db.upsertNetworkFeedEntry({
                 friendSiteUrl: normalizedFriendUrl,
                 friendName: profile.displayName,
@@ -575,9 +593,42 @@ export class RingCrawler {
                 tags: photo.tags.length > 0 ? photo.tags : album.tags,
                 createdAt: photo.createdAt,
                 verifiedSignature: photoVerified,
+                albumUrl: album.canonicalUrl,
               });
+              seenPhotoUrls.push(photo.canonicalUrl);
               photosIndexed++;
             }
+
+            const cover = absoluteUrl(album.coverUrl);
+            // The card links to the album's page only when it's on the friend's own site
+            const pageUrl = album.pageUrl ? absoluteUrl(album.pageUrl) : '';
+            const albumTargetUrl = pageUrl && isUrlWithinSite(pageUrl, normalizedFriendUrl) ? pageUrl : normalizedFriendUrl;
+            // The card shows the new photos first; otherwise the cover, then the album's order
+            const byNewest = (a: { createdAt: string }, b: { createdAt: string }) =>
+              a.createdAt < b.createdAt ? 1 : a.createdAt > b.createdAt ? -1 : 0;
+            const thumbs = newCount > 0
+              ? [...photos].sort(byNewest).map((p) => absoluteUrl(p.thumbUrl))
+              : [cover, ...photos.map((p) => absoluteUrl(p.thumbUrl))];
+            const peekUrls = [...new Set(thumbs.filter(Boolean))].slice(0, 3);
+            this.db.upsertNetworkFeedEntry({
+              friendSiteUrl: normalizedFriendUrl,
+              friendName: profile.displayName,
+              friendAvatarUrl: profile.avatarUrl,
+              friendDid: profile.did,
+              entryType: 'album',
+              title: album.title,
+              canonicalUrl: album.canonicalUrl,
+              targetUrl: albumTargetUrl,
+              commentary: album.description,
+              mediaUrl: cover,
+              tags: album.tags,
+              createdAt: albumCreatedAt,
+              verifiedSignature: photoVerified,
+              photoCount: photos.length,
+              newCount,
+              peekUrls,
+            });
+            seenPhotoUrls.push(album.canonicalUrl);
           }
         });
 

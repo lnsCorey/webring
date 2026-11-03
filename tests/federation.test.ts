@@ -8,7 +8,12 @@ import * as vm from 'vm';
 import * as crypto from 'crypto';
 import * as http from 'http';
 import * as zlib from 'zlib';
+import { DatabaseSync } from 'node:sqlite';
 import {
+  albumDisplay,
+  AlbumItemSchema,
+  albumIsPosted,
+  AlbumsDocumentSchema,
   buildCanonicalUrl,
   buildDidDocument,
   buildWebringUri,
@@ -211,6 +216,7 @@ describe('Two-Peer Pull Federation, Static Site Generation & Endorsement Discove
       title: 'Botanical Glasshouse',
       description: 'Rare ferns and orchids',
       tags: ['botany', 'glasshouse'],
+      postToFeed: true,
     });
     const alicePhoto = aliceDb.addPhotoToAlbum({
       albumId: aliceAlbum.id,
@@ -248,8 +254,8 @@ describe('Two-Peer Pull Federation, Static Site Generation & Endorsement Discove
     expect(crawlAliceRes.verifiedSignature).toBe(true);
     expect(crawlAliceRes.photosIndexed).toBeGreaterThan(0);
 
-    // Bob's neighborhood feed now contains Alice's photo
-    const bobFeed = bobDb.getNetworkFeed();
+    // Bob's neighborhood feed now contains Alice's photo (in her album's card)
+    const bobFeed = bobDb.getFeedAlbumPhotos(aliceAlbum.canonicalUrl);
     expect(bobFeed.some((f) => f.canonicalUrl === alicePhoto.canonicalUrl)).toBe(true);
 
     // Bob likes Alice's photo by referencing its canonicalUrl
@@ -665,7 +671,7 @@ describe('Two-Peer Pull Federation, Static Site Generation & Endorsement Discove
         handle: 'bob-sec.ring.test',
         displayName: 'Bob Secure',
       });
-      const bobAlbum = bobDb.createAlbum({ title: 'Verified Album' });
+      const bobAlbum = bobDb.createAlbum({ title: 'Verified Album', postToFeed: true });
       bobDb.addPhotoToAlbum({
         albumId: bobAlbum.id,
         url: 'https://bob-sec.ring.test/photo.jpg',
@@ -708,7 +714,7 @@ describe('Two-Peer Pull Federation, Static Site Generation & Endorsement Discove
 
       // Photos from untampered albums.json remain verified, while tampered items/endorsements are marked unverified!
       const feedAfterTamper = aliceDb.getNetworkFeed();
-      const photoEntry = feedAfterTamper.find((e) => e.entryType === 'photo');
+      const photoEntry = aliceDb.getFeedAlbumPhotos(bobAlbum.canonicalUrl)[0];
       const itemEntry = feedAfterTamper.find((e) => e.entryType === 'like');
       expect(photoEntry?.verifiedSignature).toBe(true);
       expect(itemEntry?.verifiedSignature).toBe(false);
@@ -1005,6 +1011,14 @@ describe('Two-Peer Pull Federation, Static Site Generation & Endorsement Discove
       expect(adsGen.filesWritten).toContain('.htaccess');
       const htaccess = fs.readFileSync(path.join(outDir, '.htaccess'), 'utf8');
       expect(htaccess).toContain('DirectoryIndex index.html');
+      // Pages and JSON are rechecked on each visit so a new publish shows up right away
+      expect(htaccess).toMatch(/<FilesMatch "\\\.\(html\|json\)\$">\s*Header set Cache-Control "no-cache"/);
+
+      // The page revalidates live JSON and keeps the embedded copy when the fetched one is older
+      expect(htmlWithAds).toContain("fetch(url, { cache: 'no-cache' })");
+      expect(htmlWithAds).toContain("live('./api/items.json', data.items)");
+      expect(htmlWithAds).toContain('fetchedAt < embeddedAt');
+      expect(htmlWithAds).not.toMatch(/fetch\('\.\/api\/[a-z]+\.json'\)/);
 
       // Verify all inline <script> blocks in index.html are 100% syntactically valid JavaScript
       const scriptBlocks = Array.from(
@@ -2413,7 +2427,7 @@ describe('Media Library', () => {
 
   it('lets friends see replaced and removed photos when they sync', async () => {
     const owner = makeSite('erin');
-    const album = owner.db.createAlbum({ title: 'Shared' });
+    const album = owner.db.createAlbum({ title: 'Shared', postToFeed: true });
     const files = [0, 1].map((n) => {
       const f = path.join(tempRoot, `s${n}.jpg`);
       fs.writeFileSync(f, makePhoneJpeg(32, 32, 1, n * 70));
@@ -2427,7 +2441,7 @@ describe('Media Library', () => {
     const crawler = new RingCrawler(friend.db);
     await crawler.crawlFriendSite('https://erin.example', out);
     const [keep, drop] = owner.db.getAlbums()[0].photos;
-    expect(friend.db.getNetworkFeed().filter((e) => e.entryType === 'photo')).toHaveLength(2);
+    expect(friend.db.getFeedAlbumPhotos(album.canonicalUrl)).toHaveLength(2);
 
     const replacement = path.join(tempRoot, 'swap.jpg');
     fs.writeFileSync(replacement, makePhoneJpeg(32, 32, 1, 222));
@@ -2436,7 +2450,7 @@ describe('Media Library', () => {
     owner.publisher.publishToLocalDirectory(out);
     await crawler.crawlFriendSite('https://erin.example', out);
 
-    const photos = friend.db.getNetworkFeed().filter((e) => e.entryType === 'photo');
+    const photos = friend.db.getFeedAlbumPhotos(album.canonicalUrl);
     expect(photos).toHaveLength(1);
     expect(photos[0].canonicalUrl).toBe(keep.canonicalUrl);
     expect(photos[0].mediaUrl).toContain(owner.db.getAlbums()[0].photos[0].sha256!.slice(0, 20));
@@ -2751,6 +2765,49 @@ describe('Media Library references', () => {
   });
 });
 
+/**
+ * Runs the published page's scripts against a tiny fake DOM and returns what they render. By default
+ * the page is opened from a file; pass `served` to open it over https with `files` as the host's JSON.
+ */
+const renderPage = async (html: string, served?: { files: Record<string, unknown> }) => {
+  const scripts = [...html.matchAll(/<script(?![^>]*src)[^>]*>([\s\S]*?)<\/script>/g)].map((m) => m[1]);
+  const root = { innerHTML: '', addEventListener: () => undefined, querySelectorAll: () => [] };
+  const attrs = new Map<string, string>();
+  const styles = new Map<string, string>();
+  const body = {
+    className: '',
+    setAttribute: (k: string, v: string) => attrs.set(k, v),
+    removeAttribute: (k: string) => attrs.delete(k),
+    style: { setProperty: (k: string, v: string) => styles.set(k, v) },
+  };
+  const windowStub: Record<string, unknown> = { location: { protocol: served ? 'https:' : 'file:' } };
+  const fetch = async (url: string) => {
+    const doc = served?.files[url];
+    return { ok: doc !== undefined, json: async () => JSON.parse(JSON.stringify(doc)) };
+  };
+  const context = vm.createContext({
+    window: windowStub,
+    document: {
+      body,
+      getElementById: (id: string) => (id === 'profile-root' ? root : null),
+      addEventListener: () => undefined,
+      createElement: () => ({ setAttribute: () => undefined }),
+    },
+    URLSearchParams,
+    console,
+    setTimeout,
+    fetch,
+    parent: { postMessage: () => undefined },
+  });
+  windowStub.document = (context as { document: unknown }).document;
+  for (const code of scripts) {
+    // `window.__WEBRING_BUNDLE__ = …` must land on the window stub
+    vm.runInContext(code.replace(/^\s*window\./, 'window.'), context);
+  }
+  await new Promise((r) => setTimeout(r, 20)); // let the async page script finish
+  return { html: root.innerHTML, attrs, styles };
+};
+
 describe('Site Design (look & feel, page layout)', () => {
   let tempRoot: string;
 
@@ -2761,41 +2818,6 @@ describe('Site Design (look & feel, page layout)', () => {
   afterEach(() => {
     fs.rmSync(tempRoot, { recursive: true, force: true });
   });
-
-  /** Runs the published page's scripts against a tiny fake DOM and returns what they render. */
-  const renderPage = async (html: string) => {
-    const scripts = [...html.matchAll(/<script(?![^>]*src)[^>]*>([\s\S]*?)<\/script>/g)].map((m) => m[1]);
-    const root = { innerHTML: '', addEventListener: () => undefined, querySelectorAll: () => [] };
-    const attrs = new Map<string, string>();
-    const styles = new Map<string, string>();
-    const body = {
-      className: '',
-      setAttribute: (k: string, v: string) => attrs.set(k, v),
-      removeAttribute: (k: string) => attrs.delete(k),
-      style: { setProperty: (k: string, v: string) => styles.set(k, v) },
-    };
-    const windowStub: Record<string, unknown> = { location: { protocol: 'file:' } };
-    const context = vm.createContext({
-      window: windowStub,
-      document: {
-        body,
-        getElementById: (id: string) => (id === 'profile-root' ? root : null),
-        addEventListener: () => undefined,
-        createElement: () => ({ setAttribute: () => undefined }),
-      },
-      URLSearchParams,
-      console,
-      setTimeout,
-      parent: { postMessage: () => undefined },
-    });
-    windowStub.document = (context as { document: unknown }).document;
-    for (const code of scripts) {
-      // `window.__WEBRING_BUNDLE__ = …` must land on the window stub
-      vm.runInContext(code.replace(/^\s*window\./, 'window.'), context);
-    }
-    await new Promise((r) => setTimeout(r, 20)); // let the async page script finish
-    return { html: root.innerHTML, attrs, styles };
-  };
 
   const blockOrder = (html: string) => [...html.matchAll(/data-block="([a-z]+)"/g)].map((m) => m[1]);
 
@@ -2908,8 +2930,10 @@ describe('Site Design (look & feel, page layout)', () => {
     const XSS = '<img src=x onerror=alert(1)>';
     const setUp = (file: string, theme: ProfileTheme) => {
       const db = new StudioDatabase(tempRoot, file);
-      const album = db.createAlbum({ title: 'Trips' });
+      const album = db.createAlbum({ title: 'Gallery', display: 'expanded', postToFeed: false });
       db.addPhotoToAlbum({ albumId: album.id, url: 'media/albums/a1/p.jpg' });
+      const trips = db.createAlbum({ title: 'Trips', display: 'card', postToFeed: true });
+      for (let i = 0; i < 5; i++) db.addPhotoToAlbum({ albumId: trips.id, url: `media/albums/t1/p${i}.jpg` });
       db.createItem({ type: 'post', title: 'Hello world', commentary: XSS, mediaUrl: 'media/albums/wall-posts/x.jpg' });
       db.createItem({ type: 'recommendation', title: 'A great book', commentary: 'Read it' });
       db.updateProfile({
@@ -2999,7 +3023,7 @@ describe('Site Design (look & feel, page layout)', () => {
         const html = new StaticSiteGenerator(db).buildStandaloneProfileHtml(db.buildSignedSiteBundle());
         expect(html).toContain('function installPageEnhancements');
         const page = await renderPage(html); // no <dialog> in the harness: plain links stay
-        const photo = db.getAlbums()[0].photos[0];
+        const photo = db.getAlbums().find((a) => a.display === 'expanded')!.photos[0];
         expect(page.html).toContain(`data-lightbox data-photo-id="${photo.id}"`);
         expect(page.html).toMatch(/data-open-post="[^"]+"/);
         expect(page.html).not.toContain('Untitled Photo');
@@ -3015,11 +3039,70 @@ describe('Site Design (look & feel, page layout)', () => {
       db.close();
     });
 
+    for (const theme of ['neo-webring', 'facepace', 'tweetdeck', 'xtraspecial', 'instapick', 'tiktalk'] as ProfileTheme[]) {
+      it(`shows card albums as cards and posted albums in the timeline in ${theme}`, async () => {
+        const db = setUp(`cards-${theme}.sqlite`, theme);
+        const albums = db.getAlbums();
+        const expandedPhoto = albums.find((a) => a.display === 'expanded')!.photos[0];
+        const cardPhotos = albums.find((a) => a.title === 'Trips')!.photos;
+        const { html } = await renderPage(new StaticSiteGenerator(db).buildStandaloneProfileHtml(db.buildSignedSiteBundle({ publish: true })));
+        expect(html).toContain('href="albums/trips/"');
+        expect(html.match(/data-album-link="[^"]+"/g)!.length).toBeGreaterThanOrEqual(2);
+        expect(html).toContain('+2');
+        expect(html).not.toMatch(/\+0|\+-/);
+        expect(html).toContain('data-photo-id="' + expandedPhoto.id + '"');
+        expect(html).not.toContain('data-photo-id="' + cardPhotos[4].id + '"');
+        db.close();
+      });
+    }
+
+    it('leaves album posts out of item blocks that exclude posts', async () => {
+      const db = setUp('no-album-posts.sqlite', 'neo-webring');
+      db.updateProfile({ layout: [{ id: 'items', type: 'items', visible: true, options: { kinds: ['recommendation'] } }] });
+      const { html } = await renderPage(new StaticSiteGenerator(db).buildStandaloneProfileHtml(db.buildSignedSiteBundle()));
+      expect(html).toContain('A great book');
+      expect(html).not.toContain('data-album-link');
+      db.close();
+    });
+
+    it('draws a 1-photo and an empty album card without empty peek tiles', async () => {
+      const db = new StudioDatabase(tempRoot, 'peek.sqlite');
+      const one = db.createAlbum({ title: 'One', postToFeed: true });
+      db.addPhotoToAlbum({ albumId: one.id, url: 'media/albums/o/p.jpg' });
+      db.createAlbum({ title: 'Empty' });
+      const { html } = await renderPage(new StaticSiteGenerator(db).buildStandaloneProfileHtml(db.buildSignedSiteBundle()));
+      const peek = html.match(/<a href="albums\/one\/" class="album-peek[^"]*"[\s\S]*?<\/a>/)![0];
+      expect(peek.match(/<img/g)).toHaveLength(1);
+      expect(peek).not.toContain('+');
+      const empty = html.match(/<a class="album-card" href="albums\/empty\/"[\s\S]*?<\/a>/)![0];
+      expect(empty).not.toContain('<img');
+      expect(empty).toContain('0 photos');
+      db.close();
+    });
+
+    it('draws an empty posted album as a placeholder post, and never repeats the cover in the peek', async () => {
+      const db = new StudioDatabase(tempRoot, 'peek-edge.sqlite');
+      db.createAlbum({ title: 'Blank', postToFeed: true });
+      const album = db.createAlbum({ title: 'Four', postToFeed: true });
+      for (let i = 0; i < 4; i++) db.addPhotoToAlbum({ albumId: album.id, url: `media/albums/f/p${i}.jpg` });
+      db.updateAlbum(album.id, { coverUrl: 'media/albums/f/p1.jpg' });
+      const { html } = await renderPage(new StaticSiteGenerator(db).buildStandaloneProfileHtml(db.buildSignedSiteBundle()));
+      const blank = html.match(/<a href="albums\/blank\/" class="album-peek[^"]*"[\s\S]*?<\/a>/)![0];
+      expect(blank).not.toContain('<img');
+      expect(blank).not.toContain('+');
+      const peek = html.match(/<a href="albums\/four\/" class="album-peek[^"]*"[\s\S]*?<\/a>/)![0];
+      expect(peek.match(/media\/albums\/f\/p1\.jpg/g)).toHaveLength(1);
+      expect(peek.match(/<img/g)).toHaveLength(3);
+      expect(peek).toContain('+1');
+      db.close();
+    });
+
     it('renders album descriptions as safe Markdown in every arrangement', async () => {
       for (const theme of ['neo-webring', 'facepace', 'instapick'] as ProfileTheme[]) {
         const db = new StudioDatabase(tempRoot, `album-md-${theme}.sqlite`);
         const album = db.createAlbum({
           title: 'Trip',
+          display: 'expanded',
           description: '## Day one\n\nWe saw [the lake](https://lake.example) and:\n\n- hills\n- birds\n\n<script>alert(1)</script> [bad](javascript:alert(1))',
         });
         db.addPhotoToAlbum({ albumId: album.id, url: 'media/albums/a1/p.jpg' });
@@ -3667,5 +3750,616 @@ describe('Fetching friends\' files over HTTP', () => {
     handler = (req) => req.socket.destroy();
     await expect(defaultJsonFetcher(`${base}/down`)).rejects.toThrow(/socket hang up|ECONNRESET/);
     expect(requests).toBe(2);
+  });
+});
+
+describe('Album cards', () => {
+  let dir: string;
+
+  beforeEach(() => {
+    dir = fs.mkdtempSync(path.join(os.tmpdir(), 'webring-album-cards-'));
+  });
+
+  afterEach(() => {
+    fs.rmSync(dir, { recursive: true, force: true });
+  });
+
+  it('stores album settings and a stable, unique slug', () => {
+    const db = new StudioDatabase(dir, 'a.sqlite');
+    db.updateProfile({ siteUrl: 'https://alice.ring.test', displayName: 'Alice' });
+    const a = db.createAlbum({ title: 'Midjourney Images #1' });
+    expect(a).toMatchObject({ slug: 'midjourney-images-1', pageUrl: 'albums/midjourney-images-1/', postToFeed: false, display: 'card' });
+    const b = db.createAlbum({ title: 'Midjourney Images #1', postToFeed: true, display: 'expanded' });
+    expect(b).toMatchObject({ slug: 'midjourney-images-1-2', postToFeed: true, display: 'expanded' });
+    expect(db.createAlbum({ title: '🎨🎨' }).slug).toBe('album');
+    expect(db.createAlbum({ title: '!!!' }).slug).toBe('album-2');
+    const renamed = db.updateAlbum(a.id, { title: 'Renamed', postToFeed: true, display: 'expanded' });
+    expect(renamed).toMatchObject({ slug: 'midjourney-images-1', postToFeed: true, display: 'expanded' });
+    const albums = AlbumsDocumentSchema.parse(db.buildSignedSiteBundle({ publish: true }).albums);
+    expect(albums.albums.find((x) => x.id === a.id)).toMatchObject({ slug: 'midjourney-images-1', postToFeed: true, display: 'expanded' });
+  });
+
+  it('migrates existing albums to posted cards with a slug', () => {
+    const raw = new DatabaseSync(path.join(dir, 'a.sqlite'));
+    raw.exec(`CREATE TABLE albums (
+      id TEXT PRIMARY KEY,
+      title TEXT NOT NULL,
+      description TEXT NOT NULL DEFAULT '',
+      cover_url TEXT NOT NULL DEFAULT '',
+      tags_json TEXT NOT NULL DEFAULT '[]',
+      created_at TEXT NOT NULL,
+      updated_at TEXT NOT NULL
+    );`);
+    const ins = raw.prepare('INSERT INTO albums (id, title, created_at, updated_at) VALUES (?, ?, ?, ?)');
+    ins.run('album-old', 'Trip to Paris', '2024-01-01T00:00:00.000Z', '2024-01-01T00:00:00.000Z');
+    ins.run('album-new', 'Trip to Paris', '2025-01-01T00:00:00.000Z', '2025-01-01T00:00:00.000Z');
+    raw.close();
+
+    const db = new StudioDatabase(dir, 'a.sqlite');
+    const albums = db.getAlbums();
+    expect(albums.find((x) => x.id === 'album-old')).toMatchObject({ postToFeed: true, display: 'card', slug: 'trip-to-paris', pageUrl: 'albums/trip-to-paris/' });
+    expect(albums.find((x) => x.id === 'album-new')).toMatchObject({ postToFeed: true, display: 'card', slug: 'trip-to-paris-2' });
+  });
+
+  it('reads albums without the new fields as posted cards', () => {
+    expect(albumIsPosted({})).toBe(true);
+    expect(albumIsPosted({ postToFeed: false })).toBe(false);
+    expect(albumDisplay({})).toBe('card');
+    expect(albumDisplay({ display: 'bogus' })).toBe('card');
+    expect(AlbumItemSchema.parse({ id: 'x', canonicalUrl: 'u', title: 't', createdAt: 'c', updatedAt: 'c', display: 'bogus' }).display).toBeUndefined();
+  });
+
+  const makeAlbumSite = () => {
+    const db = new StudioDatabase(dir, 'a.sqlite');
+    db.updateProfile({ siteUrl: 'https://alice.ring.test/', displayName: 'Alice' });
+    const album = db.createAlbum({ title: 'Trips', description: 'Summer **2026** <b>x</b>' });
+    for (let n = 1; n <= 5; n++) db.addPhotoToAlbum({ albumId: album.id, url: `media/albums/trips/p${n}.jpg`, caption: `Photo ${n}` });
+    return { db, album };
+  };
+
+  it('writes a shareable page for each album', async () => {
+    const { db } = makeAlbumSite();
+    db.createItem({ type: 'post', title: 'Unrelated post', commentary: 'x' });
+    const out = path.join(dir, 'out');
+    const result = new StaticSiteGenerator(db).generateToDirectory(out);
+    expect(result.filesWritten).toContain('albums/trips/index.html');
+    const page = fs.readFileSync(path.join(out, 'albums/trips/index.html'), 'utf8');
+    expect(page).toContain('<base href="../../">');
+    expect(page).toContain('<title>Trips · Alice</title>');
+    expect(page).toContain('<meta property="og:title" content="Trips · Alice"');
+    expect(page).toContain('<meta property="og:description" content="Summer 2026 &lt;b&gt;x&lt;/b&gt;"');
+    expect(page).toContain('<meta property="og:image" content="https://alice.ring.test/media/albums/');
+    expect(page).toContain('<meta property="og:url" content="https://alice.ring.test/albums/trips/"');
+    expect(page).toContain('<meta name="twitter:card" content="summary_large_image"');
+    const { html } = await renderPage(page);
+    expect(html).toContain('Back to Alice');
+    expect(html).toContain('5 photos');
+    expect(html).toContain('Share album');
+    expect(html.match(/data-photo-id=/g)!.length).toBe(5);
+    expect(html).not.toContain('data-block=');
+    // The embedded bundle carries just this album
+    expect(page).not.toContain('Unrelated post');
+    db.close();
+  });
+
+  it('removes an album page from the destination when the album is deleted', () => {
+    const { db, album } = makeAlbumSite();
+    const out = path.join(dir, 'dest');
+    const publisher = new SitePublisher(new StaticSiteGenerator(db));
+    expect(publisher.publishToLocalDirectory(out).success).toBe(true);
+    expect(fs.existsSync(path.join(out, 'albums/trips/index.html'))).toBe(true);
+    db.deleteAlbum(album.id);
+    expect(publisher.publishToLocalDirectory(out).success).toBe(true);
+    expect(fs.existsSync(path.join(out, 'albums/trips/index.html'))).toBe(false);
+    db.close();
+  });
+
+  it('keeps the album page address when a photo opens and closes', () => {
+    const urls: string[] = [];
+    const listeners: Record<string, (ev: unknown) => void> = {};
+    const dialog: Record<string, unknown> = {
+      className: '', open: false, innerHTML: '', showModal() { this.open = true; }, close() { this.open = false; },
+      addEventListener: (t: string, f: (ev: unknown) => void) => { listeners[t] = f; },
+      setAttribute: () => undefined, querySelector: () => null, querySelectorAll: () => [],
+    };
+    const doc = {
+      createElement: () => dialog,
+      body: { appendChild: () => undefined },
+      addEventListener: () => undefined,
+    };
+    const root = { querySelectorAll: () => [], addEventListener: () => undefined, querySelector: () => null };
+    const loc = { pathname: '/albums/trips/', search: '?x=1', hash: '#photo-p1', protocol: 'https:', href: 'https://alice.ring.test/albums/trips/' };
+    const run = new Function('document', 'history', 'location', 'window', 'HTMLDialogElement', `return ${installPageEnhancements.toString()}`);
+    const install = run(doc, { replaceState: (_a: unknown, _b: unknown, url: string) => urls.push(url) }, loc, { addEventListener: () => undefined }, class {});
+    const esc = (v: unknown) => String(v);
+    install({ root, profile: {}, albums: [{ id: 'a', title: 'Trips', photos: [{ id: 'p1', url: 'u', caption: 'c' }] }], items: [], esc, safeUrl: esc, buildDeepLink: () => '#', renderItem: () => '' });
+    expect(urls).toEqual(['/albums/trips/?x=1#photo-p1']); // opened from the address
+    loc.hash = '';
+    listeners.close({});
+    expect(urls).toEqual(['/albums/trips/?x=1#photo-p1', '/albums/trips/?x=1']);
+  });
+
+  it('writes a page for an empty album, without a link preview image', async () => {
+    const db = new StudioDatabase(dir, 'a.sqlite');
+    db.updateProfile({ siteUrl: 'https://alice.ring.test/', displayName: 'Alice' });
+    db.createAlbum({ title: 'Empty' });
+    const out = path.join(dir, 'out');
+    expect(new StaticSiteGenerator(db).generateToDirectory(out).filesWritten).toContain('albums/empty/index.html');
+    const page = fs.readFileSync(path.join(out, 'albums/empty/index.html'), 'utf8');
+    expect(page).toContain('<meta property="og:title" content="Empty · Alice"');
+    expect(page).not.toContain('og:image');
+    const { html } = await renderPage(page);
+    expect(html).toContain('0 photos');
+    expect(html).toContain('No photos yet.');
+    expect(html).not.toContain('data-photo-id=');
+    db.close();
+  });
+
+  it('says an album is no longer available when the live albums.json no longer has it', async () => {
+    const { db, album } = makeAlbumSite();
+    const bundle = db.buildSignedSiteBundle({ publish: true });
+    const page = new StaticSiteGenerator(db).buildStandaloneProfileHtml(bundle, { albumId: album.id });
+    // A deleted album's page left on the host: the newer albums.json has no such album
+    const later = new Date(Date.parse(bundle.albums.updatedAt) + 60000).toISOString();
+    const { html } = await renderPage(page, { files: { './api/albums.json': { ...bundle.albums, albums: [], updatedAt: later } } });
+    expect(html).toContain('This album is no longer available.');
+    expect(html).toContain('Back to Alice');
+    expect(html).not.toContain('data-photo-id=');
+    db.close();
+  });
+
+  it('reads a postToFeed that is not a boolean as posted, without rejecting the document', () => {
+    const { db } = makeAlbumSite();
+    const doc = JSON.parse(JSON.stringify(db.buildSignedSiteBundle().albums));
+    doc.albums[0].postToFeed = 1;
+    doc.albums[0].display = 7;
+    const parsed = AlbumsDocumentSchema.parse(doc);
+    expect(parsed.albums).toHaveLength(1);
+    expect(parsed.albums[0].postToFeed).toBeUndefined();
+    expect(parsed.albums[0].display).toBeUndefined();
+    expect(albumIsPosted(parsed.albums[0])).toBe(true);
+    expect(albumDisplay(parsed.albums[0])).toBe('card');
+    db.close();
+  });
+
+  it('keeps postToFeed and display when only the title or cover changes', () => {
+    const { db, album } = makeAlbumSite();
+    db.updateAlbum(album.id, { postToFeed: true, display: 'expanded' });
+    expect(db.updateAlbum(album.id, { title: 'Renamed' })).toMatchObject({ title: 'Renamed', postToFeed: true, display: 'expanded' });
+    // Set as cover sends only the cover
+    const cover = db.getAlbums().find((a) => a.id === album.id)!.photos[1].url;
+    expect(db.updateAlbum(album.id, { coverUrl: cover })).toMatchObject({ coverUrl: cover, postToFeed: true, display: 'expanded' });
+    const hidden = db.createAlbum({ title: 'Hidden' });
+    expect(db.updateAlbum(hidden.id, { title: 'Still hidden' })).toMatchObject({ postToFeed: false, display: 'card' });
+    expect(db.updateAlbum(hidden.id, { coverUrl: cover })).toMatchObject({ postToFeed: false, display: 'card' });
+    db.close();
+  });
+
+  it('puts id="photos" on the first Photos section only, where friends\' Albums links land', async () => {
+    const { db } = makeAlbumSite();
+    db.createItem({ type: 'post', title: 'Hello', commentary: '' });
+    db.updateProfile({
+      layout: [
+        { id: 'items', type: 'items', visible: true, options: { kinds: [] } },
+        { id: 'albums-1', type: 'albums', visible: true, options: { style: 'grid' } },
+        { id: 'albums-2', type: 'albums', visible: true, options: { style: 'grid' } },
+      ],
+    });
+    const { html } = await renderPage(new StaticSiteGenerator(db).buildStandaloneProfileHtml(db.buildSignedSiteBundle()));
+    expect(html.match(/id="photos"/g)).toHaveLength(1);
+    expect(html).toMatch(/<section class="mb-12" id="photos" data-block="albums">/);
+    expect(html.indexOf('data-block="items"')).toBeLessThan(html.indexOf('id="photos"'));
+    db.close();
+  });
+});
+
+describe('Album feed cards (syncing friends)', () => {
+  let tempRoot: string;
+
+  beforeEach(() => {
+    tempRoot = fs.mkdtempSync(path.join(os.tmpdir(), 'webring-album-sync-'));
+  });
+
+  afterEach(() => {
+    fs.rmSync(tempRoot, { recursive: true, force: true });
+  });
+
+  const DAY = 86400000;
+  const daysAgo = (n: number) => new Date(Date.now() - n * DAY).toISOString();
+  const raw = (db: StudioDatabase) => (db as unknown as { db: DatabaseSync }).db;
+  const makeSite = (name: string) => {
+    const dir = path.join(tempRoot, name);
+    const db = new StudioDatabase(dir, `${name}.sqlite`);
+    const siteUrl = `https://${name}.ring.test`;
+    db.updateProfile({ siteUrl, handle: `${name}.ring.test`, displayName: name });
+    const outDir = path.join(dir, 'public_html');
+    const publish = () => new StaticSiteGenerator(db).generateToDirectory(outDir);
+    return { db, dir, siteUrl, outDir, publish };
+  };
+  /** Adds photos dated `days` days ago (one minute apart, in album order). */
+  const addPhotos = (db: StudioDatabase, albumId: string, names: string[], days: number) =>
+    names.map((n, i) => {
+      const photo = db.addPhotoToAlbum({ albumId, url: `media/${n}.jpg`, thumbUrl: `media/${n}-t.jpg`, caption: n });
+      const createdAt = new Date(Date.now() - days * DAY + i * 60000).toISOString();
+      raw(db).prepare('UPDATE photos SET created_at = ? WHERE id = ?').run(createdAt, photo.id);
+      return { ...photo, createdAt };
+    });
+  const crawl = (alice: ReturnType<typeof makeSite>, carol: ReturnType<typeof makeSite>) =>
+    new RingCrawler(alice.db).crawlFriendSite(carol.siteUrl, carol.outDir);
+  const albumCard = (db: StudioDatabase) => db.getNetworkFeed().find((e) => e.entryType === 'album');
+
+  it('shows a friend album as one feed card and keeps its photos for the album view', async () => {
+    const alice = makeSite('alice');
+    const carol = makeSite('carol');
+    try {
+      const album = carol.db.createAlbum({ title: 'Trips', description: 'Summer', postToFeed: true });
+      const photos = addPhotos(carol.db, album.id, ['p0', 'p1', 'p2'], 3);
+      carol.publish();
+      const res = await crawl(alice, carol);
+      expect(res.verifiedSignature).toBe(true);
+
+      const feed = alice.db.getNetworkFeed();
+      expect(feed.filter((e) => e.entryType === 'photo')).toHaveLength(0);
+      const card = feed.find((e) => e.entryType === 'album')!;
+      expect(card).toMatchObject({
+        title: 'Trips',
+        commentary: 'Summer',
+        canonicalUrl: album.canonicalUrl,
+        photoCount: 3,
+        newCount: 0,
+        targetUrl: 'https://carol.ring.test/albums/trips/',
+        mediaUrl: 'https://carol.ring.test/media/p0-t.jpg',
+        createdAt: photos[2].createdAt,
+        verifiedSignature: true,
+      });
+      expect(card.peekUrls).toEqual(['p0', 'p1', 'p2'].map((n) => `https://carol.ring.test/media/${n}-t.jpg`));
+      const albumPhotos = alice.db.getFeedAlbumPhotos(card.canonicalUrl);
+      expect(albumPhotos).toHaveLength(3);
+      expect(albumPhotos.map((p) => p.canonicalUrl)).toEqual(photos.map((p) => p.canonicalUrl));
+      expect(albumPhotos.every((p) => p.entryType === 'photo' && p.albumUrl === album.canonicalUrl && p.verifiedSignature)).toBe(true);
+      // Album cards and their photos can both be saved
+      expect(alice.db.saveFeedEntry(card.canonicalUrl).entryType).toBe('album');
+      expect(alice.db.saveFeedEntry(photos[0].canonicalUrl).entryType).toBe('photo');
+    } finally {
+      alice.db.close();
+      carol.db.close();
+    }
+  });
+
+  it('counts photos added later as new and clears the count when opened', async () => {
+    const alice = makeSite('alice');
+    const carol = makeSite('carol');
+    try {
+      const album = carol.db.createAlbum({ title: 'Trips', postToFeed: true });
+      addPhotos(carol.db, album.id, ['p0', 'p1', 'p2'], 3);
+      carol.publish();
+      await crawl(alice, carol);
+      expect(albumCard(alice.db)?.newCount).toBe(0);
+
+      const added = addPhotos(carol.db, album.id, ['n0', 'n1'], 1);
+      carol.publish();
+      await crawl(alice, carol);
+      const card = albumCard(alice.db)!;
+      expect(card).toMatchObject({ newCount: 2, photoCount: 5, createdAt: added[1].createdAt });
+      expect(card.peekUrls![0]).toBe('https://carol.ring.test/media/n1-t.jpg');
+      expect(card.peekUrls).toHaveLength(3);
+      expect(alice.db.getFeedAlbumPhotos(album.canonicalUrl)).toHaveLength(5);
+
+      // Reprocessing the same document adds nothing
+      alice.db.clearFetchCache();
+      await crawl(alice, carol);
+      expect(albumCard(alice.db)?.newCount).toBe(2);
+
+      alice.db.markFeedAlbumSeen(album.canonicalUrl);
+      expect(albumCard(alice.db)?.newCount).toBe(0);
+      await crawl(alice, carol);
+      expect(albumCard(alice.db)?.newCount).toBe(0);
+    } finally {
+      alice.db.close();
+      carol.db.close();
+    }
+  });
+
+  it('leaves unposted albums out of the feed, and removes one that is unposted later, only on a verified sync', async () => {
+    const alice = makeSite('alice');
+    const carol = makeSite('carol');
+    try {
+      const hidden = carol.db.createAlbum({ title: 'Private-ish' });
+      addPhotos(carol.db, hidden.id, ['h0', 'h1'], 2);
+      carol.publish();
+      await crawl(alice, carol);
+      expect(alice.db.getNetworkFeed()).toHaveLength(0);
+      expect(alice.db.getFeedAlbumPhotos(hidden.canonicalUrl)).toHaveLength(0);
+
+      const posted = carol.db.createAlbum({ title: 'Trips', postToFeed: true });
+      const photos = addPhotos(carol.db, posted.id, ['p0', 'p1'], 2);
+      carol.publish();
+      await crawl(alice, carol);
+      expect(albumCard(alice.db)?.canonicalUrl).toBe(posted.canonicalUrl);
+      expect(alice.db.getFeedAlbumPhotos(posted.canonicalUrl)).toHaveLength(2);
+      expect(alice.db.getFeedAlbumPhotos(hidden.canonicalUrl)).toHaveLength(0);
+      alice.db.saveFeedEntry(photos[0].canonicalUrl, 'keep');
+
+      carol.db.updateAlbum(posted.id, { postToFeed: false });
+      carol.publish();
+      const albumsPath = path.join(carol.outDir, 'api/albums.json');
+      const original = fs.readFileSync(albumsPath, 'utf8');
+      const tampered = JSON.parse(original);
+      tampered.albums[0].description = 'tampered';
+      fs.writeFileSync(albumsPath, JSON.stringify(tampered));
+      const tamperedRes = await crawl(alice, carol);
+      expect(tamperedRes.entriesPruned).toBe(0);
+      expect(albumCard(alice.db)?.canonicalUrl).toBe(posted.canonicalUrl);
+      expect(alice.db.getFeedAlbumPhotos(posted.canonicalUrl)).toHaveLength(2);
+
+      fs.writeFileSync(albumsPath, original);
+      const res = await crawl(alice, carol);
+      expect(res.entriesPruned).toBe(3);
+      expect(albumCard(alice.db)).toBeUndefined();
+      expect(alice.db.getFeedAlbumPhotos(posted.canonicalUrl)).toHaveLength(0);
+      expect(alice.db.getSavedPosts()).toMatchObject([{ canonicalUrl: photos[0].canonicalUrl, note: 'keep' }]);
+    } finally {
+      alice.db.close();
+      carol.db.close();
+    }
+  });
+
+  it('treats albums from older Studios (no settings) as posted cards', async () => {
+    const alice = makeSite('alice');
+    const carol = makeSite('carol');
+    try {
+      const album = carol.db.createAlbum({ title: 'Old style' });
+      addPhotos(carol.db, album.id, ['p0', 'p1'], 2);
+      carol.publish();
+      const albumsPath = path.join(carol.outDir, 'api/albums.json');
+      const { proof: _proof, ...doc } = JSON.parse(fs.readFileSync(albumsPath, 'utf8'));
+      for (const a of doc.albums) {
+        delete a.postToFeed;
+        delete a.display;
+        delete a.slug;
+        delete a.pageUrl;
+      }
+      fs.writeFileSync(albumsPath, JSON.stringify(signDocument(doc, siteUrlToDidWeb(carol.siteUrl), carol.db.getKeys().privateKeyPem)));
+
+      const res = await crawl(alice, carol);
+      expect(res.verifiedSignature).toBe(true);
+      expect(albumCard(alice.db)).toMatchObject({
+        canonicalUrl: album.canonicalUrl,
+        title: 'Old style',
+        photoCount: 2,
+        newCount: 0,
+        targetUrl: 'https://carol.ring.test',
+      });
+      expect(alice.db.getFeedAlbumPhotos(album.canonicalUrl)).toHaveLength(2);
+    } finally {
+      alice.db.close();
+      carol.db.close();
+    }
+  });
+
+  it('keeps every photo of a recently updated album inside the feed window', async () => {
+    const alice = makeSite('alice');
+    const carol = makeSite('carol');
+    try {
+      expect(alice.db.getFeedRetentionDays()).toBe(90);
+      const album = carol.db.createAlbum({ title: 'Long trip', postToFeed: true });
+      addPhotos(carol.db, album.id, ['o0', 'o1', 'o2'], 200);
+      const fresh = addPhotos(carol.db, album.id, ['new'], 1);
+      const stale = carol.db.createAlbum({ title: 'Ancient', postToFeed: true });
+      addPhotos(carol.db, stale.id, ['a0'], 200);
+      carol.publish();
+      await crawl(alice, carol);
+
+      const cards = alice.db.getNetworkFeed().filter((e) => e.entryType === 'album');
+      expect(cards.map((c) => c.canonicalUrl)).toEqual([album.canonicalUrl]);
+      expect(cards[0].createdAt).toBe(fresh[0].createdAt);
+      expect(alice.db.getFeedAlbumPhotos(album.canonicalUrl)).toHaveLength(4);
+      expect(alice.db.getFeedAlbumPhotos(stale.canonicalUrl)).toHaveLength(0);
+      alice.db.pruneFeedOutsideWindow();
+      expect(alice.db.getFeedAlbumPhotos(album.canonicalUrl)).toHaveLength(4);
+
+      // Once the album itself is outside the window, its photos go too
+      expect(alice.db.pruneFeedOutsideWindow(Date.now() + 100 * DAY)).toBe(5);
+      expect(alice.db.getFeedAlbumPhotos(album.canonicalUrl)).toHaveLength(0);
+    } finally {
+      alice.db.close();
+      carol.db.close();
+    }
+  });
+
+  it('rejects an album whose address is on another site, keeping the real owner\'s card', async () => {
+    const alice = makeSite('alice');
+    const carol = makeSite('carol');
+    const mallory = makeSite('mallory');
+    try {
+      const album = carol.db.createAlbum({ title: 'Trips', postToFeed: true });
+      addPhotos(carol.db, album.id, ['p0', 'p1'], 2);
+      carol.publish();
+      await crawl(alice, carol);
+      const before = albumCard(alice.db)!;
+      expect(before.friendSiteUrl).toBe(carol.siteUrl);
+
+      // Mallory publishes a validly signed albums.json claiming Carol's album address
+      const fake = mallory.db.createAlbum({ title: 'Spoofed', postToFeed: true });
+      addPhotos(mallory.db, fake.id, ['m0', 'm1'], 1);
+      mallory.publish();
+      const albumsPath = path.join(mallory.outDir, 'api/albums.json');
+      const { proof: _proof, ...doc } = JSON.parse(fs.readFileSync(albumsPath, 'utf8'));
+      doc.albums[0].canonicalUrl = album.canonicalUrl;
+      fs.writeFileSync(albumsPath, JSON.stringify(signDocument(doc, siteUrlToDidWeb(mallory.siteUrl), mallory.db.getKeys().privateKeyPem)));
+
+      const res = await crawl(alice, mallory);
+      expect(res.verifiedSignature).toBe(true);
+      expect(res.entriesRejected).toBe(1);
+      const feed = alice.db.getNetworkFeed();
+      expect(feed.filter((e) => e.friendSiteUrl === mallory.siteUrl)).toHaveLength(0);
+      expect(albumCard(alice.db)).toEqual(before);
+      // Neither the album nor its photos were stored
+      const rows = raw(alice.db).prepare('SELECT COUNT(*) AS n FROM network_feed WHERE friend_site_url = ?').get(mallory.siteUrl) as { n: number };
+      expect(rows.n).toBe(0);
+      expect(alice.db.getFeedAlbumPhotos(album.canonicalUrl).map((p) => p.friendSiteUrl)).toEqual([carol.siteUrl, carol.siteUrl]);
+    } finally {
+      alice.db.close();
+      carol.db.close();
+      mallory.db.close();
+    }
+  });
+
+  it('links an album card to the friend\'s site when its page address is on another site', async () => {
+    const alice = makeSite('alice');
+    const carol = makeSite('carol');
+    try {
+      const album = carol.db.createAlbum({ title: 'Trips', postToFeed: true });
+      addPhotos(carol.db, album.id, ['p0'], 1);
+      carol.publish();
+      const albumsPath = path.join(carol.outDir, 'api/albums.json');
+      const { proof: _proof, ...doc } = JSON.parse(fs.readFileSync(albumsPath, 'utf8'));
+      doc.albums[0].pageUrl = 'https://evil.example/phish/';
+      fs.writeFileSync(albumsPath, JSON.stringify(signDocument(doc, siteUrlToDidWeb(carol.siteUrl), carol.db.getKeys().privateKeyPem)));
+
+      const res = await crawl(alice, carol);
+      expect(res.verifiedSignature).toBe(true);
+      expect(albumCard(alice.db)).toMatchObject({ canonicalUrl: album.canonicalUrl, targetUrl: carol.siteUrl });
+    } finally {
+      alice.db.close();
+      carol.db.close();
+    }
+  });
+
+  it('upgrades per-photo feed rows to album cards on the first sync without new badges', async () => {
+    const alice = makeSite('alice');
+    const carol = makeSite('carol');
+    const album = carol.db.createAlbum({ title: 'Trips', postToFeed: true });
+    const photos = addPhotos(carol.db, album.id, ['p0', 'p1'], 2);
+    carol.publish();
+    for (const p of photos) {
+      alice.db.upsertNetworkFeedEntry({
+        friendSiteUrl: carol.siteUrl, friendName: 'carol', friendAvatarUrl: '', friendDid: '', entryType: 'photo', title: p.caption,
+        canonicalUrl: p.canonicalUrl, targetUrl: '', commentary: '', mediaUrl: '', tags: [], createdAt: p.createdAt, verifiedSignature: true,
+      });
+    }
+    alice.db.setFetchValidators(`${carol.siteUrl}/api/albums.json`, carol.siteUrl, { etag: '"v1"' });
+    alice.db.close();
+
+    // A database from before album cards: network_feed without the new columns
+    const old = new DatabaseSync(path.join(alice.dir, 'alice.sqlite'));
+    old.exec('DROP INDEX IF EXISTS idx_network_feed_album');
+    for (const column of ['album_url', 'photo_count', 'new_count', 'peek_json']) {
+      old.exec(`ALTER TABLE network_feed DROP COLUMN ${column}`);
+    }
+    old.close();
+
+    const reopened = { ...alice, db: new StudioDatabase(alice.dir, 'alice.sqlite') };
+    try {
+      expect(reopened.db.getFetchValidators(`${carol.siteUrl}/api/albums.json`)).toBeNull();
+      await crawl(reopened, carol);
+      const feed = reopened.db.getNetworkFeed();
+      expect(feed.filter((e) => e.entryType === 'photo')).toHaveLength(0);
+      expect(feed.find((e) => e.entryType === 'album')).toMatchObject({ canonicalUrl: album.canonicalUrl, newCount: 0, photoCount: 2 });
+      expect(reopened.db.getFeedAlbumPhotos(album.canonicalUrl)).toHaveLength(2);
+    } finally {
+      reopened.db.close();
+      carol.db.close();
+    }
+  });
+});
+
+describe('Published page freshness and the Studio preview', () => {
+  let dir: string;
+
+  beforeEach(() => {
+    dir = fs.mkdtempSync(path.join(os.tmpdir(), 'webring-fresh-'));
+  });
+
+  afterEach(() => {
+    fs.rmSync(dir, { recursive: true, force: true });
+  });
+
+  const makeSite = () => {
+    const db = new StudioDatabase(dir, 'a.sqlite');
+    db.updateProfile({ siteUrl: 'https://alice.ring.test/', displayName: 'Alice' });
+    db.createItem({ type: 'post', title: 'Embedded post', commentary: '' });
+    const bundle = db.buildSignedSiteBundle({ publish: true });
+    return { db, bundle, html: new StaticSiteGenerator(db).buildStandaloneProfileHtml(bundle) };
+  };
+  const shifted = (iso: string, ms: number) => new Date(Date.parse(iso) + ms).toISOString();
+  const withTitle = (items: { items: Array<{ title: string }> }, title: string) => ({
+    ...items,
+    items: items.items.map((item) => ({ ...item, title })),
+  });
+
+  it('keeps the embedded copy when a fetched file is older, and uses a newer one', async () => {
+    const { db, bundle, html } = makeSite();
+    const older = { ...withTitle(bundle.items, 'Cached post'), updatedAt: shifted(bundle.items.updatedAt, -60000) };
+    const stale = await renderPage(html, { files: { './api/items.json': older } });
+    expect(stale.html).toContain('Embedded post');
+    expect(stale.html).not.toContain('Cached post');
+
+    const newer = { ...withTitle(bundle.items, 'Fresh post'), updatedAt: shifted(bundle.items.updatedAt, 60000) };
+    const fresh = await renderPage(html, { files: { './api/items.json': newer } });
+    expect(fresh.html).toContain('Fresh post');
+    expect(fresh.html).not.toContain('Embedded post');
+
+    // A file the host doesn't have falls back to the embedded copy
+    expect((await renderPage(html, { files: {} })).html).toContain('Embedded post');
+    db.close();
+  });
+
+  it('uses a fetched file without updatedAt when the embedded copy has none (like did.json)', async () => {
+    const { db, bundle } = makeSite();
+    const { updatedAt: _u, ...undatedItems } = bundle.items;
+    const html = new StaticSiteGenerator(db).buildStandaloneProfileHtml({ ...bundle, items: undatedItems as typeof bundle.items });
+    const { updatedAt: _f, ...fetched } = withTitle(bundle.items, 'Live post') as typeof bundle.items;
+    const page = await renderPage(html, { files: { './api/items.json': fetched } });
+    expect(page.html).toContain('Live post');
+    expect(page.html).not.toContain('Embedded post');
+    // The embedded copy has a date and the fetched one doesn't: the embedded copy wins
+    const dated = new StaticSiteGenerator(db).buildStandaloneProfileHtml(bundle);
+    expect((await renderPage(dated, { files: { './api/items.json': fetched } })).html).toContain('Embedded post');
+    db.close();
+  });
+
+  it('sends album links in the preview to Studio, and leaves the published page\'s links alone', () => {
+    const { db } = makeSite();
+    const album = db.createAlbum({ title: 'Trips', postToFeed: true });
+    const generator = new StaticSiteGenerator(db);
+    const bundle = db.buildSignedSiteBundle();
+    const preview = generator.buildStandaloneProfileHtml(bundle, { preview: true });
+    const published = generator.buildStandaloneProfileHtml(bundle);
+    expect(preview).toContain('webring-preview-album');
+    expect(published).not.toContain('webring-preview-album');
+
+    const bridge = [...preview.matchAll(/<script>([\s\S]*?)<\/script>/g)].map((m) => m[1]).find((code) => code.includes('webring-preview-album'))!;
+    let onClick: (ev: unknown) => void = () => undefined;
+    const messages: unknown[] = [];
+    vm.runInNewContext(bridge, {
+      document: { addEventListener: (_type: string, fn: (ev: unknown) => void) => { onClick = fn; } },
+      parent: { postMessage: (message: unknown) => messages.push(message) },
+    });
+    const click = (attrs: Record<string, string>, resolved = '') => {
+      const anchor = {
+        href: resolved,
+        getAttribute: (name: string) => attrs[name] ?? null,
+        hasAttribute: (name: string) => name in attrs,
+        closest: (selector: string) => (selector === 'a[href]' ? anchor : null),
+      };
+      let prevented = false;
+      onClick({ target: anchor, preventDefault: () => { prevented = true; }, stopPropagation: () => undefined });
+      return prevented;
+    };
+
+    // An album card (data-album-link) and an "Open album" link (by its address)
+    expect(click({ href: 'albums/trips/', 'data-album-link': album.id }, 'studio-media://local/albums/trips/')).toBe(true);
+    expect(click({ href: 'albums/trips/' }, 'studio-media://local/albums/trips/')).toBe(true);
+    expect(messages).toEqual([
+      { type: 'webring-preview-album', href: 'albums/trips/', albumId: album.id, slug: 'trips' },
+      { type: 'webring-preview-album', href: 'albums/trips/', albumId: '', slug: 'trips' },
+    ]);
+    // Other links behave as before
+    expect(click({ href: 'https://example.com/' }, 'https://example.com/')).toBe(true);
+    expect(messages[2]).toEqual({ type: 'webring-preview-open', href: 'https://example.com/' });
+    expect(click({ href: '#photos', 'data-album-link': album.id })).toBe(false);
+    expect(messages).toHaveLength(3);
+    db.close();
   });
 });

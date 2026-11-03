@@ -14,6 +14,7 @@ import {
   isValidGa4MeasurementId,
   normalizeAdSensePublisherId,
   ProfileThemeSchema,
+  albumPagePath,
   WebringHubDocument,
   WEBRING_SCHEMA_VERSION,
 } from '../../src/shared/schema';
@@ -166,16 +167,30 @@ export class StaticSiteGenerator {
     fs.writeFileSync(path.join(outputDir, 'index.html'), indexHtml, 'utf8');
     filesWritten.push('index.html');
 
+    // 4b. A shareable page for each album (the publish ledger deletes pages of removed albums)
+    for (const album of bundle.albums.albums) {
+      if (!album.slug) continue;
+      const relPath = albumPagePath(album.slug);
+      const fullPath = path.join(outputDir, relPath);
+      fs.mkdirSync(path.dirname(fullPath), { recursive: true });
+      fs.writeFileSync(fullPath, this.buildStandaloneProfileHtml(bundle, { albumId: album.id }), 'utf8');
+      filesWritten.push(relPath);
+    }
+
     // 5. Write .nojekyll so GitHub Pages serves /.well-known/did.json without ignoring dot-folders
     fs.writeFileSync(path.join(outputDir, '.nojekyll'), '', 'utf8');
     filesWritten.push('.nojekyll');
 
-    // 5b. Write .htaccess so Apache / LiteSpeed hosts resolve DirectoryIndex index.html on subdirectories (preventing 403 Forbidden on /social/) and allow CORS on JSON endpoints
+    // 5b. Write .htaccess so Apache / LiteSpeed hosts resolve DirectoryIndex index.html on subdirectories (preventing 403 Forbidden on /social/), allow CORS on JSON endpoints,
+    // and make browsers recheck pages and JSON on each visit so a new publish shows up right away (media names are content-hashed, so they can stay cached)
     const htaccessContent = [
       'DirectoryIndex index.html',
       '<IfModule mod_headers.c>',
       '  <FilesMatch "\\.(json)$">',
       '    Header set Access-Control-Allow-Origin "*"',
+      '  </FilesMatch>',
+      '  <FilesMatch "\\.(html|json)$">',
+      '    Header set Cache-Control "no-cache"',
       '  </FilesMatch>',
       '</IfModule>',
       '',
@@ -229,15 +244,21 @@ export class StaticSiteGenerator {
    * same page plus a base URL for local Media Library images and a bridge that sends link clicks
    * to Studio. Preview extras are never part of a published file.
    */
-  public buildStandaloneProfileHtml(bundle: CompleteSiteBundle, options: { preview?: boolean } = {}): string {
+  public buildStandaloneProfileHtml(bundle: CompleteSiteBundle, options: { preview?: boolean; albumId?: string } = {}): string {
     const preview = options.preview === true;
+    const album = options.albumId ? bundle.albums.albums.find((a) => a.id === options.albumId) : undefined;
+    const albumId = album ? album.id : '';
     const markdownSource = renderMarkdown.toString();
     const templateSource = renderTemplatePage.toString();
     const plainTextSource = markdownToPlainText.toString();
     const appearance = bundle.profile.appearance || {};
     // Archives aren't embedded in the published page (it fetches them); the preview, which can't
     // fetch, gets them embedded so "Older posts" works there too
-    const { archives = [], ...pageBundle } = bundle;
+    const { archives = [], ...fullBundle } = bundle;
+    // An album's page carries only that album: no posts, and no other albums
+    const pageBundle = album
+      ? { ...fullBundle, items: { ...fullBundle.items, items: [] }, albums: { ...fullBundle.albums, albums: [album] } }
+      : fullBundle;
     const archivesJson = preview ? embedJson(Object.fromEntries(archives.map((a) => ['/' + a.path, a.doc]))) : '';
     // Interactive extras are on unless turned off in Site Design; when off they aren't embedded
     const enhancementsSource = appearance.interactions === 'off' ? 'null' : installPageEnhancements.toString();
@@ -296,17 +317,36 @@ export class StaticSiteGenerator {
   <script async src="https://pagead2.googlesyndication.com/pagead/js/adsbygoogle.js?client=${adsPubId}" crossorigin="anonymous"></script>`
       : '';
 
+    let albumHead = '';
+    if (album) {
+      const siteUrl = String(bundle.profile.siteUrl || '').replace(/\/+$/, '');
+      const cover = album.coverUrl || (album.photos?.[0] ? album.photos[0].thumbUrl || album.photos[0].url : '');
+      const absolute = (u: string) => (/^https?:\/\//i.test(u) ? u : `${siteUrl}/${u.replace(/^(\.\/|\/)+/, '')}`);
+      const description = markdownToPlainText(album.description || '').slice(0, 200);
+      const og = (property: string, content: string) => `\n  <meta property="${property}" content="${this.escapeHtml(content)}" />`;
+      albumHead =
+        '\n  <base href="../../">' +
+        og('og:title', `${album.title} · ${bundle.profile.displayName}`) +
+        og('og:description', description) +
+        (cover ? og('og:image', absolute(cover)) : '') +
+        og('og:url', absolute(album.pageUrl || albumPagePath(album.slug || '').replace(/index\.html$/, ''))) +
+        '\n  <meta name="twitter:card" content="summary_large_image" />';
+    }
+    const pageTitle = album
+      ? `${album.title} · ${bundle.profile.displayName}`
+      : `${bundle.profile.displayName} — Federated Profile & Webring`;
+
     return `<!DOCTYPE html>
 <html lang="en">
 <head>
   <meta charset="UTF-8" />
   <meta name="viewport" content="width=device-width, initial-scale=1.0" />
   <meta http-equiv="Content-Security-Policy" content="default-src 'self'; script-src 'self' 'unsafe-inline' https://cdn.tailwindcss.com https://giscus.app https://utteranc.es${scriptSrcExtras ? ' ' + scriptSrcExtras : ''}; style-src 'self' 'unsafe-inline'; img-src 'self' https: http: data:${preview ? ' studio-media:' : ''}; frame-src https://giscus.app https://utteranc.es${frameSrcExtras}; connect-src 'self' https: http:;" />
-  <title>${this.escapeHtml(bundle.profile.displayName)} — Federated Profile & Webring</title>${preview ? '\n  <base href="studio-media://local/" />' : ''}
+  <title>${this.escapeHtml(pageTitle)}</title>${albumHead}${preview ? '\n  <base href="studio-media://local/" />' : ''}
   <link rel="alternate" type="application/json" title="Webring Manifest" href="./api/manifest.json" />
   <link rel="me" href="${this.escapeHtml(bundle.profile.siteUrl)}" />
   <script src="https://cdn.tailwindcss.com"></script>${analyticsHeadSnippet}${adsHeadSnippet}
-  <script>window.__WEBRING_BUNDLE__ = ${safeJson};${archivesJson ? `\n  window.__WEBRING_ARCHIVES__ = ${archivesJson};` : ''}</script>
+  <script>window.__WEBRING_BUNDLE__ = ${safeJson};${albumId ? `\n  window.__WEBRING_ALBUM_ID__ = ${embedJson(albumId)};` : ''}${archivesJson ? `\n  window.__WEBRING_ARCHIVES__ = ${archivesJson};` : ''}</script>
   <style>
     body.theme-neo-webring { background: #0f172a; color: #f8fafc; font-family: system-ui, -apple-system, sans-serif; }
     body.theme-minimal-zine { background: #fafaf9; color: #1c1917; font-family: Georgia, Cambria, serif; }
@@ -335,6 +375,7 @@ export class StaticSiteGenerator {
     body[data-background="gradient"] { background-image: linear-gradient(160deg, color-mix(in srgb, var(--accent, #6366f1) 24%, transparent), transparent 60%) !important; background-attachment: fixed; }
     body[data-background="banner-blur"]::before { content: ""; position: fixed; inset: -60px; z-index: -1; background-image: var(--banner-image); background-size: cover; background-position: center; filter: blur(48px) saturate(1.2); opacity: 0.35; }
     /* Text blocks */
+    .album-cards-row .album-card { flex: 0 0 11rem; }
     .prose-block h2 { font-size: 1.4rem; font-weight: 700; margin: 1.1rem 0 0.5rem; }
     .prose-block h3 { font-size: 1.2rem; font-weight: 700; margin: 1rem 0 0.4rem; }
     .prose-block h4, .prose-block h5 { font-weight: 700; margin: 0.9rem 0 0.3rem; }
@@ -365,14 +406,24 @@ ${TEMPLATE_CSS}${appearance.interactions === 'off' ? '' : ENHANCEMENTS_CSS}
       let data = window.__WEBRING_BUNDLE__;
       // Try fetching live JSON files if hosted over HTTP(S)
       if (window.location.protocol.startsWith('http')) {
+        // Revalidate each file (a 304 when unchanged) and keep whichever copy is newer, so a cached file never replaces fresher embedded data
+        const live = (url, embedded) => fetch(url, { cache: 'no-cache' })
+          .then(r => r.ok ? r.json() : null)
+          .then(doc => {
+            if (!doc || typeof doc !== 'object') return embedded;
+            const fetchedAt = Date.parse(doc.updatedAt);
+            const embeddedAt = Date.parse(embedded && embedded.updatedAt);
+            return !Number.isNaN(embeddedAt) && (Number.isNaN(fetchedAt) || fetchedAt < embeddedAt) ? embedded : doc;
+          })
+          .catch(() => embedded);
         try {
           const [manifest, profile, albums, items, connections, didDocument] = await Promise.all([
-            fetch('./api/manifest.json').then(r => r.ok ? r.json() : data.manifest),
-            fetch('./api/profile.json').then(r => r.ok ? r.json() : data.profile),
-            fetch('./api/albums.json').then(r => r.ok ? r.json() : data.albums),
-            fetch('./api/items.json').then(r => r.ok ? r.json() : data.items),
-            fetch('./api/connections.json').then(r => r.ok ? r.json() : data.connections),
-            fetch('./.well-known/did.json').then(r => r.ok ? r.json() : data.didDocument)
+            live('./api/manifest.json', data.manifest),
+            live('./api/profile.json', data.profile),
+            live('./api/albums.json', data.albums),
+            live('./api/items.json', data.items),
+            live('./api/connections.json', data.connections),
+            live('./.well-known/did.json', data.didDocument)
           ]);
           data = { manifest, profile, albums, items, connections, didDocument };
         } catch (err) {
@@ -402,7 +453,8 @@ ${TEMPLATE_CSS}${appearance.interactions === 'off' ? '' : ENHANCEMENTS_CSS}
           lower.startsWith('webring://') ||
           lower.startsWith('./') ||
           lower.startsWith('/') ||
-          lower.startsWith('media/')
+          lower.startsWith('media/') ||
+          lower.startsWith('albums/')
         ) {
           return esc(raw);
         }
@@ -666,6 +718,67 @@ ${TEMPLATE_CSS}${appearance.interactions === 'off' ? '' : ENHANCEMENTS_CSS}
         \`;
       }
 
+      // Albums are posted to the feed unless turned off, and shown as a card unless set to expanded
+      const albumPosted = (a) => a.postToFeed !== false;
+      const albumShownExpanded = (a) => a.display === 'expanded';
+      const albumCover = (a) => a.coverUrl || ((a.photos || [])[0] ? (a.photos[0].thumbUrl || a.photos[0].url) : '');
+      const albumPhotoTotal = (a) => (a.photos || []).length;
+      // "5 photos", and with more=true the count hidden behind the peek: "5 photos · +2 more"
+      const albumPhotosLabel = (a, more) => {
+        const n = albumPhotoTotal(a);
+        return n + (n === 1 ? ' photo' : ' photos') + (more && n > 3 ? ' · +' + (n - 3) + ' more' : '');
+      };
+      const albumHref = (a) => a.pageUrl ? safeUrl(a.pageUrl) : '#photos';
+
+      // Cover large on the left, two more photos stacked on the right, "+N" on the last tile
+      function albumPeek(album) {
+        const photos = album.photos || [];
+        const cover = albumCover(album);
+        // The two side tiles come from the photos that are not already the cover
+        const side = photos.filter(p => (p.thumbUrl || p.url) !== cover && p.url !== cover).slice(0, 2).map(p => p.thumbUrl || p.url);
+        const extra = photos.length - 3;
+        const tiles = [];
+        if (cover) tiles.push('<span class="album-tile album-tile-cover"><img src="' + safeUrl(cover) + '" alt="" loading="lazy" /></span>');
+        side.forEach(function(src, i) {
+          tiles.push('<span class="album-tile"><img src="' + safeUrl(src) + '" alt="" loading="lazy" />' +
+            (extra > 0 && i === side.length - 1 ? '<span class="album-plus">+' + extra + '</span>' : '') + '</span>');
+        });
+        if (!tiles.length) tiles.push('<span class="album-tile album-tile-blank"></span>');
+        return '<a href="' + albumHref(album) + '" class="album-peek album-peek-' + Math.min(tiles.length, 3) + '" data-album-link="' + esc(album.id) + '">' + tiles.join('') + '</a>';
+      }
+
+      function renderAlbumCard(album) {
+        const cover = albumCover(album);
+        return '<a class="album-card" href="' + albumHref(album) + '" data-album-link="' + esc(album.id) + '">' +
+          '<span class="album-card-cover">' + (cover ? '<img src="' + safeUrl(cover) + '" alt="" loading="lazy" />' : '<span class="album-card-blank"></span>') + '</span>' +
+          '<span class="album-card-title">' + esc(album.title) + '</span>' +
+          '<span class="album-card-count">' + albumPhotosLabel(album, false) + '</span></a>';
+      }
+
+      function renderAlbumPost(album) {
+        const d = album.createdAt ? new Date(album.createdAt) : null;
+        const when = d && !isNaN(d.getTime()) ? ' · ' + esc(d.toLocaleDateString()) : '';
+        return '<div class="card-surface rounded-xl p-4 md:col-span-2 album-post">' +
+          '<p class="text-xs opacity-70 mb-2">' + esc(profile.displayName) + ' posted an album' + when + '</p>' +
+          albumPeek(album) +
+          '<p class="font-bold mt-2">' + esc(album.title) + '</p>' +
+          '<a href="' + albumHref(album) + '" class="text-sm underline">Open album →</a></div>';
+      }
+
+      // Items plus posted albums, newest first. Albums count as posts, so a kind filter without posts leaves them out.
+      function timelineEntries(list, kinds, limit) {
+        const wanted = !kinds || !kinds.length || kinds.indexOf('post') !== -1;
+        let entries = kinds && kinds.length ? list.filter(i => kinds.indexOf(i.type) !== -1) : list.slice();
+        if (wanted) {
+          allAlbums.filter(albumPosted).forEach(function(a) {
+            entries.push({ type: 'album', id: 'album-' + a.id, createdAt: a.createdAt, album: a });
+          });
+        }
+        const time = (e) => { const t = Date.parse(e.createdAt); return isNaN(t) ? 0 : t; };
+        entries = entries.map((e, i) => ({ e: e, i: i })).sort((x, y) => (time(y.e) - time(x.e)) || (x.i - y.i)).map(x => x.e);
+        return limit ? entries.slice(0, limit) : entries;
+      }
+
       // A post whose title is just its opening Markdown heading shows the heading only
       function titleIsOpeningHeading(item) {
         if (item.type !== 'post') return false;
@@ -790,9 +903,12 @@ ${TEMPLATE_CSS}${appearance.interactions === 'off' ? '' : ENHANCEMENTS_CSS}
       const footerAdHtml = renderAdSlot(profile.adsAddon && profile.adsAddon.footerSlotId, 'Footer Slot');
 
       // Page blocks (Site Design). A block's title replaces the default heading; an empty title hides it.
+      let photosAnchorUsed = false;
       function section(block, defaultTitle, inner) {
         const title = typeof block.title === 'string' ? block.title : defaultTitle;
-        return '<section class="mb-12" data-block="' + esc(block.type) + '">' +
+        // The first albums section is where "Albums" links from friends land
+        const anchorId = block.type === 'albums' && !photosAnchorUsed ? (photosAnchorUsed = true, ' id="photos"') : '';
+        return '<section class="mb-12"' + anchorId + ' data-block="' + esc(block.type) + '">' +
           (title ? '<h2 class="text-2xl font-bold mb-4 flex items-center gap-2">' + esc(title) + '</h2>' : '') +
           inner + '</section>';
       }
@@ -816,15 +932,19 @@ ${TEMPLATE_CSS}${appearance.interactions === 'off' ? '' : ENHANCEMENTS_CSS}
         albums: (b) => {
           const ids = b.options && Array.isArray(b.options.albumIds) && b.options.albumIds.length ? b.options.albumIds : null;
           const list = ids ? allAlbums.filter(a => ids.includes(a.id)) : allAlbums;
-          const html = list.map(a => renderAlbum(a, b.options && b.options.style)).join('');
+          const carousel = b.options && b.options.style === 'carousel';
+          const cards = list.filter(a => !albumShownExpanded(a));
+          const cardsHtml = cards.length
+            ? '<div class="mb-8 ' + (carousel ? 'flex gap-4 overflow-x-auto snap-x pb-2 album-cards-row' : 'grid grid-cols-2 md:grid-cols-3 gap-4 album-cards-grid') + '">' + cards.map(renderAlbumCard).join('') + '</div>'
+            : '';
+          const html = cardsHtml + list.filter(albumShownExpanded).map(a => renderAlbum(a, b.options && b.options.style)).join('');
           return section(b, '📸 Photo Albums', html || emptyNote('No photo albums published yet.'));
         },
         items: (b) => {
           const kinds = b.options && Array.isArray(b.options.kinds) ? b.options.kinds : null;
-          let list = kinds ? allItems.filter(i => kinds.includes(i.type)) : allItems;
-          if (b.options && b.options.limit) list = list.slice(0, b.options.limit);
+          const list = timelineEntries(allItems, kinds, b.options && b.options.limit);
           return section(b, '✨ Shared Items & Things I Like',
-            '<div class="grid grid-cols-1 md:grid-cols-2 gap-4">' + (list.map(renderItem).join('') || emptyNote('Nothing shared here yet.')) + '</div>');
+            '<div class="grid grid-cols-1 md:grid-cols-2 gap-4">' + (list.map(i => i.type === 'album' ? renderAlbumPost(i.album) : renderItem(i)).join('') || emptyNote('Nothing shared here yet.')) + '</div>');
         },
         friends: (b) => allFriends.length
           ? section(b, '🤝 Friend Ring & Connections (' + allFriends.length + ')',
@@ -849,7 +969,7 @@ ${TEMPLATE_CSS}${appearance.interactions === 'off' ? '' : ENHANCEMENTS_CSS}
           const item = allItems.find(i => i.canonicalUrl === target);
           if (item) return section(b, '⭐ Featured', '<div class="grid grid-cols-1 md:grid-cols-2 gap-4">' + renderItem(item) + '</div>');
           const album = allAlbums.find(a => a.canonicalUrl === target);
-          if (album) return section(b, '⭐ Featured', renderAlbum(album, 'grid'));
+          if (album) return section(b, '⭐ Featured', '<div class="grid grid-cols-2 md:grid-cols-3 gap-4">' + renderAlbumCard(album) + '</div>');
           for (const a of allAlbums) {
             const photo = (a.photos || []).find(p => p.canonicalUrl === target);
             if (photo) return section(b, '⭐ Featured', '<div class="grid grid-cols-1 sm:grid-cols-2 gap-4">' + renderPhotoCard(photo, a, '') + '</div>');
@@ -897,11 +1017,29 @@ ${TEMPLATE_CSS}${appearance.interactions === 'off' ? '' : ENHANCEMENTS_CSS}
           <p>Self-contained static profile powered by <strong>Webring Studio JSON Protocol v\${esc(data.manifest.schemaVersion)}</strong> • Cryptographically signed via <code>\${esc(profile.did)}</code></p>
         </footer>\`;
 
-      if (template.shell !== 'stack') {
+      // An album's own page: just the album, no profile layout
+      function renderAlbumPage(album) {
+        const back = '<a href="./" class="text-sm underline opacity-80 hover:opacity-100">← Back to ' + esc(profile.displayName) + '\\'s page</a>';
+        if (!album) return '<div class="mb-8">' + back + '</div>' + emptyNote('This album is no longer available.');
+        const photos = (album.photos || []).map(photo => renderPhotoCard(photo, album, '')).join('');
+        return '<div class="mb-6">' + back + '</div>' +
+          '<div class="flex items-start justify-between gap-4 mb-4">' +
+            '<div class="min-w-0 flex-1"><h1 class="text-2xl sm:text-3xl font-extrabold">' + esc(album.title) + '</h1>' +
+            (album.description ? '<div class="prose-block album-description text-sm opacity-90">' + renderMarkdown(album.description) + '</div>' : '') +
+            '<p class="text-xs opacity-70 mt-1">' + albumPhotosLabel(album) + '</p></div>' +
+            '<a href="' + buildDeepLink('share', album.canonicalUrl, album.title, album.coverUrl, 'photo') + '" class="accent-soft shrink-0 text-xs px-3 py-1 rounded-lg bg-indigo-500/20 text-indigo-300 hover:bg-indigo-500/30">↻ Share album</a>' +
+          '</div>' +
+          (photos ? '<div class="grid grid-cols-1 sm:grid-cols-2 md:grid-cols-3 gap-4 mb-8">' + photos + '</div>' : emptyNote('No photos yet.')) +
+          footerHtml;
+      }
+
+      if (window.__WEBRING_ALBUM_ID__) {
+        root.innerHTML = renderAlbumPage(allAlbums.find(a => a.id === window.__WEBRING_ALBUM_ID__));
+      } else if (template.shell !== 'stack') {
         root.innerHTML = renderTemplatePage({
           shell: template.shell, profile, albums: allAlbums, items: allItems, friends: allFriends,
           endorsementCount: (connections.endorsements || []).length, layout: visibleBlocks,
-          blockRenderers, section, emptyNote, esc, safeUrl, buildDeepLink, getEndorsementsFor, getCommentsFor, renderMarkdown, markdownToPlainText,
+          blockRenderers, section, emptyNote, albumHref, albumCover, albumShownExpanded, albumPhotoTotal, albumPhotosLabel, albumPeek, renderAlbumPost, timelineEntries, esc, safeUrl, buildDeepLink, getEndorsementsFor, getCommentsFor, renderMarkdown, markdownToPlainText,
           hasLiveProvider: Boolean(commentCfg.provider && commentCfg.provider !== 'none'),
           webringBars, headerAdHtml, inFeedAdHtml, footerAdHtml, footerHtml, olderPostsHtml, archiveView
         });
@@ -967,7 +1105,7 @@ ${TEMPLATE_CSS}${appearance.interactions === 'off' ? '' : ENHANCEMENTS_CSS}
         const embedded = window.__WEBRING_ARCHIVES__;
         let doc = embedded && Object.prototype.hasOwnProperty.call(embedded, url) ? embedded[url] : null;
         if (!doc && window.location.protocol.startsWith('http')) {
-          const res = await fetch('./' + String(url).replace(/^\\/+/, ''), { credentials: 'omit' });
+          const res = await fetch('./' + String(url).replace(/^\\/+/, ''), { credentials: 'omit', cache: 'no-cache' });
           if (res.ok) doc = await res.json();
         }
         if (!doc || !Array.isArray(doc.items)) throw new Error('Archive unavailable');
@@ -1059,7 +1197,8 @@ const WEBRING_STUDIO_URL = 'https://github.com/lnsCorey/webring';
 
 /**
  * Studio preview only (sandboxed iframe): links never navigate the preview. webring:// actions
- * open the matching form in Studio and web links open in the browser, via postMessage.
+ * open the matching form in Studio, album links open the album in Studio's Albums tab, and web
+ * links open in the browser, via postMessage.
  */
 const PREVIEW_BRIDGE = `
   <script>
@@ -1071,7 +1210,11 @@ const PREVIEW_BRIDGE = `
       if (anchor.closest('[data-lightbox], [data-open-post]')) return; // opens in the page's own viewer
       ev.preventDefault();
       ev.stopPropagation();
-      if (/^webring:/i.test(href)) parent.postMessage({ type: 'webring-preview-deeplink', href: href }, '*');
+      // Album pages aren't in the preview: Studio opens the album in its Albums tab instead
+      var albumPage = /^(?:\\.\\/)?albums\\/([^\\/?#]+)\\/?(?:index\\.html)?$/i.exec(href);
+      if (anchor.hasAttribute('data-album-link') || albumPage) {
+        parent.postMessage({ type: 'webring-preview-album', href: href, albumId: anchor.getAttribute('data-album-link') || '', slug: albumPage ? albumPage[1] : '' }, '*');
+      } else if (/^webring:/i.test(href)) parent.postMessage({ type: 'webring-preview-deeplink', href: href }, '*');
       else if (/^https?:/i.test(anchor.href)) parent.postMessage({ type: 'webring-preview-open', href: anchor.href }, '*');
     }, true);
   </script>`;

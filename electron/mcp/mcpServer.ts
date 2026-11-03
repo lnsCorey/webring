@@ -436,6 +436,8 @@ export class WebringMcpServer {
             description: { type: 'string', description: 'Album description, in Markdown (headings, links, lists, tables; no HTML).' },
             coverUrl: { type: 'string', description: 'Optional cover image URL.' },
             tags: { type: 'array', items: { type: 'string' } },
+            postToFeed: { type: 'boolean', description: 'Show the album in the feed. Default false.' },
+            display: { type: 'string', enum: ['card', 'expanded'], description: 'How the Photos section of the published page shows the album: card (one card linking to the album page) or expanded (its photos in a grid). Default card.' },
           },
           required: ['title'],
         },
@@ -645,14 +647,14 @@ export class WebringMcpServer {
       {
         name: 'webring_get_neighborhood_feed',
         description:
-          'Query chronological posts, photos, likes, shares, and comments pulled from friends in the Neighborhood Feed.',
+          'Query chronological posts, albums, likes, shares, and comments pulled from friends in the Neighborhood Feed. Friends\' photos arrive inside album entries (entryType "album", with photoCount, newCount and peekUrls) rather than as separate photo entries.',
         inputSchema: {
           type: 'object',
           properties: {
             personaId: personaIdProp,
             entryType: {
               type: 'string',
-              enum: ['photo', 'post', 'like', 'share', 'recommendation', 'comment'],
+              enum: ['photo', 'album', 'post', 'like', 'share', 'recommendation', 'comment'],
               description: 'Optional filter by entry type.',
             },
             friendSiteUrl: {
@@ -1259,6 +1261,8 @@ export class WebringMcpServer {
             description: args.description ? String(args.description) : undefined,
             coverUrl: args.coverUrl ? String(args.coverUrl) : undefined,
             tags: Array.isArray(args.tags) ? args.tags.map(String) : [],
+            postToFeed: args.postToFeed === true,
+            display: args.display === 'expanded' ? 'expanded' : 'card',
           });
           resultData = album;
           summary = `Created photo album "${album.title}"`;

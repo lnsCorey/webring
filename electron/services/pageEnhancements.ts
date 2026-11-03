@@ -69,7 +69,7 @@ export function installPageEnhancements(ctx: any): { addItems: (items: any[]) =>
 
   const setHash = (hash: string) => {
     try {
-      history.replaceState(null, '', hash ? '#' + hash : location.pathname + location.search);
+      history.replaceState(null, '', location.pathname + location.search + (hash ? '#' + hash : ''));
     } catch (e) {
       // sandboxed previews may refuse; the dialog still works
     }

@@ -167,6 +167,23 @@ export const TEMPLATE_CSS = String.raw`
     .xs-center .tw-row { padding: 0.8rem 1rem; }
     .xs-center .tpl-tabs { border-bottom: 1px solid var(--tpl-line); }
 
+    .album-peek { display: grid; grid-template-columns: 2fr 1fr; grid-template-rows: 1fr 1fr; gap: 3px; aspect-ratio: 16 / 9; overflow: hidden; border-radius: 0.6rem; background: rgba(128, 128, 128, 0.2); }
+    .album-peek .album-tile { position: relative; display: block; overflow: hidden; min-height: 0; }
+    .album-peek .album-tile img { width: 100%; height: 100%; object-fit: cover; display: block; }
+    .album-peek .album-tile-cover { grid-row: 1 / span 2; }
+    .album-peek-1 { grid-template-columns: 1fr; }
+    .album-peek-2 .album-tile:last-child { grid-row: 1 / span 2; }
+    .album-plus { position: absolute; inset: 0; display: flex; align-items: center; justify-content: center; background: rgba(0, 0, 0, 0.55); color: #fff; font-weight: 800; font-size: 1.1rem; }
+    .album-card { display: flex; flex-direction: column; gap: 0.2rem; min-width: 0; text-decoration: none; color: inherit; }
+    .album-card-cover { display: block; aspect-ratio: 4 / 3; overflow: hidden; border-radius: 0.6rem; background: rgba(128, 128, 128, 0.2); }
+    .album-card-cover img { width: 100%; height: 100%; object-fit: cover; display: block; }
+    .album-card-blank { display: block; width: 100%; height: 100%; }
+    .album-tile-blank { background: rgba(128, 128, 128, 0.2); }
+    .album-card-title { font-weight: 700; font-size: 0.9rem; }
+    .album-card-count { font-size: 0.75rem; opacity: 0.65; }
+    .album-badge { position: absolute; top: 0.4rem; right: 0.4rem; padding: 0.1rem 0.4rem; border-radius: 0.4rem; background: rgba(0, 0, 0, 0.6); color: #fff; font-size: 0.75rem; font-weight: 700; pointer-events: none; }
+    .album-tile-link { display: block; width: 100%; height: 100%; }
+
     /* Instapick: stats header, highlights, square grid */
     body.theme-instapick { --tpl-accent: #d6337a; --tpl-line: #e3e3e3; background: #ffffff; color: #1f1f1f; font-family: system-ui, -apple-system, "Segoe UI", Roboto, sans-serif; }
     body.theme-instapick .card-surface { background: #ffffff; border: 1px solid #e3e3e3; color: #1f1f1f; }
@@ -308,14 +325,42 @@ export function renderTemplatePage(ctx: any): string {
     const d = item.updatedAt ? new Date(item.updatedAt) : null;
     return d && !isNaN(d.getTime()) ? ' · <span class="item-edited" title="Edited ' + esc(d.toLocaleString()) + '">edited</span>' : '';
   };
+  // Albums: a link to the album's page, with a cover and a photo count
+  const albumHref = ctx.albumHref;
+  const albumCover = ctx.albumCover;
+  const albumCount = ctx.albumPhotoTotal;
+  const photosLabel = (a: any) => ctx.albumPhotosLabel(a, true);
+  const albumOpenAttrs = (a: any) => 'href="' + albumHref(a) + '" data-album-link="' + esc(a.id) + '"';
+  const albumPostBody = (a: any) =>
+    ctx.albumPeek(a) + '<p class="font-bold mt-2">' + esc(a.title) + '</p><a href="' + albumHref(a) + '" class="text-sm font-semibold tpl-accent">Open album →</a>';
+  const albumTile = (a: any) =>
+    '<div class="tpl-tile"><a ' + albumOpenAttrs(a) + ' class="album-tile-link">' +
+    (albumCover(a) ? '<img src="' + safeUrl(albumCover(a)) + '" alt="' + esc(a.title) + '" />' : '<div class="tpl-tile-text"><strong>' + esc(a.title) + '</strong></div>') + '</a>' +
+    '<span class="album-badge">▣ ' + albumCount(a) + '</span><div class="tpl-overlay"><span>' + esc(a.title) + '</span><span>' + photosLabel(a) + '</span></div></div>';
+  const albumReel = (a: any) =>
+    reelCard(albumCover(a), a.title, photosLabel(a), [], { likes: ctx.getEndorsementsFor(a.canonicalUrl).length, comments: 0 }, {
+      like: link('like', a.canonicalUrl, a.title, a.coverUrl, 'photo'),
+      share: link('share', a.canonicalUrl, a.title, a.coverUrl, 'photo'),
+      open: albumOpenAttrs(a),
+    });
+  const albumPostCard = (a: any) =>
+    '<article class="card-surface fp-post"><div class="fp-post-head">' + avatar('w-10 h-10 text-base') +
+    '<div><p class="font-bold text-sm">' + name + ' <span class="tpl-muted font-normal">posted an album</span></p><p class="text-xs tpl-muted">' + esc(formatDate(a.createdAt)) + '</p></div></div>' +
+    '<div class="fp-post-body">' + albumPostBody(a) + '</div></article>';
+  const albumTweetRow = (a: any) =>
+    '<article class="tw-row">' + avatar('') + '<div class="tw-main"><div class="tw-head"><span class="font-bold">' + name + '</span><span class="tpl-muted">' + esc(handle) + ' · posted an album · ' + esc(formatDate(a.createdAt)) + '</span></div>' +
+    albumPostBody(a) + '</div></article>';
   const postCard = (item: any) =>
+    item.type === 'album' ? albumPostCard(item.album) :
     '<article class="card-surface fp-post"><div class="fp-post-head">' + avatar('w-10 h-10 text-base') +
     '<div><p class="font-bold text-sm">' + name + '</p><p class="text-xs tpl-muted">' + esc(formatDate(item.createdAt)) + ' · ' + typeLabel(item) + (item.category && item.category !== 'general' ? ' · ' + esc(item.category) : '') + edited(item) + '</p></div></div>' +
     '<div class="fp-post-body">' + itemBody(item) + '</div>' + itemActions(item, true) + '</article>';
   const tweetRow = (item: any) =>
+    item.type === 'album' ? albumTweetRow(item.album) :
     '<article class="tw-row">' + avatar('') + '<div class="tw-main"><div class="tw-head"><span class="font-bold">' + name + '</span><span class="tpl-muted">' + esc(handle) + ' · ' + esc(formatDate(item.createdAt)) + edited(item) + '</span>' +
     (item.type !== 'post' ? '<span class="tpl-chip">' + typeLabel(item) + '</span>' : '') + '</div>' + itemBody(item) + itemActions(item, false) + '</div></article>';
   const itemTile = (item: any) => {
+    if (item.type === 'album') return albumTile(item.album);
     const r = reactions(item.canonicalUrl);
     return '<div class="tpl-tile">' +
       (item.mediaUrl
@@ -333,8 +378,13 @@ export function renderTemplatePage(ctx: any): string {
     '<a href="' + actions.like + '"><span class="tt-icon">♥</span>' + counts.likes + '</a>' +
     (actions.comment ? '<a href="' + actions.comment + '"><span class="tt-icon">💬</span>' + counts.comments + '</a>' : '') +
     '<a href="' + actions.share + '"><span class="tt-icon">↻</span>Share</a>' +
-    (actions.open ? '<button type="button" ' + actions.open + ' aria-label="Open"><span class="tt-icon">⤢</span>Open</button>' : '') + '</div></div>';
+    (actions.open
+      ? actions.open.indexOf('href=') === 0
+        ? '<a ' + actions.open + ' aria-label="Open"><span class="tt-icon">⤢</span>Open</a>'
+        : '<button type="button" ' + actions.open + ' aria-label="Open"><span class="tt-icon">⤢</span>Open</button>'
+      : '') + '</div></div>';
   const itemReel = (item: any) => {
+    if (item.type === 'album') return albumReel(item.album);
     const r = reactions(item.canonicalUrl);
     return reelCard(item.mediaUrl, item.title, snippet(item), item.tags, { likes: r.endorsements.length, comments: r.comments.length }, {
       like: link('like', item.canonicalUrl, item.title, item.mediaUrl, item.category),
@@ -359,11 +409,14 @@ export function renderTemplatePage(ctx: any): string {
     const ids = b.options && Array.isArray(b.options.albumIds) && b.options.albumIds.length ? b.options.albumIds : null;
     const list = ids ? ctx.albums.filter((a: any) => ids.includes(a.id)) : ctx.albums;
     if (!list.length) return ctx.section(b, '📸 Photo Albums', ctx.emptyNote('No photo albums published yet.'));
+    const isCard = (a: any) => !ctx.albumShownExpanded(a);
     if (shell === 'reel') {
-      return ctx.section(b, '📸 Photos', '<div class="tt-reel">' + list.map((a: any) => (a.photos || []).map((p: any) => photoReel(p, a)).join('')).join('') + '</div>');
+      return ctx.section(b, '📸 Photos', '<div class="tt-reel">' + list.map((a: any) => isCard(a) ? albumReel(a) : (a.photos || []).map((p: any) => photoReel(p, a)).join('')).join('') + '</div>');
     }
     const carousel = b.options && b.options.style === 'carousel';
-    return ctx.section(b, '📸 Photos', list.map((a: any) =>
+    const cards = list.filter(isCard);
+    const cardsHtml = cards.length ? '<div class="' + (carousel ? 'tpl-carousel' : 'tpl-grid') + '">' + cards.map(albumTile).join('') + '</div>' : '';
+    return ctx.section(b, '📸 Photos', cardsHtml + list.filter((a: any) => !isCard(a)).map((a: any) =>
       '<div class="tpl-album" id="tpl-album-' + esc(a.id) + '"><div class="tpl-album-head"><div><h3 class="font-bold">' + esc(a.title) + '</h3>' +
       (a.description ? '<div class="prose-block album-description text-sm">' + ctx.renderMarkdown(a.description) + '</div>' : '') + '</div>' +
       '<a href="' + link('share', a.canonicalUrl, a.title, a.coverUrl, 'photo') + '" class="text-xs font-semibold tpl-accent">↻ Share album</a></div>' +
@@ -372,8 +425,7 @@ export function renderTemplatePage(ctx: any): string {
   };
   const itemsBlock = (b: any) => {
     const kinds = b.options && Array.isArray(b.options.kinds) ? b.options.kinds : null;
-    let list = kinds ? ctx.items.filter((i: any) => kinds.includes(i.type)) : ctx.items;
-    if (b.options && b.options.limit) list = list.slice(0, b.options.limit);
+    const list = ctx.timelineEntries(ctx.items, kinds, b.options && b.options.limit);
     if (!list.length) return ctx.section(b, '✨ Posts', ctx.emptyNote('Nothing shared here yet.'));
     if (shell === 'sidebar') return ctx.section(b, 'Posts', list.map(postCard).join(''));
     if (shell === 'grid') return ctx.section(b, 'Posts', '<div class="tpl-grid">' + list.map(itemTile).join('') + '</div>');
@@ -460,8 +512,8 @@ export function renderTemplatePage(ctx: any): string {
       (profile.bio ? '<p class="text-sm mt-1 whitespace-pre-line">' + esc(profile.bio) + '</p>' : '') + meta() + '</div></div>';
     const highlights = ctx.albums.length
       ? '<div class="ip-highlights" data-region="highlights">' + ctx.albums.map((a: any) => {
-          const cover = a.coverUrl || (a.photos && a.photos[0] ? a.photos[0].thumbUrl || a.photos[0].url : '');
-          return '<a href="#tpl-album-' + esc(a.id) + '"><span class="ip-bubble">' + (cover ? '<img src="' + safeUrl(cover) + '" alt="" />' : '') + '</span>' + esc(a.title) + '</a>';
+          const cover = albumCover(a);
+          return '<a href="' + albumHref(a) + '"><span class="ip-bubble">' + (cover ? '<img src="' + safeUrl(cover) + '" alt="" />' : '') + '</span>' + esc(a.title) + '</a>';
         }).join('') + '</div>'
       : '';
     return wrap(

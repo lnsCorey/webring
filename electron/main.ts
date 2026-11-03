@@ -456,6 +456,15 @@ function registerIpcHandlers() {
     const ctx = personaManager.getActiveContext();
     return savePost(ctx.db, ctx.mediaLibrary, String(canonicalUrl));
   });
+  ipcMain.handle('studio:get-feed-album-photos', (_e, albumUrl: string) => {
+    const ctx = personaManager.getActiveContext();
+    return ctx.db.getFeedAlbumPhotos(String(albumUrl));
+  });
+  ipcMain.handle('studio:mark-feed-album-seen', (_e, albumUrl: string) => {
+    const ctx = personaManager.getActiveContext();
+    ctx.db.markFeedAlbumSeen(String(albumUrl));
+    return { ok: true };
+  });
   ipcMain.handle('studio:unsave-post', (_e, savedId: string) => {
     const ctx = personaManager.getActiveContext();
     unsavePost(ctx.db, ctx.mediaLibrary, String(savedId));
@@ -595,7 +604,7 @@ function registerIpcHandlers() {
 
   ipcMain.handle(
     'studio:media-update-album',
-    (_e, albumId: string, updates: { title?: string; description?: string; tags?: string[]; coverUrl?: string }) => {
+    (_e, albumId: string, updates: { title?: string; description?: string; tags?: string[]; coverUrl?: string; postToFeed?: boolean; display?: 'card' | 'expanded' }) => {
       return personaManager.getActiveContext().db.updateAlbum(albumId, updates);
     }
   );

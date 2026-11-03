@@ -1,5 +1,8 @@
 import React, { useEffect, useRef, useState } from 'react';
 import {
+  AlbumDisplay,
+  albumDisplay,
+  albumIsPosted,
   CompleteSiteBundle,
   CreatePersonaInput,
   EndorsementItem,
@@ -21,6 +24,7 @@ import {
 import { SiteDesignPanel } from './SiteDesignPanel';
 import { ItemEdit, ItemEditor } from './ItemEditor';
 import { SavedPostView, SavedPostsView } from './SavedPostsView';
+import { FriendAlbumView } from './FriendAlbumView';
 import { AddBackTarget, FriendNoticeReviewView, FriendNoticeView, FriendNoticesPanel } from './FriendNoticesPanel';
 import { MarkdownField } from './MarkdownField';
 import { renderMarkdown } from '../shared/markdown';
@@ -260,6 +264,18 @@ function formatRelativeTime(iso: string): string {
   return `${days} day${days === 1 ? '' : 's'} ago`;
 }
 
+// A per-publish query string makes the browser and any CDN treat the page as new, so it shows the latest publish
+function openLiveSite(siteUrl: string, publishedAt: string): void {
+  try {
+    const url = new URL(siteUrl);
+    const time = new Date(publishedAt).getTime();
+    if (!Number.isNaN(time)) url.searchParams.set('v', String(time));
+    window.studioApi?.openExternal(url.toString());
+  } catch {
+    window.studioApi?.openExternal(siteUrl);
+  }
+}
+
 type FeedScope = 'friends' | 'everyone' | 'me' | 'saved';
 const FEED_SCOPE_KEY = 'webring-studio.feedScope';
 
@@ -278,7 +294,7 @@ interface NetworkFeedEntry {
   friendName: string;
   friendAvatarUrl: string;
   friendDid: string;
-  entryType: 'photo' | 'post' | 'like' | 'share' | 'recommendation' | 'comment';
+  entryType: 'photo' | 'album' | 'post' | 'like' | 'share' | 'recommendation' | 'comment';
   title: string;
   canonicalUrl: string;
   targetUrl: string;
@@ -287,6 +303,12 @@ interface NetworkFeedEntry {
   tags: string[];
   createdAt: string;
   verifiedSignature: boolean;
+  /** Photo rows: the canonical URL of their album. */
+  albumUrl?: string;
+  /** Album rows: how many photos, how many are new, and up to 3 thumbnails for the card. */
+  photoCount?: number;
+  newCount?: number;
+  peekUrls?: string[];
   /** Your own post or photo, shown in the feed (never stored with friends' entries). */
   isMine?: boolean;
 }
@@ -381,7 +403,7 @@ declare global {
       movePhoto: (photoId: string, direction: 'up' | 'down') => Promise<unknown>;
       updateAlbum: (
         albumId: string,
-        updates: { title?: string; description?: string; tags?: string[]; coverUrl?: string }
+        updates: { title?: string; description?: string; tags?: string[]; coverUrl?: string; postToFeed?: boolean; display?: 'card' | 'expanded' }
       ) => Promise<unknown>;
       getMediaUsage: () => Promise<{ files: number; bytes: number }>;
       forgetPublishHistory: () => Promise<unknown>;
@@ -392,6 +414,8 @@ declare global {
       updateItem: (itemId: string, updates: ItemEdit) => Promise<SharedItem>;
       savePost: (canonicalUrl: string) => Promise<SavedPostView>;
       unsavePost: (savedId: string) => Promise<unknown>;
+      getFeedAlbumPhotos: (albumUrl: string) => Promise<NetworkFeedEntry[]>;
+      markFeedAlbumSeen: (albumUrl: string) => Promise<{ ok: true }>;
       updateSavedNote: (savedId: string, note: string) => Promise<unknown>;
       setFeedRetention: (days: number) => Promise<{ days: number; pruned: number }>;
       addFriend: (input: unknown) => Promise<unknown>;
@@ -557,12 +581,16 @@ export const App: React.FC = () => {
   const [allFriends, setAllFriends] = useState<FriendConnection[]>([]);
   const [allEndorsements, setAllEndorsements] = useState<EndorsementItem[]>([]);
   const [networkFeed, setNetworkFeed] = useState<NetworkFeedEntry[]>([]);
+  const [openFeedAlbum, setOpenFeedAlbum] = useState<{ album: NetworkFeedEntry; photos: NetworkFeedEntry[] } | null>(null);
   const [savedPosts, setSavedPosts] = useState<SavedPostView[]>([]);
   const [feedRetentionDays, setFeedRetentionDays] = useState(90);
   const [friendNotices, setFriendNotices] = useState<FriendNoticeView[]>([]);
   const [mutualFriendUrls, setMutualFriendUrls] = useState<string[]>([]);
   const [incomingFriendNotice, setIncomingFriendNotice] = useState<{ link: string; at: number } | null>(null);
   const [feedScope, setFeedScopeState] = useState<FeedScope>(loadFeedScope);
+  useEffect(() => {
+    setOpenFeedAlbum(null);
+  }, [feedScope, activeTab]);
   const setFeedScope = (scope: FeedScope) => {
     setFeedScopeState(scope);
     try {
@@ -651,6 +679,8 @@ export const App: React.FC = () => {
   const [newAlbumTitle, setNewAlbumTitle] = useState('');
   const [newAlbumDesc, setNewAlbumDesc] = useState('');
   const [newAlbumTags, setNewAlbumTags] = useState('');
+  const [newAlbumPostToFeed, setNewAlbumPostToFeed] = useState(false);
+  const [newAlbumDisplay, setNewAlbumDisplay] = useState<AlbumDisplay>('card');
   const [selectedAlbumId, setSelectedAlbumId] = useState('');
   const [newPhotoUrl, setNewPhotoUrl] = useState('');
   const [newPhotoCaption, setNewPhotoCaption] = useState('');
@@ -658,7 +688,13 @@ export const App: React.FC = () => {
   const [mediaUsage, setMediaUsage] = useState<{ files: number; bytes: number } | null>(null);
   const [isImportingPhotos, setIsImportingPhotos] = useState(false);
   const [isDraggingPhotos, setIsDraggingPhotos] = useState(false);
-  const [albumDraft, setAlbumDraft] = useState<{ title: string; description: string; tags: string } | null>(null);
+  const [albumDraft, setAlbumDraft] = useState<{
+    title: string;
+    description: string;
+    tags: string;
+    postToFeed: boolean;
+    display: AlbumDisplay;
+  } | null>(null);
   const [photoDrafts, setPhotoDrafts] = useState<Record<string, { caption: string; altText: string }>>({});
 
   // New Item (Wall Post / Like / Share / Recommendation / Comment) state
@@ -908,9 +944,14 @@ export const App: React.FC = () => {
   useEffect(() => {
     const onMessage = (event: MessageEvent) => {
       if (!previewFrameRef.current || event.source !== previewFrameRef.current.contentWindow) return;
-      const data = event.data as { type?: string; href?: string } | null;
+      const data = event.data as { type?: string; href?: string; albumId?: string; slug?: string } | null;
       if (!data || typeof data.href !== 'string') return;
-      if (data.type === 'webring-preview-deeplink') {
+      if (data.type === 'webring-preview-album') {
+        // An album card or post in the preview opens that album in the Albums tab
+        const album = bundle?.albums.albums.find((a) => (data.albumId && a.id === data.albumId) || (data.slug && a.slug === data.slug));
+        if (album) setSelectedAlbumId(album.id);
+        setActiveTab('albums');
+      } else if (data.type === 'webring-preview-deeplink') {
         const parsed = parseWebringUri(data.href);
         if (parsed) handleIncomingDeepLink(parsed);
       } else if (data.type === 'webring-preview-open' && /^https?:/i.test(data.href)) {
@@ -1061,10 +1102,14 @@ export const App: React.FC = () => {
         .split(',')
         .map((s) => s.trim())
         .filter(Boolean),
+      postToFeed: newAlbumPostToFeed,
+      display: newAlbumDisplay,
     })) as { id: string };
     setNewAlbumTitle('');
     setNewAlbumDesc('');
     setNewAlbumTags('');
+    setNewAlbumPostToFeed(false);
+    setNewAlbumDisplay('card');
     setSelectedAlbumId(created.id);
     await refreshStudioData();
     notify(`Created photo album "${newAlbumTitle}"`);
@@ -1175,6 +1220,8 @@ export const App: React.FC = () => {
         .split(',')
         .map((t) => t.trim())
         .filter(Boolean),
+      postToFeed: albumDraft.postToFeed,
+      display: albumDraft.display,
     });
     setAlbumDraft(null);
     await refreshStudioData();
@@ -1849,25 +1896,40 @@ export const App: React.FC = () => {
         verifiedSignature: true,
         isMine: true,
       })),
-    ...bundle.albums.albums.flatMap((album) =>
-      album.photos.map((photo) => ({
-        id: `mine-${photo.id}`,
-        friendSiteUrl: bundle.profile.siteUrl,
-        friendName: bundle.profile.displayName,
-        friendAvatarUrl: bundle.profile.avatarUrl,
-        friendDid: bundle.profile.did,
-        entryType: 'photo' as const,
-        title: photo.caption || `${album.title} Photo`,
-        canonicalUrl: photo.canonicalUrl,
-        targetUrl: photo.url,
-        commentary: `Published in album "${album.title}"`,
-        mediaUrl: photo.thumbUrl || photo.url,
-        tags: photo.tags,
-        createdAt: photo.createdAt,
-        verifiedSignature: true,
-        isMine: true,
-      }))
-    ),
+    ...bundle.albums.albums
+      .filter((album) => albumIsPosted(album) && album.photos.length > 0)
+      .map((album) => {
+        const newest = album.photos.reduce((a, b) => (b.createdAt > a.createdAt ? b : a), album.photos[0]);
+        // Same tiles as the published peek: the cover, then photos that aren't the cover
+        const cover = album.coverUrl || album.photos[0].thumbUrl || album.photos[0].url;
+        const side = album.photos
+          .filter((photo) => (photo.thumbUrl || photo.url) !== cover && photo.url !== cover)
+          .slice(0, 2)
+          .map((photo) => photo.thumbUrl || photo.url);
+        const thumbs = [cover, ...side].map(mediaSrc);
+        return {
+          id: `mine-${album.id}`,
+          friendSiteUrl: bundle.profile.siteUrl,
+          friendName: bundle.profile.displayName,
+          friendAvatarUrl: bundle.profile.avatarUrl,
+          friendDid: bundle.profile.did,
+          entryType: 'album' as const,
+          title: album.title,
+          canonicalUrl: album.canonicalUrl,
+          targetUrl: album.pageUrl
+            ? `${bundle.profile.siteUrl.replace(/\/$/, '')}/${album.pageUrl}`
+            : bundle.profile.siteUrl,
+          commentary: album.description,
+          mediaUrl: thumbs[0] || '',
+          tags: album.tags,
+          createdAt: newest.createdAt,
+          verifiedSignature: true,
+          photoCount: album.photos.length,
+          newCount: 0,
+          peekUrls: thumbs,
+          isMine: true,
+        };
+      }),
   ];
   const visibleFeed = (
     feedScope === 'saved'
@@ -1902,6 +1964,24 @@ export const App: React.FC = () => {
       notify(`Couldn't save that: ${err instanceof Error ? err.message.replace(/^Error invoking remote method '[^']+': (Error: )?/, '') : String(err)}`);
     }
     await refreshStudioData();
+  };
+
+  const handleOpenFeedAlbum = async (album: NetworkFeedEntry) => {
+    if (!window.studioApi) return;
+    if (album.isMine) {
+      const own = bundle.albums.albums.find((a) => a.canonicalUrl === album.canonicalUrl);
+      if (own) setSelectedAlbumId(own.id);
+      setActiveTab('albums');
+      return;
+    }
+    try {
+      const photos = await window.studioApi.getFeedAlbumPhotos(album.canonicalUrl);
+      setOpenFeedAlbum({ album, photos });
+      await window.studioApi.markFeedAlbumSeen(album.canonicalUrl);
+      await refreshStudioData();
+    } catch (err) {
+      notify(`Couldn't open that album: ${err instanceof Error ? err.message : String(err)}`);
+    }
   };
 
   const handleSetFeedRetention = async (days: number) => {
@@ -2415,7 +2495,13 @@ export const App: React.FC = () => {
             const albums = bundle.albums.albums;
             const album = albums.find((a) => a.id === selectedAlbumId);
             const draft = album
-              ? albumDraft || { title: album.title, description: album.description, tags: album.tags.join(', ') }
+              ? albumDraft || {
+                  title: album.title,
+                  description: album.description,
+                  tags: album.tags.join(', '),
+                  postToFeed: albumIsPosted(album),
+                  display: albumDisplay(album),
+                }
               : null;
             return (
             <div className="max-w-6xl mx-auto space-y-6">
@@ -2460,6 +2546,32 @@ export const App: React.FC = () => {
                       placeholder="Description (optional)"
                       className="w-full px-3 py-2 rounded-xl bg-slate-950 border border-slate-800 text-sm"
                     />
+                    <label className="flex items-start gap-2 text-xs text-slate-300 cursor-pointer">
+                      <input
+                        type="checkbox"
+                        checked={newAlbumPostToFeed}
+                        onChange={(e) => setNewAlbumPostToFeed(e.target.checked)}
+                        className="mt-0.5"
+                      />
+                      <span>
+                        Post to feed
+                        <span className="block text-[11px] text-slate-500">Announce this album in your posts timeline</span>
+                      </span>
+                    </label>
+                    <div className="flex flex-wrap items-center gap-3 text-xs text-slate-300">
+                      <span>Show in Photos as:</span>
+                      {(['card', 'expanded'] as AlbumDisplay[]).map((mode) => (
+                        <label key={mode} className="flex items-center gap-1.5 cursor-pointer">
+                          <input
+                            type="radio"
+                            name="new-album-display"
+                            checked={newAlbumDisplay === mode}
+                            onChange={() => setNewAlbumDisplay(mode)}
+                          />
+                          {mode === 'card' ? 'Card' : 'Expanded'}
+                        </label>
+                      ))}
+                    </div>
                     <button
                       type="submit"
                       className="w-full px-3 py-2 rounded-xl bg-indigo-600 hover:bg-indigo-500 text-white font-semibold text-xs"
@@ -2539,6 +2651,51 @@ export const App: React.FC = () => {
                         placeholder="Description (Markdown: headings, links, lists, tables)"
                         className="md:col-span-2"
                       />
+                    </div>
+                    <div className="flex flex-wrap items-center gap-x-2 gap-y-1 text-xs text-slate-500">
+                      <span>Page address:</span>
+                      <code className="text-slate-300">{album.pageUrl}</code>
+                      {publishSettings.lastPublishedAt && !isPlaceholderSiteUrl(bundle.profile.siteUrl) && (
+                        <button
+                          type="button"
+                          onClick={() =>
+                            window.studioApi?.openExternal(
+                              `${bundle.profile.siteUrl.replace(/\/+$/, '')}/${album.pageUrl}`,
+                            )
+                          }
+                          className="text-indigo-400 hover:text-indigo-300"
+                        >
+                          View page ↗
+                        </button>
+                      )}
+                    </div>
+                    <div className="space-y-2">
+                      <label className="flex items-start gap-2 text-xs text-slate-300 cursor-pointer">
+                        <input
+                          type="checkbox"
+                          checked={draft.postToFeed}
+                          onChange={(e) => setAlbumDraft({ ...draft, postToFeed: e.target.checked })}
+                          className="mt-0.5"
+                        />
+                        <span>
+                          Post to feed
+                          <span className="block text-[11px] text-slate-500">Announce this album in your posts timeline</span>
+                        </span>
+                      </label>
+                      <div className="flex flex-wrap items-center gap-3 text-xs text-slate-300">
+                        <span>Show in Photos as:</span>
+                        {(['card', 'expanded'] as AlbumDisplay[]).map((mode) => (
+                          <label key={mode} className="flex items-center gap-1.5 cursor-pointer">
+                            <input
+                              type="radio"
+                              name="album-display"
+                              checked={draft.display === mode}
+                              onChange={() => setAlbumDraft({ ...draft, display: mode })}
+                            />
+                            {mode === 'card' ? 'Card' : 'Expanded'}
+                          </label>
+                        ))}
+                      </div>
                     </div>
                     <div className="flex flex-wrap items-center gap-2">
                       {albumDraft && (
@@ -3994,6 +4151,13 @@ export const App: React.FC = () => {
                             {isPublic ? 'Make Private' : 'Make Public'}
                           </button>
                           <button
+                            onClick={() => window.studioApi?.openExternal(friend.siteUrl.replace(/\/$/, '') + '/#photos')}
+                            className="px-2.5 py-1.5 rounded-lg bg-slate-800 hover:bg-slate-700 text-xs"
+                            title="Open their albums on their site"
+                          >
+                            Albums ↗
+                          </button>
+                          <button
                             onClick={async () => {
                               notify(`Crawling ${friend.siteUrl}...`);
                               const res = await window.studioApi?.crawlFriend(friend.siteUrl);
@@ -4214,6 +4378,16 @@ export const App: React.FC = () => {
                     </>
                   )}
                 </div>
+              ) : openFeedAlbum ? (
+                <FriendAlbumView
+                  album={openFeedAlbum.album}
+                  photos={openFeedAlbum.photos}
+                  savedUrls={new Set(savedPosts.map((s) => s.canonicalUrl))}
+                  onClose={() => setOpenFeedAlbum(null)}
+                  onAction={handleIncomingDeepLink}
+                  onToggleSave={handleToggleSaved}
+                  onOpenSite={(url) => window.studioApi?.openExternal(url)}
+                />
               ) : (
                 <div className="space-y-4">
                   {visibleFeed
@@ -4311,17 +4485,68 @@ export const App: React.FC = () => {
                               </div>
                             </div>
 
-                            {entry.mediaUrl && (
-                              <img
-                                src={entry.mediaUrl}
-                                alt={entry.title}
-                                className="w-full max-h-72 object-cover rounded-xl mt-2"
-                              />
+                            {entry.entryType === 'album' ? (
+                              <>
+                                <p className="text-xs text-slate-400 flex items-center gap-2">
+                                  <span>
+                                    {entry.friendName}{' '}
+                                    {(entry.newCount ?? 0) > 0
+                                      ? `added ${entry.newCount} photo${entry.newCount === 1 ? '' : 's'}`
+                                      : 'posted an album'}
+                                  </span>
+                                  {(entry.newCount ?? 0) > 0 && (
+                                    <span className="text-[10px] px-2 py-0.5 rounded-full bg-indigo-500 text-white font-bold">
+                                      {entry.newCount} new
+                                    </span>
+                                  )}
+                                </p>
+                                {(() => {
+                                  const peek = (entry.peekUrls && entry.peekUrls.length ? entry.peekUrls : [entry.mediaUrl]).filter(Boolean);
+                                  const extra = (entry.photoCount ?? 0) - 3;
+                                  const side = peek.slice(1, 3);
+                                  return peek.length > 0 ? (
+                                    <button
+                                      type="button"
+                                      onClick={() => handleOpenFeedAlbum(entry)}
+                                      className="grid grid-cols-3 grid-rows-2 gap-1 w-full h-56 rounded-xl overflow-hidden"
+                                      title="Open album"
+                                    >
+                                      <img src={peek[0]} alt={entry.title} className={`${peek.length > 1 ? 'col-span-2' : 'col-span-3'} row-span-2 w-full h-full object-cover`} />
+                                      {side.map((url, i) => (
+                                        <div key={url + i} className={`relative w-full h-full ${side.length === 1 ? 'row-span-2' : ''}`}>
+                                          <img src={url} alt="" className="w-full h-full object-cover" />
+                                          {i === side.length - 1 && extra > 0 && (
+                                            <span className="absolute inset-0 bg-black/55 flex items-center justify-center text-white font-bold">
+                                              +{extra}
+                                            </span>
+                                          )}
+                                        </div>
+                                      ))}
+                                    </button>
+                                  ) : null;
+                                })()}
+                              </>
+                            ) : (
+                              entry.mediaUrl && (
+                                <img
+                                  src={entry.mediaUrl}
+                                  alt={entry.title}
+                                  className="w-full max-h-72 object-cover rounded-xl mt-2"
+                                />
+                              )
                             )}
 
-                            <h4 className="font-bold text-base pt-1">{entry.title}</h4>
-                            {entry.entryType === 'post' ? (
-                              // Friends' posts are Markdown too; the renderer escapes everything first
+                            <h4 className="font-bold text-base pt-1">
+                              {entry.entryType === 'album' ? (
+                                <button type="button" onClick={() => handleOpenFeedAlbum(entry)} className="text-left hover:text-indigo-300">
+                                  {entry.title}
+                                </button>
+                              ) : (
+                                entry.title
+                              )}
+                            </h4>
+                            {entry.entryType === 'post' || entry.entryType === 'album' ? (
+                              // Posts and album descriptions are Markdown; the renderer escapes everything first
                               <div
                                 className="studio-prose text-sm text-slate-300"
                                 dangerouslySetInnerHTML={{ __html: renderMarkdown(entry.commentary) }}
@@ -4329,9 +4554,11 @@ export const App: React.FC = () => {
                             ) : (
                               <p className="text-sm text-slate-300 whitespace-pre-line">{entry.commentary}</p>
                             )}
-                            <p className="text-xs font-mono text-indigo-400 truncate">
-                              Indexed Target: {entry.targetUrl}
-                            </p>
+                            {entry.entryType !== 'album' && (
+                              <p className="text-xs font-mono text-indigo-400 truncate">
+                                Indexed Target: {entry.targetUrl}
+                              </p>
+                            )}
 
                             {entry.isMine ? (
                               <div className="flex flex-wrap gap-2 pt-1">
@@ -4342,12 +4569,22 @@ export const App: React.FC = () => {
                                 >
                                   <ExternalLink className="w-3.5 h-3.5" /> View my site
                                 </button>
+                                {entry.entryType === 'album' && (
+                                  <button
+                                    onClick={() => handleOpenFeedAlbum(entry)}
+                                    className="px-3 py-1.5 rounded-lg bg-slate-800 hover:bg-slate-700 text-xs font-medium"
+                                  >
+                                    Open album →
+                                  </button>
+                                )}
+                                {entry.entryType !== 'album' && (
                                 <button
                                   onClick={() => handleDeleteMyFeedEntry(entry)}
                                   className="px-3 py-1.5 rounded-lg bg-rose-950/40 hover:bg-rose-900/50 border border-rose-500/30 text-rose-300 text-xs font-medium flex items-center gap-1"
                                 >
                                   <Trash2 className="w-3.5 h-3.5" /> Delete
                                 </button>
+                                )}
                               </div>
                             ) : (
                             <div className="flex flex-wrap gap-2 pt-1">
@@ -4766,6 +5003,17 @@ export const App: React.FC = () => {
                     {changesSinceLastPublish} change{changesSinceLastPublish === 1 ? '' : 's'} since
                     last publish
                   </span>
+                )}
+                {publishSettings.lastPublishedAt && !isPlaceholderSiteUrl(bundle.profile.siteUrl) && (
+                  <button
+                    type="button"
+                    onClick={() => openLiveSite(bundle.profile.siteUrl, publishSettings.lastPublishedAt!)}
+                    title="Opens your site with the publish time added to the address, so the browser and any host cache fetch a fresh copy"
+                    className="text-xs px-2.5 py-1 rounded-lg bg-slate-800 hover:bg-slate-700 border border-slate-700 text-slate-200 font-medium flex items-center gap-1"
+                  >
+                    View live site
+                    <ExternalLink className="w-3 h-3" />
+                  </button>
                 )}
               </div>
 

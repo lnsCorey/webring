@@ -354,6 +354,14 @@ export const AlbumItemSchema = z.object({
   updatedAt: z.string(),
   /** Relative URL of the album's signed manifest (media/albums/<id>/manifest.json). */
   manifestUrl: z.string().optional(),
+  /** Stable page address segment, set once when the album is created. */
+  slug: z.string().optional(),
+  /** Relative URL of the album's page (albums/<slug>/). */
+  pageUrl: z.string().optional(),
+  /** Whether the album appears in the feed. Missing or not a boolean means posted. */
+  postToFeed: z.boolean().optional().catch(undefined),
+  /** How the Photos section shows the album. Missing or unknown means card. */
+  display: z.enum(['card', 'expanded']).optional().catch(undefined),
 });
 export type AlbumItem = z.infer<typeof AlbumItemSchema>;
 
@@ -803,6 +811,32 @@ export function siteUrlToDidWeb(siteUrl: string): string {
   } catch {
     return 'did:web:localhost';
   }
+}
+
+export type AlbumDisplay = 'card' | 'expanded';
+
+/** Albums written before the setting existed are posted. */
+export function albumIsPosted(album: { postToFeed?: boolean }): boolean {
+  return album.postToFeed !== false;
+}
+
+export function albumDisplay(album: { display?: string }): AlbumDisplay {
+  return album.display === 'expanded' ? 'expanded' : 'card';
+}
+
+/** Slug base from a title; callers add the -2, -3 uniqueness suffix. */
+export function slugifyAlbumTitle(title: string): string {
+  return (
+    title
+      .toLowerCase()
+      .replace(/[^a-z0-9]+/g, '-')
+      .replace(/^-+|-+$/g, '')
+      .slice(0, 40) || 'album'
+  );
+}
+
+export function albumPagePath(slug: string): string {
+  return `albums/${slug}/index.html`;
 }
 
 /**
