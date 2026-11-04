@@ -20,6 +20,7 @@ import {
   documentFingerprint,
   generateIdentityKeyPair,
   isPlaceholderSiteUrl,
+  normalizeRingPagePath,
   normalizeSiteUrl,
   parseLayout,
   ProfileDocumentSchema,
@@ -34,7 +35,7 @@ import {
 } from '../src/shared/schema';
 import { STORED_SECRET_PLACEHOLDER, StudioDatabase } from '../electron/db/database';
 import { LEGACY_DEMO_PHOTOS, LEGACY_DEMO_PROFILE } from '../electron/db/legacyDemoContent';
-import { StaticSiteGenerator } from '../electron/services/siteGenerator';
+import { buildRingDirectoryHtml, StaticSiteGenerator } from '../electron/services/siteGenerator';
 import { renderTemplatePage } from '../electron/services/siteTemplates';
 import { installPageEnhancements } from '../electron/services/pageEnhancements';
 import {
@@ -1543,8 +1544,13 @@ describe('Curated Webrings (hosted rings, signed requests, sync)', () => {
     // Order is maya, bob, carol
     expect(joined.prevSiteUrl).toBe(maya.siteUrl);
     expect(joined.nextSiteUrl).toBe(carol.siteUrl);
+    // Random's members are saved so it works without the hub; never the site itself
+    expect(joined.rotationUrls).toEqual([maya.siteUrl, carol.siteUrl]);
+    expect(maya.db.getWebrings()[0].rotationUrls).toEqual([bob.siteUrl, carol.siteUrl]);
     bob.publish();
-    expect(bob.db.buildSignedSiteBundle().connections.webrings[0].hubUrl).toBe(ring.hubUrl);
+    const published = bob.db.buildSignedSiteBundle().connections.webrings[0];
+    expect(published.hubUrl).toBe(ring.hubUrl);
+    expect(published.rotationUrls).toEqual([maya.siteUrl, carol.siteUrl]);
 
     const [hostedSync] = await maya.rings.syncHostedRings();
     expect(hostedSync.confirmed).toEqual([bob.siteUrl]);
@@ -1665,6 +1671,7 @@ describe('Curated Webrings (hosted rings, signed requests, sync)', () => {
     await tick();
     maya.publish();
     expect((await bob.rings.syncJoinedRings())[0].outcome).toBe('closed');
+    expect(bob.db.getJoinedRings()[0].rotationUrls).toEqual([]);
     expect(bob.db.buildSignedSiteBundle().connections.webrings).toHaveLength(0);
     // The closed hub is still published, with no members
     const closedDoc = JSON.parse(fs.readFileSync(path.join(maya.outDir, ring.hubPath), 'utf8'));
@@ -1691,6 +1698,176 @@ describe('Curated Webrings (hosted rings, signed requests, sync)', () => {
 
     await expect(other.rings.reviewRequest(requestLink)).rejects.toThrow(/doesn’t host/);
     await expect(maya.rings.reviewRequest('webring://ring-request?token=garbage')).rejects.toThrow(/damaged/);
+  });
+
+  it('sends Random to a saved ring member, never the hub JSON, on the page and in the preview', async () => {
+    const maya = makeSite('maya');
+    const bob = makeSite('bob');
+    const carol = makeSite('carol');
+    const ring = maya.db.createHostedRing({ name: 'Ring' });
+    maya.publish();
+    for (const peer of [bob, carol]) {
+      peer.publish();
+      const { requestLink } = await peer.rings.requestToJoin(ring.hubUrl);
+      await maya.rings.decideRequest(requestLink, 'approve');
+      await tick();
+    }
+    maya.publish();
+    await bob.rings.syncJoinedRings();
+
+    const randomLink = async (html: string) => {
+      const page = await renderPage(html);
+      const link = /<a href="([^"]*)" data-ring-nav="random"[^>]*>/.exec(page.html);
+      const rotation = link ? /data-ring-random="([^"]*)"/.exec(link[0]) : null;
+      return link ? { href: link[1], rotation: (rotation ? rotation[1] : '').split(' ').filter(Boolean) } : null;
+    };
+    const generator = new StaticSiteGenerator(bob.db);
+    const bundle = bob.db.buildSignedSiteBundle();
+    for (const html of [
+      generator.buildStandaloneProfileHtml(bundle),
+      generator.buildStandaloneProfileHtml(bundle, { preview: true }),
+    ]) {
+      const link = await randomLink(html);
+      expect(link).not.toBeNull();
+      expect([maya.siteUrl, carol.siteUrl]).toContain(link!.href);
+      expect(link!.rotation.sort()).toEqual([carol.siteUrl, maya.siteUrl]);
+    }
+
+    // No saved members and no directory: no Random rather than a link to the hub's JSON
+    const bareHtml = generator.buildStandaloneProfileHtml({
+      ...bundle,
+      connections: {
+        ...bundle.connections,
+        webrings: bundle.connections.webrings.map((r) => ({ ...r, rotationUrls: undefined, directoryUrl: undefined })),
+      },
+    });
+    expect(await randomLink(bareHtml)).toBeNull();
+  });
+
+  it('hosts an older ring entry on your own site, with its page at the old address', async () => {
+    const maya = makeSite('maya');
+    const legacy = maya.db.upsertJoinedRing({
+      hubUrl: `${maya.siteUrl}/webring`,
+      name: 'Science, Technology & Society',
+      description: 'STS sites',
+      status: 'legacy',
+    });
+    const elsewhere = maya.db.upsertJoinedRing({ hubUrl: 'https://other.ring.test/webring', status: 'legacy' });
+
+    const ring = maya.db.hostLegacyRing(legacy.id);
+    expect(ring.name).toBe('Science, Technology & Society');
+    expect(ring.directoryPath).toBe('webring/index.html');
+    expect(ring.directoryUrl).toBe(`${maya.siteUrl}/webring/`);
+    expect(maya.db.getJoinedRings().map((r) => r.id)).toEqual([elsewhere.id]);
+    // Someone else's site can't be hosted here
+    expect(() => maya.db.hostLegacyRing(elsewhere.id)).toThrow(/isn't on your site/);
+
+    maya.publish();
+    const page = fs.readFileSync(path.join(maya.outDir, 'webring/index.html'), 'utf8');
+    expect(page).toContain('Science, Technology &amp; Society');
+    expect(JSON.parse(fs.readFileSync(path.join(maya.outDir, 'webring/ring.json'), 'utf8')).hubUrl).toBe(ring.hubUrl);
+  });
+
+  it('only accepts ring page addresses that are free and outside generated folders', () => {
+    expect(normalizeRingPagePath('/webring')).toBe('webring/index.html');
+    expect(normalizeRingPagePath('rings/Photo-Ring/index.html')).toBe('rings/photo-ring/index.html');
+    for (const bad of ['', '/', '/api/rings', '/media/x', '/albums/trip', '/../etc', '/we ring', '/index.html']) {
+      expect(() => normalizeRingPagePath(bad)).toThrow();
+    }
+    const maya = makeSite('maya');
+    const first = maya.db.createHostedRing({ name: 'One', directoryPath: '/webring' });
+    const second = maya.db.createHostedRing({ name: 'Two' });
+    expect(second.directoryPath).toBe('rings/two/index.html');
+    expect(() => maya.db.updateHostedRing(second.id, { directoryPath: '/webring' })).toThrow(/already uses/);
+    expect(maya.db.updateHostedRing(first.id, { directoryPath: '/sts' }).directoryUrl).toBe(`${maya.siteUrl}/sts/`);
+    expect(() => maya.db.updateHostedRing(first.id, { accent: 'red' })).toThrow(/hex/);
+    expect(() => maya.db.updateHostedRing(first.id, { bannerUrl: 'javascript:alert(1)' })).toThrow(/banner/);
+  });
+
+  it('joins from a ring page link and publishes the ring page design with verified member cards', async () => {
+    const maya = makeSite('maya');
+    const bob = makeSite('bob');
+    maya.db.updateProfile({ tagline: 'Maintainer' });
+    bob.db.updateProfile({ tagline: 'Bob makes films', avatarUrl: 'media/profile/bob.jpg' });
+    const created = maya.db.createHostedRing({ name: 'Film Ring', directoryPath: '/film' });
+    const ring = maya.db.updateHostedRing(created.id, {
+      tagline: 'Sites about film',
+      rules: '**Be kind**',
+      bannerUrl: 'https://maya.ring.test/media/banner.jpg',
+      accent: '#ff3366',
+    });
+    maya.publish();
+    bob.publish();
+
+    // Joining with the page's address finds the hub through ring.json
+    await expect(bob.rings.requestToJoin('https://nowhere.ring.test/film')).rejects.toThrow(/ring page/);
+    const { requestLink, ring: joined } = await bob.rings.requestToJoin(ring.directoryUrl);
+    expect(joined.hubUrl).toBe(ring.hubUrl);
+    await maya.rings.decideRequest(requestLink, 'approve');
+    await tick();
+    maya.publish();
+    await bob.rings.syncJoinedRings();
+    bob.publish();
+
+    // Before a verified check there's no member avatar; afterwards it comes from Bob's signed profile
+    const hubBefore = maya.db.buildSignedHubDocuments()[0].doc;
+    expect(hubBefore.members.find((m) => m.siteUrl === bob.siteUrl)!.avatarUrl).toBeUndefined();
+    await maya.rings.syncHostedRings();
+    const { doc } = maya.db.buildSignedHubDocuments()[0];
+    expect(doc).toMatchObject({ tagline: 'Sites about film', rules: '**Be kind**', accent: '#ff3366' });
+    expect(doc.bannerUrl).toBe('https://maya.ring.test/media/banner.jpg');
+    expect(doc.members.find((m) => m.siteUrl === bob.siteUrl)).toMatchObject({
+      avatarUrl: `${bob.siteUrl}/media/profile/bob.jpg`,
+      tagline: 'Bob makes films',
+    });
+    expect(doc.members.find((m) => m.siteUrl === maya.siteUrl)!.tagline).toBe('Maintainer');
+
+    maya.publish();
+    const page = fs.readFileSync(path.join(maya.outDir, 'film/index.html'), 'utf8');
+    expect(page).not.toMatch(/<script/i);
+    expect(page).toContain('<strong>Be kind</strong>');
+    expect(page).toContain('--accent: #ff3366');
+    expect(page).toContain(`<link rel="alternate" type="application/json" href="${ring.hubUrl}"`);
+    expect(page).toContain(`src="${bob.siteUrl}/media/profile/bob.jpg"`);
+  });
+
+  it('escapes everything on a ring page and only shows https images', () => {
+    const html = buildRingDirectoryHtml({
+      schemaVersion: '1',
+      name: '<b>Ring</b>',
+      description: '"quoted"',
+      hubUrl: 'https://maya.ring.test/api/rings/r.json',
+      maintainerUrl: 'https://maya.ring.test',
+      updatedAt: new Date().toISOString(),
+      bannerUrl: 'http://insecure.test/banner.jpg',
+      accent: 'red;}</style><script>',
+      rules: '<img src=x onerror=alert(1)>',
+      members: [
+        {
+          siteUrl: 'https://bob.ring.test',
+          displayName: '<script>x</script>',
+          joinedAt: new Date().toISOString(),
+          avatarUrl: 'javascript:alert(1)',
+          tagline: '<i>hi</i>',
+        },
+      ],
+    });
+    expect(html).not.toMatch(/<script/i);
+    expect(html).not.toContain('<b>Ring</b>');
+    expect(html).not.toContain('insecure.test');
+    expect(html).not.toContain('javascript:');
+    expect(html).not.toContain('<img src=x');
+    expect(html).toContain('--accent: #6366f1');
+  });
+
+  it('shows the rings a site is in as a profile block', async () => {
+    const maya = makeSite('maya');
+    const ring = maya.db.createHostedRing({ name: 'Photo Ring', description: 'Film photographers', directoryPath: '/photo' });
+    maya.db.updateProfile({ layout: [{ id: 'my-rings', type: 'rings', visible: true, options: {} }] });
+    const page = await renderPage(new StaticSiteGenerator(maya.db).buildStandaloneProfileHtml(maya.db.buildSignedSiteBundle()));
+    expect(page.html).toContain('Photo Ring');
+    expect(page.html).toContain('Film photographers');
+    expect(page.html).toContain(`href="${ring.directoryUrl}"`);
   });
 
   it('publishes small rings sensibly and converts the old hub in place', async () => {
@@ -2793,6 +2970,7 @@ const renderPage = async (html: string, served?: { files: Record<string, unknown
       addEventListener: () => undefined,
       createElement: () => ({ setAttribute: () => undefined }),
     },
+    URL,
     URLSearchParams,
     console,
     setTimeout,

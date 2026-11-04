@@ -29,6 +29,7 @@ import { AddBackTarget, FriendNoticeReviewView, FriendNoticeView, FriendNoticesP
 import { MarkdownField } from './MarkdownField';
 import { renderMarkdown } from '../shared/markdown';
 import { ProfileImagePicker } from './ProfileImagePicker';
+import { HostedRingPageEditor } from './HostedRingPageEditor';
 import {
   BookOpen,
   Camera,
@@ -151,6 +152,8 @@ interface HostedRingMember {
   failCount: number;
   hidden: boolean;
   flagged: boolean;
+  avatarUrl: string;
+  tagline: string;
 }
 
 interface HostedRing {
@@ -159,13 +162,39 @@ interface HostedRing {
   name: string;
   description: string;
   hubUrl: string;
+  directoryPath: string;
   directoryUrl: string;
   maintainerIsMember: boolean;
   status: 'active' | 'closed';
+  tagline: string;
+  rules: string;
+  bannerUrl: string;
+  accent: string;
   updatedAt: string;
   members: HostedRingMember[];
   bans: Array<{ siteUrl: string; reason: string; createdAt: string }>;
 }
+
+/** True when both addresses are on the same origin (bad addresses never match). */
+function sameOrigin(a: string, b: string): boolean {
+  try {
+    return new URL(a).origin === new URL(b).origin;
+  } catch {
+    return false;
+  }
+}
+
+type HostedRingUpdates = {
+  name?: string;
+  description?: string;
+  maintainerIsMember?: boolean;
+  status?: 'active' | 'closed';
+  directoryPath?: string;
+  tagline?: string;
+  rules?: string;
+  bannerUrl?: string;
+  accent?: string;
+};
 
 interface RingRequestReview {
   ring: { id: string; name: string; hubUrl: string };
@@ -444,10 +473,9 @@ declare global {
         hosted: Array<{ name: string; autoRemoved: string[]; failing: string[]; confirmed: string[] }>;
       }>;
       createHostedRing: (input: { name: string; description?: string }) => Promise<HostedRing>;
-      updateHostedRing: (
-        ringId: string,
-        updates: { name?: string; description?: string; maintainerIsMember?: boolean; status?: 'active' | 'closed' }
-      ) => Promise<HostedRing>;
+      updateHostedRing: (ringId: string, updates: HostedRingUpdates) => Promise<HostedRing>;
+      hostLegacyRing: (joinedRingId: string) => Promise<HostedRing>;
+      previewHostedRing: (ringId: string) => Promise<string>;
       updateRingMember: (
         ringId: string,
         siteUrl: string,
@@ -1443,10 +1471,7 @@ export const App: React.FC = () => {
     notify(`Created "${ring.name}". Publish your site to put its hub online.`);
   };
 
-  const handleUpdateHostedRing = async (
-    ring: HostedRing,
-    updates: { maintainerIsMember?: boolean; status?: 'active' | 'closed' }
-  ) => {
+  const handleUpdateHostedRing = async (ring: HostedRing, updates: HostedRingUpdates) => {
     if (!window.studioApi) return;
     if (
       updates.status === 'closed' &&
@@ -1456,9 +1481,33 @@ export const App: React.FC = () => {
     ) {
       return;
     }
-    await window.studioApi.updateHostedRing(ring.id, updates);
+    try {
+      await window.studioApi.updateHostedRing(ring.id, updates);
+    } catch (err) {
+      notify(`Couldn't update "${ring.name}": ${errorMessage(err)}`);
+      return;
+    }
     await refreshStudioData();
     notify(`Updated "${ring.name}". Publish to make it live.`);
+  };
+
+  // An older ring entry pointing at this site becomes a ring it hosts, with its page at that address
+  const handleHostLegacyRing = async (ring: JoinedRing) => {
+    if (!window.studioApi) return;
+    if (
+      !window.confirm(
+        `Host "${ring.name}" yourself? Studio creates a ring you maintain with its page at ${ring.hubUrl}, and removes the old entry. Publish to put the page online.`
+      )
+    ) {
+      return;
+    }
+    try {
+      const hosted = await window.studioApi.hostLegacyRing(ring.id);
+      await refreshStudioData();
+      notify(`"${hosted.name}" is now a ring you host. Publish to put ${hosted.directoryUrl} online.`);
+    } catch (err) {
+      notify(`Couldn't convert "${ring.name}": ${errorMessage(err)}`);
+    }
   };
 
   const handleRingMemberAction = async (ring: HostedRing, member: { siteUrl: string; displayName: string }, action: RingMemberAction) => {
@@ -3515,19 +3564,20 @@ export const App: React.FC = () => {
                     <Layers className="w-4 h-4 text-indigo-400" /> Join a Webring
                   </h3>
                   <p className="text-xs text-slate-400">
-                    Paste the ring's hub address (from its directory page or a member's{' '}
+                    Paste the address of the ring's page (or its hub, or use a member's{' '}
                     <strong>Join Ring</strong> link). Studio checks the ring's signature and creates a
                     private, signed request link for you to send the ring's maintainer. Publish your
-                    site first so the maintainer can verify it.
+                    site first so the maintainer can verify it. To start your own ring instead, use{' '}
+                    <strong>Rings You Host</strong> below.
                   </p>
                   <div>
-                    <label className="block text-xs text-slate-400 mb-1">Ring Hub URL (https)</label>
+                    <label className="block text-xs text-slate-400 mb-1">Ring page or hub address (https)</label>
                     <input
                       type="url"
                       required
                       value={ringHubUrl}
                       onChange={(e) => setRingHubUrl(e.target.value)}
-                      placeholder="https://maintainer.example/api/rings/photo-ring.json"
+                      placeholder="https://maintainer.example/webring"
                       className="w-full px-3 py-2 rounded-xl bg-slate-950 border border-slate-800 text-sm font-mono"
                     />
                   </div>
@@ -3733,6 +3783,16 @@ export const App: React.FC = () => {
                                     <Copy className="w-3 h-3" /> Request Link
                                   </button>
                                 )}
+                                {ring.status === 'legacy' && sameOrigin(ring.hubUrl, bundle.profile.siteUrl) && (
+                                  <button
+                                    type="button"
+                                    onClick={() => handleHostLegacyRing(ring)}
+                                    className="px-3 py-1.5 rounded-lg bg-indigo-600 hover:bg-indigo-500 text-white text-xs font-semibold"
+                                    title="This address is on your own site: host the ring here, with a real page at this address"
+                                  >
+                                    Host this ring
+                                  </button>
+                                )}
                                 {ring.status === 'legacy' && (
                                   <button
                                     type="button"
@@ -3765,8 +3825,8 @@ export const App: React.FC = () => {
                 <div className="flex flex-wrap items-center justify-between gap-2">
                   <h3 className="font-bold text-lg">Rings You Host ({hostedRings.length})</h3>
                   <p className="text-xs text-slate-400">
-                    Each ring is published as a signed hub plus a directory page. Changes go live when
-                    you publish.
+                    Each ring gets a public page people can visit and join from, plus a signed hub that
+                    members' Studios sync. Changes go live when you publish.
                   </p>
                 </div>
 
@@ -3889,18 +3949,29 @@ export const App: React.FC = () => {
                           </span>
                         </div>
                         {ring.description && <p className="text-xs text-slate-400 mt-0.5">{ring.description}</p>}
-                        <p className="text-[11px] font-mono text-indigo-300 truncate mt-1">{ring.hubUrl}</p>
+                        <p className="text-[11px] font-mono text-indigo-300 truncate mt-1">{ring.directoryUrl}</p>
                       </div>
                       <div className="flex flex-wrap items-center gap-2 text-xs">
                         <button
                           type="button"
                           onClick={() => {
+                            navigator.clipboard.writeText(ring.directoryUrl);
+                            notify('Copied the ring page link. Anyone can visit it, and Studio users can join from it.');
+                          }}
+                          className="px-2.5 py-1.5 rounded-lg bg-indigo-600 hover:bg-indigo-500 text-white font-semibold flex items-center gap-1"
+                        >
+                          <Copy className="w-3 h-3" /> Ring Page Link
+                        </button>
+                        <button
+                          type="button"
+                          onClick={() => {
                             navigator.clipboard.writeText(ring.hubUrl);
-                            notify('Copied hub URL. Share it (or your directory page) with people who want to join.');
+                            notify('Copied the hub address (the signed JSON members sync).');
                           }}
                           className="px-2.5 py-1.5 rounded-lg bg-slate-800 hover:bg-slate-700 flex items-center gap-1"
+                          title="The signed JSON that members' Studios sync. Share the ring page instead."
                         >
-                          <Copy className="w-3 h-3" /> Hub URL
+                          <Copy className="w-3 h-3" /> Hub
                         </button>
                         <label className="flex items-center gap-1.5 px-2.5 py-1.5 rounded-lg bg-slate-800">
                           <input
@@ -3923,9 +3994,17 @@ export const App: React.FC = () => {
                       </div>
                     </div>
 
+                    <HostedRingPageEditor
+                      ring={ring}
+                      albums={bundle.albums.albums}
+                      mediaSrc={mediaSrc}
+                      onSave={(updates) => handleUpdateHostedRing(ring, updates)}
+                      onPreview={() => window.studioApi!.previewHostedRing(ring.id)}
+                    />
+
                     {ring.members.length === 0 ? (
                       <p className="text-xs text-slate-500">
-                        No other members yet. Share the hub URL, then review the request links people send you.
+                        No other members yet. Share the ring page link, then review the request links people send you.
                       </p>
                     ) : (
                       <ul className="divide-y divide-slate-800 text-xs">

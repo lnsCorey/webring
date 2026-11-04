@@ -12,6 +12,7 @@ import {
   FriendNoticeDocument,
   isUrlWithinSite,
   normalizeSiteUrl,
+  ProfileDocumentSchema,
   parseFriendNoticeUri,
   parseRingRequestUri,
   publicKeyFingerprint,
@@ -172,6 +173,30 @@ export class RingService {
     return { doc, verified: true, keyChanged: false };
   }
 
+  /**
+   * A hub address, or a ring page's address: ring pages publish a small ring.json beside them that
+   * points at the hub. The hub must be on the same site as the page; it's then checked as usual.
+   */
+  public async resolveHubUrl(address: string): Promise<string> {
+    const url = address.trim();
+    if (/\.json$/i.test(new URL(url).pathname)) return url;
+    const page = new URL(url);
+    page.pathname = page.pathname.replace(/\/index\.html$/i, '/').replace(/\/?$/, '/ring.json');
+    page.search = '';
+    page.hash = '';
+    let pointer: unknown;
+    try {
+      pointer = await this.fetchPublicJson(page.toString());
+    } catch {
+      throw new Error(`${url} isn't a ring page or hub. Ask the maintainer for their ring page link.`);
+    }
+    const hubUrl = String((pointer as { hubUrl?: unknown })?.hubUrl || '').trim();
+    if (!hubUrl || new URL(hubUrl).origin !== page.origin) {
+      throw new Error(`The ring page at ${url} doesn't point to a hub on its own site.`);
+    }
+    return hubUrl;
+  }
+
   // ---------------------------------------------------------------------------
   // Applicant side
 
@@ -179,8 +204,8 @@ export class RingService {
    * Verifies the hub, records the ring as 'requested', and returns a private signed request link
    * for the user to send the maintainer. The site must already be published (for its did.json).
    */
-  public async requestToJoin(hubUrl: string): Promise<{ ring: JoinedRing; requestLink: string; warning?: string }> {
-    const hub = await this.fetchHub(hubUrl);
+  public async requestToJoin(address: string): Promise<{ ring: JoinedRing; requestLink: string; warning?: string }> {
+    const hub = await this.fetchHub(await this.resolveHubUrl(address));
     if (hub.doc.status === 'closed') {
       throw new Error(`"${hub.doc.name}" is closed and no longer accepts members.`);
     }
@@ -291,11 +316,18 @@ export class RingService {
 
   /**
    * Fetches a member's signed manifest and connections.json (without adding them as a friend or
-   * to the feed). Only a fully verified result counts as evidence about their membership.
+   * to the feed). Only a fully verified result counts as evidence about their membership. With
+   * `withProfile`, also reads their verified profile.json for the ring page's member card; a
+   * missing or unverified profile just leaves `profile` out.
    */
   private async fetchMemberConnections(
-    siteUrl: string
-  ): Promise<{ hubUrls: string[]; friendUrls: string[] }> {
+    siteUrl: string,
+    options: { withProfile?: boolean } = {}
+  ): Promise<{
+    hubUrls: string[];
+    friendUrls: string[];
+    profile?: { displayName: string; avatarUrl: string; tagline: string };
+  }> {
     const normalized = normalizeSiteUrl(siteUrl);
     const key = await this.fetchSiteKey(normalized);
     if (key.keyChanged) {
@@ -324,7 +356,40 @@ export class RingService {
     return {
       hubUrls: connections.webrings.map((w) => w.hubUrl.trim()),
       friendUrls: connections.friends.map((f) => normalizeSiteUrl(f.siteUrl)),
+      ...(options.withProfile
+        ? { profile: await this.fetchVerifiedProfile(normalized, manifest.endpoints.profile, key) }
+        : {}),
     };
+  }
+
+  private async fetchVerifiedProfile(
+    siteUrl: string,
+    endpointPath: string,
+    key: { did: string; publicKeyPem: string }
+  ): Promise<{ displayName: string; avatarUrl: string; tagline: string } | undefined> {
+    try {
+      const endpoint = new URL(endpointPath, `${siteUrl}/`).toString();
+      if (!isUrlWithinSite(endpoint, siteUrl)) return undefined;
+      const raw = (await this.fetchPublicJson(endpoint)) as Record<string, unknown>;
+      const profile = ProfileDocumentSchema.parse(raw);
+      if (
+        !profile.proof ||
+        !verifyDocumentSignature(raw as Parameters<typeof verifyDocumentSignature>[0], key.publicKeyPem) ||
+        normalizeSiteUrl(profile.siteUrl) !== siteUrl ||
+        profile.did !== key.did
+      ) {
+        return undefined;
+      }
+      const avatarUrl = absoluteSiteUrl(profile.avatarUrl, siteUrl);
+      return {
+        displayName: profile.displayName,
+        // Only https images, and only from the member's own site, go on the ring page
+        avatarUrl: /^https:\/\//i.test(avatarUrl) && isUrlWithinSite(avatarUrl, siteUrl) ? avatarUrl : '',
+        tagline: profile.tagline,
+      };
+    } catch {
+      return undefined;
+    }
   }
 
   // ---------------------------------------------------------------------------
@@ -368,7 +433,7 @@ export class RingService {
         ...(hub.verified ? { hubUpdatedAt: doc.updatedAt } : {}),
       };
       if (doc.status === 'closed' && hub.verified) {
-        this.db.upsertJoinedRing({ ...common, status: 'closed', prevSiteUrl: null, nextSiteUrl: null });
+        this.db.upsertJoinedRing({ ...common, status: 'closed', prevSiteUrl: null, nextSiteUrl: null, rotationUrls: [] });
         results.push({ hubUrl: ring.hubUrl, name: ring.name, outcome: 'closed' });
         continue;
       }
@@ -384,6 +449,7 @@ export class RingService {
           directoryUrl: doc.directoryUrl || '',
           prevSiteUrl: neighbors.prevSiteUrl ?? null,
           nextSiteUrl: neighbors.nextSiteUrl ?? null,
+          rotationUrls: neighbors.rotationUrls,
           memberCount: neighbors.memberCount,
         });
         if (hub.verified) await this.discoverRingFriends(doc, mySiteUrl, discovery);
@@ -392,7 +458,7 @@ export class RingService {
         this.db.upsertJoinedRing(common);
         results.push({ hubUrl: ring.hubUrl, name: ring.name, outcome: 'still-requested' });
       } else if (ring.status === 'member' && hub.verified) {
-        this.db.upsertJoinedRing({ ...common, status: 'removed', prevSiteUrl: null, nextSiteUrl: null });
+        this.db.upsertJoinedRing({ ...common, status: 'removed', prevSiteUrl: null, nextSiteUrl: null, rotationUrls: [] });
         results.push({ hubUrl: ring.hubUrl, name: ring.name, outcome: 'removed' });
       } else {
         // Legacy rows and unverified hubs are never removed automatically
@@ -545,7 +611,9 @@ export class RingService {
         if (member.siteUrl === mySiteUrl) continue;
         result.checked++;
         try {
-          const { hubUrls, friendUrls } = await this.fetchMemberConnections(member.siteUrl);
+          const { hubUrls, friendUrls, profile } = await this.fetchMemberConnections(member.siteUrl, {
+            withProfile: true,
+          });
           const listsRing = hubUrls.includes(ring.hubUrl);
           if (friendUrls.includes(mySiteUrl)) {
             this.db.upsertFriendNotice({
@@ -555,7 +623,11 @@ export class RingService {
               ringName: ring.name,
             });
           }
-          this.db.recordRingMemberCheck(ring.id, member.siteUrl, { ok: true, listsRing });
+          this.db.recordRingMemberCheck(ring.id, member.siteUrl, {
+            ok: true,
+            listsRing,
+            ...(profile ? { avatarUrl: profile.avatarUrl, tagline: profile.tagline } : {}),
+          });
           if (listsRing) {
             if (!member.confirmedAt) result.confirmed.push(member.siteUrl);
           } else if (

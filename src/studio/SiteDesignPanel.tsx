@@ -137,6 +137,7 @@ const BLOCK_LABELS: Record<LayoutBlockType, string> = {
   featured: 'Featured',
   contact: 'Contact & elsewhere',
   guestbook: 'Guestbook',
+  rings: 'Webrings',
 };
 
 const KIND_LABELS: Record<(typeof ITEM_BLOCK_KINDS)[number], string> = {
@@ -431,6 +432,13 @@ export function SiteDesignPanel(props: SiteDesignPanelProps) {
               <option key={o.value} value={o.value}>{o.label.slice(0, 80)}</option>
             ))}
           </select>
+        );
+      case 'rings':
+        return (
+          <p className="text-[11px] text-slate-400">
+            Cards for the webrings your site is in (including rings you host and belong to), each
+            linking to the ring's page.
+          </p>
         );
       case 'guestbook':
         return (

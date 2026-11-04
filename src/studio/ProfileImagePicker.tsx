@@ -16,7 +16,10 @@ export function ProfileImagePicker(props: {
   albums: AlbumItem[];
   mediaSrc: (url: string) => string;
   onChange: (url: string) => void;
-  onUpload: (filePath?: string) => Promise<void>;
+  /** Without it there's no Upload button or drop target (choose from albums or type an address). */
+  onUpload?: (filePath?: string) => Promise<void>;
+  /** Shown while `value` differs from `savedValue`. */
+  unsavedNote?: string;
 }) {
   const [browsing, setBrowsing] = useState(false);
   const [dragging, setDragging] = useState(false);
@@ -37,6 +40,7 @@ export function ProfileImagePicker(props: {
           : 'Web address';
 
   const upload = async (filePath?: string) => {
+    if (!props.onUpload) return;
     setBusy(true);
     try {
       await props.onUpload(filePath);
@@ -63,12 +67,12 @@ export function ProfileImagePicker(props: {
             setDragging(false);
             const file = e.dataTransfer.files[0];
             const path = file && window.studioApi ? window.studioApi.getPathForFile(file) : '';
-            if (path) void upload(path);
+            if (path && props.onUpload) void upload(path);
           }}
           className={`relative shrink-0 overflow-hidden bg-slate-950 border-2 border-dashed flex items-center justify-center text-slate-600 ${
             dragging ? 'border-indigo-400' : 'border-slate-800'
           } ${avatar ? 'w-24 h-24 rounded-2xl' : 'w-full h-28 rounded-xl'}`}
-          title="Drop a JPEG or PNG here"
+          title={props.onUpload ? 'Drop a JPEG or PNG here' : undefined}
         >
           {value ? (
             <img src={props.mediaSrc(value)} alt="" className="w-full h-full object-cover" />
@@ -79,9 +83,11 @@ export function ProfileImagePicker(props: {
         </div>
         <div className="min-w-0 flex-1 space-y-1.5">
           <div className="flex flex-wrap gap-1.5">
-            <button type="button" disabled={busy} onClick={() => void upload()} className={buttonClass}>
-              <Upload className="w-3.5 h-3.5" /> Upload…
-            </button>
+            {props.onUpload && (
+              <button type="button" disabled={busy} onClick={() => void upload()} className={buttonClass}>
+                <Upload className="w-3.5 h-3.5" /> Upload…
+              </button>
+            )}
             <button type="button" disabled={photos.length === 0} onClick={() => setBrowsing(!browsing)} className={buttonClass}>
               <Images className="w-3.5 h-3.5" /> From albums
             </button>
@@ -100,7 +106,9 @@ export function ProfileImagePicker(props: {
           />
           <p className="text-[11px] text-slate-500">
             {source}
-            {props.value !== props.savedValue && <span className="text-amber-300"> · save the profile to apply</span>}
+            {props.value !== props.savedValue && (
+              <span className="text-amber-300"> · {props.unsavedNote || 'save the profile to apply'}</span>
+            )}
           </p>
         </div>
       </div>

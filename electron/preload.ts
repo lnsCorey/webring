@@ -68,6 +68,8 @@ contextBridge.exposeInMainWorld('studioApi', {
     ipcRenderer.invoke('studio:hosted-ring-create', input),
   updateHostedRing: (ringId: string, updates: unknown) =>
     ipcRenderer.invoke('studio:hosted-ring-update', ringId, updates),
+  hostLegacyRing: (joinedRingId: string) => ipcRenderer.invoke('studio:host-legacy-ring', joinedRingId),
+  previewHostedRing: (ringId: string) => ipcRenderer.invoke('studio:hosted-ring-preview', ringId),
   updateRingMember: (
     ringId: string,
     siteUrl: string,

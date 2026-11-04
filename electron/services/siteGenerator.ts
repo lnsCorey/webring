@@ -133,8 +133,9 @@ export class StaticSiteGenerator {
       writeJson(ring.hubPath, doc);
       const directoryFile = path.join(outputDir, ring.directoryPath);
       fs.mkdirSync(path.dirname(directoryFile), { recursive: true });
-      fs.writeFileSync(directoryFile, buildRingDirectoryHtml(doc), 'utf8');
+      fs.writeFileSync(directoryFile, buildRingDirectoryHtml(doc, ringPageStyleFor(bundle.profile)), 'utf8');
       filesWritten.push(ring.directoryPath);
+      writeJson(path.posix.join(path.posix.dirname(ring.directoryPath), 'ring.json'), ringPagePointer(doc));
     }
     // The pre-redesign hub lived here; drop a stale local copy unless a hosted ring now owns the path
     const legacyHubPath = path.join(outputDir, 'api/webring-hub.json');
@@ -220,6 +221,19 @@ export class StaticSiteGenerator {
   }
 
   /** Media Library files referenced by photos, with their location in the library folder. */
+  /**
+   * Studio's preview of a hosted ring's page, as it will publish (with local banner images). Shown
+   * in a sandboxed iframe with no scripts or popups, so its links don't go anywhere.
+   */
+  public buildRingPagePreviewHtml(ringId: string): string {
+    const hub = this.db.buildSignedHubDocuments().find(({ ring }) => ring.id === ringId);
+    if (!hub) throw new Error(`Hosted ring "${ringId}" not found.`);
+    const doc = hub.ring.bannerUrl.startsWith('media/')
+      ? { ...hub.doc, bannerUrl: `studio-media://local/${hub.ring.bannerUrl}` }
+      : hub.doc;
+    return buildRingDirectoryHtml(doc, { ...ringPageStyleFor(this.db.getProfile()), preview: true });
+  }
+
   private localMediaFiles(): Array<{ url: string; file: string | null }> {
     if (!this.mediaStoreDir) return [];
     const library = new MediaLibrary(this.mediaStoreDir);
@@ -582,14 +596,20 @@ ${TEMPLATE_CSS}${appearance.interactions === 'off' ? '' : ENHANCEMENTS_CSS}
         const count = typeof ring.memberCount === 'number' ? ring.memberCount : 3;
         const homeHref = safeUrl(ring.directoryUrl || ring.hubUrl);
         const single = ring.prevSiteUrl && ring.prevSiteUrl === ring.nextSiteUrl;
-        const navLink = (nav, href, label) =>
-          '<a href="' + safeUrl(href) + '" data-ring-nav="' + nav + '" data-ring-index="' + ringIndex + '" rel="noopener noreferrer" class="hover:underline">' + label + '</a>';
+        const navLink = (nav, href, label, extra) =>
+          '<a href="' + safeUrl(href) + '" data-ring-nav="' + nav + '" data-ring-index="' + ringIndex + '"' + (extra || '') + ' rel="noopener noreferrer" class="hover:underline">' + label + '</a>';
+        // Random lands on a member saved at publish (never the hub's JSON), so it still works
+        // in the preview and when the hub can't be read
+        const rotation = ringRotation(ring);
+        const randomHref = rotation[0] || ring.directoryUrl;
         const links = count <= 1
           ? ''
           : single
             ? navLink('next', ring.nextSiteUrl, 'Neighbour →')
             : (ring.prevSiteUrl ? navLink('prev', ring.prevSiteUrl, '← Prev Site') : '') +
-              (count > 2 ? navLink('random', ring.directoryUrl || ring.hubUrl, 'Random') : '') +
+              (count > 2 && randomHref
+                ? navLink('random', randomHref, 'Random', rotation.length ? ' data-ring-random="' + esc(rotation.join(' ')) + '"' : '')
+                : '') +
               (ring.nextSiteUrl ? navLink('next', ring.nextSiteUrl, 'Next Site →') : '');
         return \`
         <div class="card-surface rounded-xl px-4 py-2.5 mb-3 flex flex-wrap items-center justify-between gap-2 text-xs">
@@ -615,6 +635,21 @@ ${TEMPLATE_CSS}${appearance.interactions === 'off' ? '' : ENHANCEMENTS_CSS}
         } catch (e) {
           return null;
         }
+      }
+
+      // The other members saved at publish, filtered like hub addresses
+      function ringRotation(ring) {
+        const me = ringSiteUrl(profile.siteUrl);
+        const urls = [];
+        (Array.isArray(ring.rotationUrls) ? ring.rotationUrls : []).forEach(function(value) {
+          const url = ringSiteUrl(value);
+          if (url && url !== me && urls.indexOf(url) === -1) urls.push(url);
+        });
+        return urls;
+      }
+
+      function pickRandom(list) {
+        return list.length ? list[Math.floor(Math.random() * list.length)] : null;
       }
 
       async function fetchRingHub(hubUrl) {
@@ -656,12 +691,13 @@ ${TEMPLATE_CSS}${appearance.interactions === 'off' ? '' : ENHANCEMENTS_CSS}
           const others = rotation.filter(function(u) { return u !== me; });
           const idx = rotation.indexOf(me);
           if (nav === 'random') {
-            target = others.length ? others[Math.floor(Math.random() * others.length)] : null;
+            target = pickRandom(others);
           } else if (idx !== -1 && rotation.length > 1) {
             const step = nav === 'prev' ? -1 : 1;
             target = rotation[(idx + step + rotation.length) % rotation.length];
           }
         }
+        if (!target && nav === 'random') target = pickRandom(ringRotation(ring));
         const destination = target || fallback;
         if (destination && destination.charAt(0) !== '#') window.location.assign(destination);
       });
@@ -977,6 +1013,21 @@ ${TEMPLATE_CSS}${appearance.interactions === 'off' ? '' : ENHANCEMENTS_CSS}
           return '';
         },
         contact: (b) => (b.options && (b.options.entries || []).length) ? section(b, '✉️ Contact & Elsewhere', linkButtons(b.options.entries, 'me')) : '',
+        rings: (b) => {
+          const rings = (connections.webrings || []).filter(r => r && r.name && (r.directoryUrl || r.hubUrl));
+          if (!rings.length) return '';
+          const cards = rings.map(r => {
+            const href = safeUrl(r.directoryUrl || r.hubUrl);
+            const count = typeof r.memberCount === 'number' && r.memberCount > 0 ? r.memberCount + ' member' + (r.memberCount === 1 ? '' : 's') : '';
+            return '<a href="' + href + '" target="_blank" rel="noopener noreferrer" class="card-surface rounded-xl p-4 block hover:opacity-90">' +
+              '<span class="accent-soft text-[10px] px-2 py-0.5 rounded-full bg-indigo-500/20 text-indigo-300 font-semibold">WEBRING</span>' +
+              '<h3 class="font-bold mt-2">' + esc(r.name) + '</h3>' +
+              (r.description ? '<p class="text-sm opacity-80 mt-1">' + esc(r.description) + '</p>' : '') +
+              (count ? '<p class="text-xs opacity-60 mt-2">' + count + '</p>' : '') +
+            '</a>';
+          }).join('');
+          return section(b, '🔗 Webrings (' + rings.length + ')', '<div class="grid grid-cols-1 sm:grid-cols-2 gap-4">' + cards + '</div>');
+        },
         guestbook: (b) => hasGuestbook
           ? section(b, '📖 Guestbook', '<div class="card-surface rounded-xl p-4"><button onclick="window.openGuestbook()" class="accent-solid px-4 py-2 rounded-xl bg-indigo-600 text-white text-sm font-semibold">Open Guestbook</button><div id="guestbook-thread" class="hidden mt-3"></div></div>')
           : '',
@@ -1198,7 +1249,7 @@ const WEBRING_STUDIO_URL = 'https://github.com/lnsCorey/webring';
 /**
  * Studio preview only (sandboxed iframe): links never navigate the preview. webring:// actions
  * open the matching form in Studio, album links open the album in Studio's Albums tab, and web
- * links open in the browser, via postMessage.
+ * links (including a random ring member for Random) open in the browser, via postMessage.
  */
 const PREVIEW_BRIDGE = `
   <script>
@@ -1210,6 +1261,12 @@ const PREVIEW_BRIDGE = `
       if (anchor.closest('[data-lightbox], [data-open-post]')) return; // opens in the page's own viewer
       ev.preventDefault();
       ev.stopPropagation();
+      // Random picks from the ring members saved at publish; the preview never reads the hub
+      var rotation = (anchor.getAttribute('data-ring-random') || '').split(' ').filter(Boolean);
+      if (rotation.length) {
+        parent.postMessage({ type: 'webring-preview-open', href: rotation[Math.floor(Math.random() * rotation.length)] }, '*');
+        return;
+      }
       // Album pages aren't in the preview: Studio opens the album in its Albums tab instead
       var albumPage = /^(?:\\.\\/)?albums\\/([^\\/?#]+)\\/?(?:index\\.html)?$/i.exec(href);
       if (anchor.hasAttribute('data-album-link') || albumPage) {
@@ -1238,52 +1295,158 @@ function safeExternalUrl(value: string): string | null {
   }
 }
 
+/** How a ring page borrows the maintainer's site design. */
+export interface RingPageStyle {
+  light: boolean;
+  accent?: string;
+  font?: string;
+  /** Studio's preview: local Media Library images, and links that go nowhere. */
+  preview?: boolean;
+}
+
+const RING_PAGE_FONTS: Record<string, string> = {
+  serif: 'Georgia, "Times New Roman", serif',
+  rounded: '"Nunito", "Segoe UI Rounded", system-ui, sans-serif',
+  mono: 'ui-monospace, "SF Mono", Menlo, monospace',
+};
+
+/** The ring page style for a profile: its theme's light or dark look and its Site Design accent. */
+export function ringPageStyleFor(profile: { theme?: string; appearance?: { accent?: string; font?: string } }): RingPageStyle {
+  const theme = profile.theme && Object.prototype.hasOwnProperty.call(TEMPLATE_CONFIG, profile.theme) ? profile.theme : 'neo-webring';
+  return {
+    light: TEMPLATE_CONFIG[theme as keyof typeof TEMPLATE_CONFIG].light,
+    accent: profile.appearance?.accent,
+    font: profile.appearance?.font,
+  };
+}
+
 /**
- * A plain, script-free page listing a hosted ring's members, so the ring is browsable without
- * JavaScript and "Random" has somewhere to land when scripts are off.
+ * A hosted ring's public page: banner, description, rules, member cards and how to join. It has
+ * no script (strict CSP), takes its colours from the maintainer's site design, and still works
+ * as a plain member list when styles don't load.
  */
-export function buildRingDirectoryHtml(doc: WebringHubDocument): string {
+export function buildRingDirectoryHtml(doc: WebringHubDocument, style: RingPageStyle = { light: false }): string {
   const closed = doc.status === 'closed';
+  const hexColour = (value: string | undefined) => (value && /^#[0-9a-fA-F]{6}$/.test(value) ? value : '');
+  const accent = hexColour(doc.accent) || hexColour(style.accent) || '#6366f1';
+  const font = RING_PAGE_FONTS[style.font || ''] || 'system-ui, -apple-system, "Segoe UI", Roboto, sans-serif';
+  const httpsImage = (value: string | undefined) => {
+    if (style.preview && value?.startsWith('studio-media://local/')) return value;
+    const url = value ? safeExternalUrl(value) : null;
+    return url && url.startsWith('https://') ? url : null;
+  };
+  const banner = httpsImage(doc.bannerUrl);
   const members = doc.members
     .map((m) => {
       const href = safeExternalUrl(m.siteUrl);
+      if (!href) return '';
       const name = escapeHtml(m.displayName.slice(0, 120));
-      return href
-        ? `<li><a href="${escapeHtml(href)}" rel="noopener">${name}</a> <span>${escapeHtml(new URL(href).host)}</span></li>`
-        : '';
+      const avatar = httpsImage(m.avatarUrl);
+      const initial = escapeHtml((m.displayName.trim().charAt(0) || '?').toUpperCase());
+      return `<li class="member">
+        <a href="${escapeHtml(href)}" rel="noopener">
+          ${avatar ? `<img src="${escapeHtml(avatar)}" alt="" loading="lazy" />` : `<span class="initial" aria-hidden="true">${initial}</span>`}
+          <span class="who"><strong>${name}</strong> <span class="host">${escapeHtml(new URL(href).host)}</span>${
+            m.tagline ? `<span class="tagline">${escapeHtml(m.tagline.slice(0, 200))}</span>` : ''
+          }</span>
+        </a>
+      </li>`;
     })
     .join('\n      ');
   const joinLink = `webring://interact?action=join-ring&targetUrl=${encodeURIComponent(doc.hubUrl)}&title=${encodeURIComponent(doc.name)}`;
   const maintainer = safeExternalUrl(doc.maintainerUrl);
+  const pageUrl = doc.directoryUrl ? safeExternalUrl(doc.directoryUrl) : null;
+  const palette = style.light
+    ? '--bg: #f8fafc; --fg: #1e293b; --muted: #64748b; --card: #ffffff; --line: #e2e8f0;'
+    : '--bg: #0f172a; --fg: #e2e8f0; --muted: #94a3b8; --card: #1e293b; --line: #334155;';
   return `<!doctype html>
 <html lang="en">
 <head>
   <meta charset="utf-8" />
   <meta name="viewport" content="width=device-width, initial-scale=1" />
-  <meta http-equiv="Content-Security-Policy" content="default-src 'none'; style-src 'unsafe-inline'; img-src 'self' https: data:;" />
+  <meta http-equiv="Content-Security-Policy" content="default-src 'none'; style-src 'unsafe-inline'; img-src 'self' https: data:${style.preview ? ' studio-media:' : ''};" />${
+    style.preview ? '\n  <base target="_blank" />' : ''
+  }
   <title>${escapeHtml(doc.name)} · Webring</title>
+  <meta name="description" content="${escapeHtml(doc.tagline || doc.description)}" />
+  <meta property="og:title" content="${escapeHtml(doc.name)}" />
+  <meta property="og:description" content="${escapeHtml(doc.tagline || doc.description)}" />${
+    banner ? `\n  <meta property="og:image" content="${escapeHtml(banner)}" />` : ''
+  }${pageUrl ? `\n  <link rel="canonical" href="${escapeHtml(pageUrl)}" />` : ''}
+  <link rel="alternate" type="application/json" href="${escapeHtml(doc.hubUrl)}" title="Ring hub" />
   <style>
-    body { font-family: system-ui, sans-serif; max-width: 42rem; margin: 2rem auto; padding: 0 1rem; line-height: 1.5; color: #1e293b; background: #f8fafc; }
-    @media (prefers-color-scheme: dark) { body { color: #e2e8f0; background: #0f172a; } a { color: #a5b4fc; } }
-    li { margin: 0.35rem 0; } li span { opacity: 0.6; font-size: 0.85em; }
-    .note { opacity: 0.75; font-size: 0.9em; }
+    :root { ${palette} --accent: ${accent}; color-scheme: ${style.light ? 'light' : 'dark'}; }
+    * { box-sizing: border-box; }
+    body { font-family: ${font}; margin: 0; line-height: 1.55; color: var(--fg); background: var(--bg); }
+    main { max-width: 46rem; margin: 0 auto; padding: 0 1rem 3rem; }
+    a { color: var(--accent); }
+    .banner { width: 100%; max-height: 16rem; object-fit: cover; display: block; border-radius: 0 0 1rem 1rem; }
+    header { padding: 2rem 0 1rem; }
+    .kicker { display: inline-block; font-size: 0.7rem; font-weight: 700; letter-spacing: 0.08em; padding: 0.15rem 0.6rem; border-radius: 999px; background: color-mix(in srgb, var(--accent) 18%, transparent); color: var(--accent); }
+    h1 { margin: 0.5rem 0 0.25rem; font-size: 2rem; line-height: 1.2; }
+    .lead { font-size: 1.1rem; margin: 0.25rem 0; }
+    .muted, .host { color: var(--muted); font-size: 0.9em; }
+    section { margin-top: 2rem; }
+    h2 { font-size: 1.15rem; border-bottom: 1px solid var(--line); padding-bottom: 0.35rem; }
+    .rules { background: var(--card); border: 1px solid var(--line); border-radius: 0.75rem; padding: 0.25rem 1rem; }
+    .members { list-style: none; padding: 0; display: grid; grid-template-columns: repeat(auto-fill, minmax(14rem, 1fr)); gap: 0.75rem; }
+    .member a { display: flex; gap: 0.75rem; align-items: center; padding: 0.75rem; border-radius: 0.75rem; background: var(--card); border: 1px solid var(--line); color: inherit; text-decoration: none; height: 100%; }
+    .member a:hover { border-color: var(--accent); }
+    .member img, .member .initial { width: 2.75rem; height: 2.75rem; border-radius: 999px; object-fit: cover; flex-shrink: 0; }
+    .member .initial { display: flex; align-items: center; justify-content: center; font-weight: 800; background: var(--accent); color: #fff; }
+    .who { display: flex; flex-direction: column; min-width: 0; }
+    .who .host, .who .tagline { overflow: hidden; text-overflow: ellipsis; white-space: nowrap; }
+    .tagline { font-size: 0.85em; }
+    .join { background: var(--card); border: 1px solid var(--line); border-radius: 0.75rem; padding: 1rem; }
+    .button { display: inline-block; padding: 0.5rem 1rem; border-radius: 0.5rem; background: var(--accent); color: #fff; font-weight: 600; text-decoration: none; }
+    code { word-break: break-all; font-size: 0.85em; }
+    footer { margin-top: 3rem; font-size: 0.85em; color: var(--muted); }
   </style>
 </head>
 <body>
-  <h1>${escapeHtml(doc.name)}</h1>
-  <p>${escapeHtml(doc.description)}</p>
+  ${banner ? `<img class="banner" src="${escapeHtml(banner)}" alt="" />` : ''}
+  <main>
+    <header>
+      <span class="kicker">WEBRING</span>
+      <h1>${escapeHtml(doc.name)}</h1>
+      ${doc.tagline ? `<p class="lead">${escapeHtml(doc.tagline)}</p>` : ''}
+      ${doc.description ? `<p>${escapeHtml(doc.description)}</p>` : ''}
+      ${maintainer ? `<p class="muted">Maintained by <a href="${escapeHtml(maintainer)}" rel="noopener">${escapeHtml(new URL(maintainer).host)}</a></p>` : ''}
+    </header>
   ${
     closed
       ? '<p><strong>This ring has closed.</strong></p>'
-      : `<h2>Members (${doc.members.length})</h2>
-  <ol>
+      : `${doc.rules?.trim() ? `<section>
+    <h2>Ring rules</h2>
+    <div class="rules">${renderMarkdown(doc.rules)}</div>
+  </section>
+  ` : ''}<section>
+    <h2>Members (${doc.members.length})</h2>
+    <ul class="members">
       ${members}
-  </ol>
-  <h2>Join this ring</h2>
-  <p>Membership is curated${maintainer ? ` by <a href="${escapeHtml(maintainer)}" rel="noopener">the maintainer</a>` : ''}. In Webring Studio, <a href="${escapeHtml(joinLink)}">open this ring</a> (or paste the hub address below into Friends &amp; Webrings → Join a ring), then send the maintainer the request link Studio gives you.</p>
-  <p class="note">Hub: <code>${escapeHtml(doc.hubUrl)}</code></p>`
+    </ul>
+  </section>
+  <section>
+    <h2>Join this ring</h2>
+    <div class="join">
+      <p>Membership is curated${maintainer ? ` by <a href="${escapeHtml(maintainer)}" rel="noopener">the maintainer</a>` : ''}. With Webring Studio:</p>
+      <ol>
+        <li><a class="button" href="${escapeHtml(joinLink)}">Open this ring in Webring Studio</a>, or paste this page's address into Friends &amp; Webrings → Join a ring.</li>
+        <li>Send the maintainer the request link Studio gives you.</li>
+        <li>Once they approve and publish, Sync All adds the ring bar to your site.</li>
+      </ol>
+      <p class="muted">Hub: <code>${escapeHtml(doc.hubUrl)}</code></p>
+    </div>
+  </section>`
   }
+    <footer>A static webring page made with Webring Studio. No tracking, no scripts.</footer>
+  </main>
 </body>
 </html>
 `;
+}
+
+/** Published beside a ring page so Studio can join from the page's address. */
+export function ringPagePointer(doc: WebringHubDocument): { type: 'webring-ring-page'; name: string; hubUrl: string } {
+  return { type: 'webring-ring-page', name: doc.name, hubUrl: doc.hubUrl };
 }
