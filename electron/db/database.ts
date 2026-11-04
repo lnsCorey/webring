@@ -25,8 +25,10 @@ import {
   FriendVisibility,
   generateIdentityKeyPair,
   isValidAdSlotId,
+  isUrlWithinSite,
   isValidGa4MeasurementId,
   ItemsDocument,
+  normalizeRingPagePath,
   computeRingNeighbors,
   documentFingerprint,
   ModerationAction,
@@ -108,6 +110,28 @@ function readDesign(row: Record<string, unknown>): { appearance?: Appearance; la
     ...(Object.keys(appearance).some((k) => appearance[k as keyof Appearance] !== undefined) ? { appearance } : {}),
     ...(Array.isArray(layoutRaw) ? { layout: parseLayout(layoutRaw) } : {}),
   };
+}
+
+/** Only the fields that have a value, so empty ones stay out of signed documents. */
+function optionalText<T extends Record<string, string | undefined>>(fields: T): Partial<T> {
+  return Object.fromEntries(Object.entries(fields).filter(([, value]) => value)) as Partial<T>;
+}
+
+/** A Media Library path (media/…) as an absolute URL on the site; https URLs pass through. */
+function absoluteOnSite(url: string | undefined, siteUrl: string): string {
+  const value = (url || '').trim();
+  if (/^https:\/\//i.test(value)) return value;
+  return value.startsWith('media/') ? `${siteUrl}/${value}` : '';
+}
+
+/** Reads a joined ring's stored rotation; anything that isn't a list of strings becomes empty. */
+function parseRotationUrls(value: unknown): string[] {
+  try {
+    const parsed = JSON.parse(String(value || '[]'));
+    return Array.isArray(parsed) ? parsed.filter((url): url is string => typeof url === 'string') : [];
+  } catch {
+    return [];
+  }
 }
 
 export function albumManifestPath(albumId: string): string {
@@ -196,6 +220,8 @@ export interface JoinedRing {
   nextSiteUrl?: string;
   memberCount: number;
   directoryUrl?: string;
+  /** The other sites in rotation at the last sync, for Random when the hub can't be read. */
+  rotationUrls: string[];
   hubVerified: boolean;
   hubUpdatedAt?: string;
   lastSyncedAt?: string;
@@ -215,6 +241,9 @@ export interface HostedRingMember {
   lastVerifiedAt?: string;
   failCount: number;
   hidden: boolean;
+  /** From the member's verified profile.json, for the ring page. */
+  avatarUrl: string;
+  tagline: string;
 }
 
 export interface HostedRingBan {
@@ -237,6 +266,11 @@ export interface HostedRing {
   directoryUrl: string;
   maintainerIsMember: boolean;
   status: 'active' | 'closed';
+  /** Ring page design. `rules` is Markdown; `bannerUrl` is a Media Library path or https URL. */
+  tagline: string;
+  rules: string;
+  bannerUrl: string;
+  accent: string;
   createdAt: string;
   updatedAt: string;
   members: HostedRingMember[];
@@ -959,11 +993,31 @@ export class StudioDatabase {
     addRingColumn('maintainer_did', "TEXT NOT NULL DEFAULT ''");
     addRingColumn('member_count', 'INTEGER NOT NULL DEFAULT 0');
     addRingColumn('directory_url', "TEXT NOT NULL DEFAULT ''");
+    addRingColumn('rotation_urls', "TEXT NOT NULL DEFAULT '[]'");
     addRingColumn('hub_verified', 'INTEGER NOT NULL DEFAULT 0');
     addRingColumn('hub_updated_at', 'TEXT');
     addRingColumn('last_synced_at', 'TEXT');
     addRingColumn('request_token', "TEXT NOT NULL DEFAULT ''");
     addRingColumn('sync_warning', "TEXT NOT NULL DEFAULT ''");
+
+    // Hosted ring pages: a chosen address ('' = rings/<slug>/) and their design
+    const addColumns = (table: string, columns: Array<[string, string]>) => {
+      const existing = this.db.prepare(`PRAGMA table_info(${table})`).all() as Array<{ name: string }>;
+      for (const [name, ddl] of columns) {
+        if (!existing.some((c) => c.name === name)) this.db.exec(`ALTER TABLE ${table} ADD COLUMN ${name} ${ddl};`);
+      }
+    };
+    addColumns('hosted_rings', [
+      ['directory_path', "TEXT NOT NULL DEFAULT ''"],
+      ['tagline', "TEXT NOT NULL DEFAULT ''"],
+      ['rules', "TEXT NOT NULL DEFAULT ''"],
+      ['banner_url', "TEXT NOT NULL DEFAULT ''"],
+      ['accent', "TEXT NOT NULL DEFAULT ''"],
+    ]);
+    addColumns('ring_members', [
+      ['avatar_url', "TEXT NOT NULL DEFAULT ''"],
+      ['tagline', "TEXT NOT NULL DEFAULT ''"],
+    ]);
 
     // Site Design: look & feel options and the page's content blocks (JSON; empty = defaults)
     const profileColumns = this.db.prepare('PRAGMA table_info(profile)').all() as Array<{ name: string }>;
@@ -1648,6 +1702,7 @@ export class StudioDatabase {
       ...(this.db.prepare("SELECT cover_url AS u FROM albums WHERE cover_url LIKE 'media/%'").all() as Array<{ u: string }>),
       ...(this.db.prepare("SELECT avatar_url AS u FROM profile WHERE avatar_url LIKE 'media/%'").all() as Array<{ u: string }>),
       ...(this.db.prepare("SELECT banner_url AS u FROM profile WHERE banner_url LIKE 'media/%'").all() as Array<{ u: string }>),
+      ...(this.db.prepare("SELECT banner_url AS u FROM hosted_rings WHERE banner_url LIKE 'media/%'").all() as Array<{ u: string }>),
     ];
     for (const { u } of others) urls.add(u);
     return { urls, originals };
@@ -2366,6 +2421,7 @@ export class StudioDatabase {
         joinedAt: r.joinedAt,
         ...(r.memberCount ? { memberCount: r.memberCount } : {}),
         ...(r.directoryUrl ? { directoryUrl: r.directoryUrl } : {}),
+        ...(r.rotationUrls.length ? { rotationUrls: r.rotationUrls } : {}),
       }));
     const mySiteUrl = normalizeSiteUrl(this.getProfile().siteUrl);
     const hosted: WebringMembership[] = this.getHostedRings()
@@ -2383,6 +2439,7 @@ export class StudioDatabase {
           joinedAt: ring.createdAt,
           memberCount: neighbors.memberCount,
           directoryUrl: ring.directoryUrl,
+          ...(neighbors.rotationUrls.length ? { rotationUrls: neighbors.rotationUrls } : {}),
         };
       });
     return [...hosted, ...joined];
@@ -2404,6 +2461,7 @@ export class StudioDatabase {
       nextSiteUrl: r.next_site_url ? String(r.next_site_url) : undefined,
       memberCount: Number(r.member_count || 0),
       directoryUrl: r.directory_url ? String(r.directory_url) : undefined,
+      rotationUrls: parseRotationUrls(r.rotation_urls),
       hubVerified: Boolean(r.hub_verified),
       hubUpdatedAt: r.hub_updated_at ? String(r.hub_updated_at) : undefined,
       lastSyncedAt: r.last_synced_at ? String(r.last_synced_at) : undefined,
@@ -2428,6 +2486,7 @@ export class StudioDatabase {
     nextSiteUrl?: string | null;
     memberCount?: number;
     directoryUrl?: string;
+    rotationUrls?: string[];
     hubVerified?: boolean;
     hubUpdatedAt?: string;
     lastSyncedAt?: string;
@@ -2461,6 +2520,7 @@ export class StudioDatabase {
       ['next_site_url', input.nextSiteUrl === null ? '' : input.nextSiteUrl],
       ['member_count', input.memberCount],
       ['directory_url', input.directoryUrl],
+      ['rotation_urls', input.rotationUrls === undefined ? undefined : JSON.stringify(input.rotationUrls)],
       ['hub_verified', input.hubVerified === undefined ? undefined : input.hubVerified ? 1 : 0],
       ['hub_updated_at', input.hubUpdatedAt],
       ['last_synced_at', input.lastSyncedAt],
@@ -2563,7 +2623,7 @@ export class StudioDatabase {
       const id = String(r.id);
       const slug = String(r.slug);
       const hubPath = String(r.hub_path);
-      const directoryPath = `rings/${slug}/index.html`;
+      const directoryPath = String(r.directory_path || '') || `rings/${slug}/index.html`;
       const members = (
         this.db
           .prepare('SELECT * FROM ring_members WHERE ring_id = ? ORDER BY position ASC, joined_at ASC')
@@ -2579,6 +2639,8 @@ export class StudioDatabase {
         lastVerifiedAt: m.last_verified_at ? String(m.last_verified_at) : undefined,
         failCount: Number(m.fail_count || 0),
         hidden: Boolean(m.hidden),
+        avatarUrl: String(m.avatar_url || ''),
+        tagline: String(m.tagline || ''),
       }));
       const bans = (
         this.db
@@ -2602,6 +2664,10 @@ export class StudioDatabase {
         directoryUrl: `${siteUrl}/${directoryPath.replace(/index\.html$/, '')}`,
         maintainerIsMember: Boolean(r.maintainer_is_member),
         status: r.status === 'closed' ? 'closed' : 'active',
+        tagline: String(r.tagline || ''),
+        rules: String(r.rules || ''),
+        bannerUrl: String(r.banner_url || ''),
+        accent: String(r.accent || ''),
         createdAt: String(r.created_at),
         updatedAt: String(r.updated_at),
         members,
@@ -2616,7 +2682,12 @@ export class StudioDatabase {
     return ring;
   }
 
-  public createHostedRing(input: { name: string; description?: string; hubPath?: string }): HostedRing {
+  public createHostedRing(input: {
+    name: string;
+    description?: string;
+    hubPath?: string;
+    directoryPath?: string;
+  }): HostedRing {
     const base =
       input.name
         .toLowerCase()
@@ -2627,35 +2698,105 @@ export class StudioDatabase {
     for (let n = 2; this.db.prepare('SELECT 1 FROM hosted_rings WHERE slug = ?').get(slug); n++) {
       slug = `${base}-${n}`;
     }
+    const directoryPath = input.directoryPath ? this.checkRingPagePath(input.directoryPath) : '';
     const id = `hosted-${crypto.randomBytes(4).toString('hex')}`;
     const now = new Date().toISOString();
     this.db
       .prepare(
-        `INSERT INTO hosted_rings (id, slug, name, description, hub_path, maintainer_is_member, status, created_at, updated_at)
-         VALUES (?, ?, ?, ?, ?, 1, 'active', ?, ?)`
+        `INSERT INTO hosted_rings (id, slug, name, description, hub_path, directory_path, maintainer_is_member, status, created_at, updated_at)
+         VALUES (?, ?, ?, ?, ?, ?, 1, 'active', ?, ?)`
       )
-      .run(id, slug, input.name.trim(), input.description?.trim() || '', input.hubPath || `api/rings/${slug}.json`, now, now);
+      .run(
+        id,
+        slug,
+        input.name.trim(),
+        input.description?.trim() || '',
+        input.hubPath || `api/rings/${slug}.json`,
+        directoryPath,
+        now,
+        now
+      );
     return this.getHostedRing(id);
+  }
+
+  /** A usable ring page path that no other hosted ring already has. */
+  private checkRingPagePath(input: string, ringId?: string): string {
+    const directoryPath = normalizeRingPagePath(input);
+    const taken = this.getHostedRings().find((r) => r.id !== ringId && r.directoryPath === directoryPath);
+    if (taken) throw new Error(`"${taken.name}" already uses /${directoryPath.replace(/\/index\.html$/, '')}.`);
+    return directoryPath;
   }
 
   public updateHostedRing(
     ringId: string,
-    updates: { name?: string; description?: string; maintainerIsMember?: boolean; status?: 'active' | 'closed' }
+    updates: {
+      name?: string;
+      description?: string;
+      maintainerIsMember?: boolean;
+      status?: 'active' | 'closed';
+      directoryPath?: string;
+      tagline?: string;
+      rules?: string;
+      bannerUrl?: string;
+      accent?: string;
+    }
   ): HostedRing {
     const current = this.getHostedRing(ringId);
+    const accent = updates.accent?.trim();
+    if (accent && !/^#[0-9a-f]{6}$/i.test(accent)) {
+      throw new Error('The accent colour must be a hex colour, such as #6366f1.');
+    }
+    const bannerUrl = updates.bannerUrl?.trim();
+    if (bannerUrl && !bannerUrl.startsWith('media/') && !/^https:\/\//i.test(bannerUrl)) {
+      throw new Error('The banner must be a Media Library image or an https:// address.');
+    }
     this.db
       .prepare(
-        'UPDATE hosted_rings SET name = ?, description = ?, maintainer_is_member = ?, status = ? WHERE id = ?'
+        `UPDATE hosted_rings SET name = ?, description = ?, maintainer_is_member = ?, status = ?,
+           directory_path = ?, tagline = ?, rules = ?, banner_url = ?, accent = ? WHERE id = ?`
       )
       .run(
         updates.name?.trim() || current.name,
         updates.description ?? current.description,
         (updates.maintainerIsMember ?? current.maintainerIsMember) ? 1 : 0,
         updates.status ?? current.status,
+        updates.directoryPath === undefined ? current.directoryPath : this.checkRingPagePath(updates.directoryPath, ringId),
+        (updates.tagline ?? current.tagline).trim().slice(0, 200),
+        (updates.rules ?? current.rules).slice(0, 10000),
+        bannerUrl ?? current.bannerUrl,
+        accent ?? current.accent,
         ringId
       );
     this.touchHostedRing(ringId);
     return this.getHostedRing(ringId);
+  }
+
+  /**
+   * Turns a pre-redesign ring entry that points at this persona's own site into a ring it hosts,
+   * with its page at the old address, so links people already have start working once published.
+   */
+  public hostLegacyRing(joinedRingId: string): HostedRing {
+    const legacy = this.getJoinedRings().find((r) => r.id === joinedRingId);
+    if (!legacy || legacy.status !== 'legacy') {
+      throw new Error('Only older ring entries can be converted.');
+    }
+    const siteUrl = normalizeSiteUrl(this.getProfile().siteUrl);
+    if (!isUrlWithinSite(legacy.hubUrl, siteUrl)) {
+      throw new Error(`${legacy.hubUrl} isn't on your site (${siteUrl}), so it can't be hosted here.`);
+    }
+    // The old address becomes the ring page, unless it pointed at a JSON file
+    const sitePath = new URL(siteUrl).pathname.replace(/\/+$/, '');
+    const pagePath = new URL(legacy.hubUrl).pathname.slice(sitePath.length);
+    let ring!: HostedRing;
+    this.transaction(() => {
+      ring = this.createHostedRing({
+        name: legacy.name,
+        description: legacy.description,
+        ...(/\.json$/i.test(pagePath) ? {} : { directoryPath: pagePath }),
+      });
+      this.deleteWebring(legacy.id);
+    });
+    return ring;
   }
 
   private touchHostedRing(ringId: string): void {
@@ -2775,7 +2916,9 @@ export class StudioDatabase {
   public recordRingMemberCheck(
     ringId: string,
     siteUrl: string,
-    result: { ok: true; listsRing: boolean; displayName?: string } | { ok: false }
+    result:
+      | { ok: true; listsRing: boolean; displayName?: string; avatarUrl?: string; tagline?: string }
+      | { ok: false }
   ): void {
     const normalized = normalizeSiteUrl(siteUrl);
     const now = new Date().toISOString();
@@ -2789,10 +2932,20 @@ export class StudioDatabase {
       .prepare(
         `UPDATE ring_members SET fail_count = 0, last_verified_at = ?,
            confirmed_at = CASE WHEN ? THEN COALESCE(confirmed_at, ?) ELSE confirmed_at END,
-           display_name = COALESCE(?, display_name)
+           display_name = COALESCE(?, display_name),
+           avatar_url = COALESCE(?, avatar_url), tagline = COALESCE(?, tagline)
          WHERE ring_id = ? AND site_url = ?`
       )
-      .run(now, result.listsRing ? 1 : 0, now, result.displayName?.slice(0, 120) ?? null, ringId, normalized);
+      .run(
+        now,
+        result.listsRing ? 1 : 0,
+        now,
+        result.displayName?.slice(0, 120) ?? null,
+        result.avatarUrl?.slice(0, 2000) ?? null,
+        result.tagline?.slice(0, 200) ?? null,
+        ringId,
+        normalized
+      );
   }
 
   /**
@@ -2809,6 +2962,10 @@ export class StudioDatabase {
             displayName: profile.displayName,
             did: siteUrlToDidWeb(profile.siteUrl),
             joinedAt: ring.createdAt,
+            ...optionalText({
+              avatarUrl: absoluteOnSite(profile.avatarUrl, normalizeSiteUrl(profile.siteUrl)),
+              tagline: profile.tagline,
+            }),
           },
         ]
       : [];
@@ -2822,6 +2979,7 @@ export class StudioDatabase {
           did: m.did || undefined,
           joinedAt: m.joinedAt,
           ...(m.hidden ? { inRotation: false } : {}),
+          ...optionalText({ avatarUrl: m.avatarUrl, tagline: m.tagline }),
         })),
     ];
   }
@@ -2847,6 +3005,12 @@ export class StudioDatabase {
         maintainerDid: did,
         status: ring.status,
         directoryUrl: ring.directoryUrl,
+        ...optionalText({
+          tagline: ring.tagline,
+          rules: ring.rules,
+          bannerUrl: absoluteOnSite(ring.bannerUrl, siteUrl),
+          accent: ring.accent,
+        }),
         updatedAt: ring.updatedAt,
         members: this.hubMembersFor(ring),
       };

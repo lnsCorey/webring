@@ -233,9 +233,9 @@ export function renderTemplatePage(ctx: any): string {
   const link = ctx.buildDeepLink;
   const profile = ctx.profile;
   const shell: string = ctx.shell;
-  const ASIDE_TYPES = ['friends', 'contact', 'links', 'guestbook'];
+  const ASIDE_TYPES = ['friends', 'rings', 'contact', 'links', 'guestbook'];
   const TYPE_LABELS: Record<string, string> = { post: 'Post', like: 'Liked', share: 'Shared', recommendation: 'Recommends', comment: 'Comment' };
-  const BLOCK_TABS: Record<string, string> = { albums: 'Photos', items: 'Posts', friends: 'Friends', text: 'About', image: 'Image', links: 'Links', featured: 'Featured', contact: 'Contact', guestbook: 'Guestbook' };
+  const BLOCK_TABS: Record<string, string> = { albums: 'Photos', items: 'Posts', friends: 'Friends', text: 'About', image: 'Image', links: 'Links', featured: 'Featured', contact: 'Contact', guestbook: 'Guestbook', rings: 'Webrings' };
 
   let host = '';
   try {

@@ -251,6 +251,8 @@ export const LayoutBlockSchema = z.discriminatedUnion('type', [
     options: z.object({ entries: z.array(LinkEntrySchema).max(20).default([]) }).default({ entries: [] }),
   }),
   z.object({ ...blockBase, type: z.literal('guestbook'), options: z.object({}).default({}) }),
+  // Webrings this site is in, linking to each ring's page
+  z.object({ ...blockBase, type: z.literal('rings'), options: z.object({}).default({}) }),
 ]);
 export type LayoutBlock = z.infer<typeof LayoutBlockSchema>;
 export type LayoutBlockType = LayoutBlock['type'];
@@ -521,6 +523,8 @@ export const WebringMembershipSchema = z.object({
   // v2: lets the site render small rings sensibly and link Random to the ring directory
   memberCount: z.number().optional(),
   directoryUrl: z.string().optional(),
+  // v3: the other sites in rotation, so Random still lands on a member when the hub can't be read
+  rotationUrls: z.array(z.string()).optional(),
 });
 export type WebringMembership = z.infer<typeof WebringMembershipSchema>;
 
@@ -572,12 +576,20 @@ export const WebringHubDocumentSchema = z.object({
       joinedAt: z.string(),
       // v2: false = still a member, but skipped by Prev / Next / Random
       inRotation: z.boolean().optional(),
+      // v3: copied from the member's verified profile.json, for the ring page's member cards
+      avatarUrl: z.string().optional(),
+      tagline: z.string().optional(),
     })
   ),
   // v2 fields (v1 hubs omit them; v1 readers ignore them)
   maintainerDid: z.string().optional(),
   status: z.enum(['active', 'closed']).optional(),
   directoryUrl: z.string().optional(),
+  // v3: how the ring page looks (rules are Markdown); older readers ignore them
+  tagline: z.string().optional(),
+  rules: z.string().optional(),
+  bannerUrl: z.string().optional(),
+  accent: z.string().optional(),
   proof: SignatureProofSchema.optional(),
 });
 export type WebringHubDocument = z.infer<typeof WebringHubDocumentSchema>;
@@ -683,19 +695,27 @@ export function parseFriendNoticeUri(uriOrToken: string): string | null {
 export function computeRingNeighbors(
   members: Array<{ siteUrl: string; inRotation?: boolean }>,
   siteUrl: string
-): { isMember: boolean; prevSiteUrl?: string; nextSiteUrl?: string; memberCount: number } {
+): {
+  isMember: boolean;
+  prevSiteUrl?: string;
+  nextSiteUrl?: string;
+  rotationUrls: string[];
+  memberCount: number;
+} {
   const me = normalizeSiteUrl(siteUrl);
   const all = members.map((m) => ({ ...m, siteUrl: normalizeSiteUrl(m.siteUrl) }));
   const isMember = all.some((m) => m.siteUrl === me);
   const rotation = all.filter((m) => m.inRotation !== false || m.siteUrl === me);
   if (!isMember || rotation.length < 2) {
-    return { isMember, memberCount: all.length };
+    return { isMember, rotationUrls: [], memberCount: all.length };
   }
   const idx = rotation.findIndex((m) => m.siteUrl === me);
+  const rotationUrls = [...new Set(rotation.map((m) => m.siteUrl).filter((url) => url !== me))];
   return {
     isMember,
     prevSiteUrl: rotation[(idx - 1 + rotation.length) % rotation.length].siteUrl,
     nextSiteUrl: rotation[(idx + 1) % rotation.length].siteUrl,
+    rotationUrls,
     memberCount: all.length,
   };
 }
@@ -780,6 +800,32 @@ export function normalizeSiteUrl(rawUrl: string): string {
  * True when `url` lives under `siteUrl` (same origin and path prefix), e.g. a friend's
  * canonical item URL must sit on that friend's own site so it can't overwrite another peer's rows.
  */
+/** Top-level folders the generator writes itself; a ring page can't live inside them. */
+const RESERVED_RING_PAGE_ROOTS = new Set(['api', 'media', 'albums', '.well-known', 'did.json', 'index.html']);
+
+/**
+ * A ring page address on the maintainer's site ("/webring", "webring/" or "webring/index.html")
+ * as the file the generator writes ("webring/index.html"). Throws for paths it can't use.
+ */
+export function normalizeRingPagePath(input: string): string {
+  const segments = input
+    .trim()
+    .toLowerCase()
+    .replace(/\/index\.html$/, '')
+    .split('/')
+    .filter(Boolean);
+  if (segments.length === 0) {
+    throw new Error('Choose a page address, such as /webring.');
+  }
+  if (segments.some((segment) => !/^[a-z0-9][a-z0-9-]*$/.test(segment))) {
+    throw new Error('Page addresses can only use letters, numbers and dashes, such as /webring or /rings/photo-ring.');
+  }
+  if (RESERVED_RING_PAGE_ROOTS.has(segments[0])) {
+    throw new Error(`/${segments[0]} is used by the rest of your site. Choose another address.`);
+  }
+  return `${segments.join('/')}/index.html`;
+}
+
 export function isUrlWithinSite(url: string, siteUrl: string): boolean {
   try {
     const target = new URL(url);

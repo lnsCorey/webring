@@ -760,6 +760,14 @@ function registerIpcHandlers() {
     return personaManager.getActiveContext().db.updateHostedRing(ringId, updates);
   });
 
+  ipcMain.handle('studio:host-legacy-ring', (_e, joinedRingId: string) => {
+    return personaManager.getActiveContext().db.hostLegacyRing(joinedRingId);
+  });
+
+  ipcMain.handle('studio:hosted-ring-preview', (_e, ringId: string) => {
+    return personaManager.getActiveContext().siteGenerator.buildRingPagePreviewHtml(ringId);
+  });
+
   ipcMain.handle(
     'studio:hosted-ring-member',
     (
