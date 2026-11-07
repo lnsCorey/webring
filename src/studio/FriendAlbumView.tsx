@@ -1,5 +1,5 @@
-import React, { useState } from 'react';
-import { ArrowLeft, ExternalLink, Heart, MessageSquare, Repeat2, X } from 'lucide-react';
+import React, { useEffect, useRef, useState } from 'react';
+import { ArrowLeft, ExternalLink, Heart, Maximize2, MessageSquare, Minimize2, Repeat2, X } from 'lucide-react';
 import type { WebringDeepLinkAction } from '../shared/schema';
 import { renderMarkdown } from '../shared/markdown';
 
@@ -37,9 +37,26 @@ export function FriendAlbumView(props: {
   onAction(action: WebringDeepLinkAction): void;
   onToggleSave(entry: Entry): void;
   onOpenSite(url: string): void;
+  /** Opens a photo by itself, outside Studio (a browser tab, or the image viewer for local files). */
+  onOpenImage(url: string): void;
 }): JSX.Element {
   const { album, photos, savedUrls } = props;
   const [enlarged, setEnlarged] = useState<Entry | null>(null);
+  const viewerRef = useRef<HTMLDivElement>(null);
+  const [fullscreen, setFullscreen] = useState(false);
+  useEffect(() => {
+    const onChange = () => setFullscreen(!!document.fullscreenElement);
+    document.addEventListener('fullscreenchange', onChange);
+    return () => document.removeEventListener('fullscreenchange', onChange);
+  }, []);
+  const toggleFullscreen = () => {
+    if (document.fullscreenElement) void document.exitFullscreen().catch(() => undefined);
+    else void viewerRef.current?.requestFullscreen().catch(() => undefined);
+  };
+  const closeEnlarged = () => {
+    if (document.fullscreenElement) void document.exitFullscreen().catch(() => undefined);
+    setEnlarged(null);
+  };
   const count = photos.length || album.photoCount || 0;
 
   const actions = (entry: Entry, small = false) => {
@@ -153,23 +170,54 @@ export function FriendAlbumView(props: {
 
       {enlarged && (
         <div
-          className="fixed inset-0 z-50 bg-black/80 flex items-center justify-center p-6"
-          onClick={() => setEnlarged(null)}
+          ref={viewerRef}
+          className={`fixed inset-0 z-50 flex items-center justify-center ${fullscreen ? 'bg-black p-3' : 'bg-black/80 p-4'}`}
+          onClick={closeEnlarged}
         >
-          <div className="max-w-4xl max-h-full space-y-3" onClick={(e) => e.stopPropagation()}>
-            <div className="flex justify-end">
+          <div className="flex flex-col items-center w-full h-full gap-3 min-h-0">
+            <div className="w-full flex justify-end gap-2" onClick={(e) => e.stopPropagation()}>
               <button
                 type="button"
-                onClick={() => setEnlarged(null)}
+                onClick={() => props.onOpenImage(enlarged.mediaUrl)}
+                className="p-1.5 rounded-full bg-slate-800 hover:bg-slate-700"
+                aria-label="Open in new window"
+                title="Open in new window"
+              >
+                <ExternalLink className="w-4 h-4" />
+              </button>
+              <button
+                type="button"
+                onClick={toggleFullscreen}
+                className="p-1.5 rounded-full bg-slate-800 hover:bg-slate-700"
+                aria-label={fullscreen ? 'Exit full screen' : 'Full screen'}
+                title={fullscreen ? 'Exit full screen' : 'Full screen'}
+              >
+                {fullscreen ? <Minimize2 className="w-4 h-4" /> : <Maximize2 className="w-4 h-4" />}
+              </button>
+              <button
+                type="button"
+                onClick={closeEnlarged}
                 className="p-1.5 rounded-full bg-slate-800 hover:bg-slate-700"
                 aria-label="Close"
               >
                 <X className="w-4 h-4" />
               </button>
             </div>
-            <img src={enlarged.mediaUrl} alt={enlarged.title} className="max-w-full max-h-[75vh] object-contain rounded-xl" />
-            {enlarged.title && <p className="text-sm text-slate-200">{enlarged.title}</p>}
-            {actions(enlarged)}
+            {/* The image fills the space the caption and actions leave; clicks beside it close the viewer */}
+            <div className="flex-1 min-h-0 w-full flex items-center justify-center">
+              <img
+                src={enlarged.mediaUrl}
+                alt={enlarged.title}
+                onClick={(e) => e.stopPropagation()}
+                onDoubleClick={toggleFullscreen}
+                title="Double-click for full screen"
+                className={`max-w-full max-h-full object-contain ${fullscreen ? '' : 'rounded-xl'}`}
+              />
+            </div>
+            <div className="space-y-2 flex flex-col items-center" onClick={(e) => e.stopPropagation()}>
+              {enlarged.title && <p className="text-sm text-slate-200">{enlarged.title}</p>}
+              {actions(enlarged)}
+            </div>
           </div>
         </div>
       )}

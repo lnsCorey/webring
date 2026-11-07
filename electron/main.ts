@@ -827,6 +827,17 @@ function registerIpcHandlers() {
     return { ok: true };
   });
 
+  // A Media Library image (studio-media://local/<path> or media/<path>) in the computer's image viewer
+  ipcMain.handle('studio:open-media', async (_e, url: string) => {
+    if (typeof url !== 'string') return { ok: false };
+    const relative = url.startsWith('studio-media:')
+      ? decodeURIComponent(new URL(url).pathname.replace(/^\/+/, '')).replace(/^media\//, '')
+      : url.replace(/^media\//, '');
+    const file = personaManager.getActiveContext().mediaLibrary.resolveLocalUrl(`media/${relative}`);
+    if (!file || !fs.existsSync(file)) return { ok: false };
+    return { ok: (await shell.openPath(file)) === '' };
+  });
+
   // The Publish tab sends its current form; save it, then publish with the saved settings
   const publishWithSettings = (destination: PublishDestination, settings: unknown) =>
     withActiveLock(async () => {

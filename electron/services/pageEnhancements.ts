@@ -1,5 +1,6 @@
 /**
- * Interactive extras for the published page: a photo lightbox, opening a post in a larger view
+ * Interactive extras for the published page: a photo lightbox (with full screen where the browser
+ * allows it), opening a post in a larger view
  * (linkable as #post-<id>, photos as #photo-<id>), sortable tables in text blocks, and a short
  * explanation before a webring:// link hands over to Webring Studio.
  *
@@ -79,8 +80,32 @@ export function installPageEnhancements(ctx: any): { addItems: (items: any[]) =>
     const close = dialog.querySelector('[data-wr="close"]') as HTMLElement | null;
     if (close) close.focus();
   };
-  const bar = (label: string) =>
-    '<div class="wr-bar"><span>' + label + '</span><button type="button" class="wr-close" data-wr="close" aria-label="Close">✕</button></div>';
+  const bar = (label: string, extra?: string) =>
+    '<div class="wr-bar"><span>' + label + '</span><div class="wr-bar-buttons">' + (extra || '') +
+    '<button type="button" class="wr-close" data-wr="close" aria-label="Close">✕</button></div></div>';
+
+  // Full screen shows the photo as large as the screen allows. A <dialog> can't go full screen
+  // itself, so the lightbox inside it does; browsers without element full screen (iPhone) get no button.
+  const canFullscreen = !!doc.fullscreenEnabled;
+  const fullscreenLightbox = (): any => {
+    const el = doc.fullscreenElement;
+    return el && dialog.contains(el) ? el : null;
+  };
+  const fullscreenIcon = (on: boolean) =>
+    '<svg viewBox="0 0 24 24" width="18" height="18" fill="none" stroke="currentColor" stroke-width="2" stroke-linecap="round" stroke-linejoin="round" aria-hidden="true"><path d="' +
+    (on ? 'M9 4v5H4M15 4v5h5M9 20v-5H4M15 20v-5h5' : 'M4 9V4h5M20 9V4h-5M4 15v5h5M20 15v5h-5') + '"/></svg>';
+  const fullscreenButton = (on: boolean) => {
+    const label = on ? 'Exit full screen' : 'Full screen';
+    return '<button type="button" class="wr-close" data-wr="fullscreen" aria-label="' + label + '" title="' + label + '">' + fullscreenIcon(on) + '</button>';
+  };
+  const toggleFullscreen = () => {
+    if (fullscreenLightbox()) {
+      doc.exitFullscreen().catch(() => undefined);
+      return;
+    }
+    const lightbox = dialog.querySelector('.wr-lightbox') as any;
+    if (canFullscreen && lightbox && lightbox.requestFullscreen) lightbox.requestFullscreen().catch(() => undefined);
+  };
 
   const showPhoto = (photoId: string) => {
     const entry = photoIndex[photoId];
@@ -92,11 +117,12 @@ export function installPageEnhancements(ctx: any): { addItems: (items: any[]) =>
     const many = photos.length > 1;
     const title = photo.caption || album.title;
     dialog.setAttribute('aria-label', 'Photo: ' + title);
-    dialog.innerHTML =
-      '<div class="wr-lightbox">' + bar(esc(album.title) + (many ? ' · ' + (entry.index + 1) + ' / ' + photos.length : '')) +
+    const full = fullscreenLightbox();
+    const content =
+      bar(esc(album.title) + (many ? ' · ' + (entry.index + 1) + ' / ' + photos.length : ''), canFullscreen ? fullscreenButton(!!full) : '') +
       '<div class="wr-stage">' +
       (many ? '<button type="button" class="wr-nav wr-prev" data-wr="prev" aria-label="Previous photo">‹</button>' : '') +
-      '<img src="' + safeUrl(photo.url) + '" alt="' + esc(photo.altText || photo.caption) + '" />' +
+      '<img src="' + safeUrl(photo.url) + '" alt="' + esc(photo.altText || photo.caption) + '"' + (canFullscreen ? ' title="Double-click for full screen"' : '') + ' />' +
       (many ? '<button type="button" class="wr-nav wr-next" data-wr="next" aria-label="Next photo">›</button>' : '') +
       '</div><div class="wr-caption">' +
       (photo.caption ? '<p class="wr-title">' + esc(photo.caption) + '</p>' : '') +
@@ -105,8 +131,11 @@ export function installPageEnhancements(ctx: any): { addItems: (items: any[]) =>
       '<div class="wr-actions">' +
       '<a href="' + link('like', photo.canonicalUrl, title, photo.url, 'photo') + '">♥ Like</a>' +
       '<a href="' + link('share', photo.canonicalUrl, title, photo.url, 'photo') + '">↻ Share</a>' +
-      '<a href="' + safeUrl(photo.url) + '" target="_blank" rel="noopener noreferrer">Open original</a>' +
-      '</div></div></div>';
+      '<a href="' + safeUrl(photo.url) + '" target="_blank" rel="noopener noreferrer" data-wr-full-size>Open full size</a>' +
+      '</div></div>';
+    // Browsing in full screen swaps the photo inside the full-screen lightbox, so it stays full screen
+    if (full) full.innerHTML = content;
+    else dialog.innerHTML = '<div class="wr-lightbox">' + content + '</div>';
     setHash('photo-' + encodeURIComponent(photo.id));
     show();
     return true;
@@ -236,6 +265,7 @@ export function installPageEnhancements(ctx: any): { addItems: (items: any[]) =>
     if (!button) return;
     const action = button.getAttribute('data-wr');
     if (action === 'close') dialog.close();
+    else if (action === 'fullscreen') toggleFullscreen();
     else if (action === 'copy') {
       const field = dialog.querySelector('.wr-sheet-copy input') as HTMLInputElement | null;
       const done = () => {
@@ -263,6 +293,14 @@ export function installPageEnhancements(ctx: any): { addItems: (items: any[]) =>
     if (!current) return;
     if (ev.key === 'ArrowLeft') step(-1);
     else if (ev.key === 'ArrowRight') step(1);
+    else if (ev.key === 'f' && canFullscreen && !ev.metaKey && !ev.ctrlKey && !ev.altKey) toggleFullscreen();
+  });
+  dialog.addEventListener('dblclick', (ev: any) => {
+    if (current && ev.target && ev.target.closest && ev.target.closest('.wr-stage img')) toggleFullscreen();
+  });
+  doc.addEventListener('fullscreenchange', () => {
+    const button = dialog.querySelector('[data-wr="fullscreen"]');
+    if (button) button.outerHTML = fullscreenButton(!!fullscreenLightbox());
   });
   dialog.addEventListener('touchstart', (ev: any) => {
     touchX = ev.touches && ev.touches[0] ? ev.touches[0].clientX : null;
@@ -273,6 +311,7 @@ export function installPageEnhancements(ctx: any): { addItems: (items: any[]) =>
     touchX = null;
   });
   dialog.addEventListener('close', () => {
+    if (fullscreenLightbox()) doc.exitFullscreen().catch(() => undefined);
     current = null;
     dialog.innerHTML = '';
     setHash('');
@@ -308,16 +347,21 @@ export function installPageEnhancements(ctx: any): { addItems: (items: any[]) =>
 
 export const ENHANCEMENTS_CSS = `
     /* Interactive extras (pageEnhancements.ts) */
-    .wr-dialog { padding: 0; border: 0; background: transparent; color: inherit; width: 100%; max-width: min(96vw, 72rem); max-height: 94vh; overflow: visible; }
+    .wr-dialog { padding: 0; border: 0; background: transparent; color: inherit; width: 100%; max-width: 96vw; max-height: 94vh; overflow: visible; }
     .wr-dialog::backdrop { background: rgba(0, 0, 0, 0.82); }
     @media (prefers-reduced-motion: no-preference) { .wr-dialog[open] { animation: wr-in 0.16s ease-out; } }
     @keyframes wr-in { from { opacity: 0; transform: scale(0.98); } to { opacity: 1; transform: none; } }
     .wr-bar { display: flex; align-items: center; justify-content: space-between; gap: 1rem; padding: 0.35rem 0.25rem 0.6rem; color: #f5f5f5; font-size: 0.85rem; font-weight: 600; }
-    .wr-close { width: 2.4rem; height: 2.4rem; border-radius: 9999px; background: rgba(255, 255, 255, 0.16); color: #fff; font-size: 1rem; }
+    .wr-bar-buttons { display: flex; gap: 0.5rem; }
+    .wr-close { display: inline-flex; align-items: center; justify-content: center; width: 2.4rem; height: 2.4rem; border-radius: 9999px; background: rgba(255, 255, 255, 0.16); color: #fff; font-size: 1rem; }
     .wr-close:hover, .wr-nav:hover { background: rgba(255, 255, 255, 0.3); }
     .wr-lightbox { display: flex; flex-direction: column; width: fit-content; max-width: 100%; max-height: 94vh; margin: 0 auto; color: #f5f5f5; }
     .wr-stage { position: relative; display: flex; align-items: center; justify-content: center; min-height: 0; }
-    .wr-stage img { max-width: 100%; max-height: 74vh; object-fit: contain; border-radius: 0.5rem; box-shadow: 0 20px 60px rgba(0, 0, 0, 0.5); }
+    .wr-stage img { max-width: 100%; max-height: max(16rem, calc(100vh - 12rem)); object-fit: contain; border-radius: 0.5rem; box-shadow: 0 20px 60px rgba(0, 0, 0, 0.5); }
+    .wr-lightbox:fullscreen { width: 100%; height: 100%; max-width: none; max-height: none; margin: 0; padding: 0.5rem 1rem 0.75rem; box-sizing: border-box; background: #000; }
+    .wr-lightbox:fullscreen .wr-stage { flex: 1 1 auto; }
+    .wr-lightbox:fullscreen .wr-stage img { max-height: 100%; border-radius: 0; box-shadow: none; }
+    .wr-lightbox:fullscreen .wr-caption { padding-top: 0.5rem; }
     .wr-nav { position: absolute; top: 50%; transform: translateY(-50%); width: 2.8rem; height: 2.8rem; border-radius: 9999px; background: rgba(0, 0, 0, 0.55); color: #fff; font-size: 1.9rem; line-height: 1; }
     .wr-prev { left: 0.5rem; }
     .wr-next { right: 0.5rem; }

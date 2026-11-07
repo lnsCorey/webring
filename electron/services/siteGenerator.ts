@@ -1248,8 +1248,9 @@ const WEBRING_STUDIO_URL = 'https://github.com/lnsCorey/webring';
 
 /**
  * Studio preview only (sandboxed iframe): links never navigate the preview. webring:// actions
- * open the matching form in Studio, album links open the album in Studio's Albums tab, and web
- * links (including a random ring member for Random) open in the browser, via postMessage.
+ * open the matching form in Studio, album links open the album in Studio's Albums tab, web
+ * links (including a random ring member for Random) open in the browser, and Media Library images
+ * open in the image viewer, via postMessage.
  */
 const PREVIEW_BRIDGE = `
   <script>
@@ -1273,6 +1274,8 @@ const PREVIEW_BRIDGE = `
         parent.postMessage({ type: 'webring-preview-album', href: href, albumId: anchor.getAttribute('data-album-link') || '', slug: albumPage ? albumPage[1] : '' }, '*');
       } else if (/^webring:/i.test(href)) parent.postMessage({ type: 'webring-preview-deeplink', href: href }, '*');
       else if (/^https?:/i.test(anchor.href)) parent.postMessage({ type: 'webring-preview-open', href: anchor.href }, '*');
+      // Media Library files ("Open full size") open in the computer's image viewer
+      else if (/^studio-media:/i.test(anchor.href)) parent.postMessage({ type: 'webring-preview-media', href: anchor.href }, '*');
     }, true);
   </script>`;
 
