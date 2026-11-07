@@ -4057,6 +4057,65 @@ describe('Album cards', () => {
     expect(urls).toEqual(['/albums/trips/?x=1#photo-p1', '/albums/trips/?x=1']);
   });
 
+  it('offers full screen in the photo viewer and stays full screen while browsing', () => {
+    const listeners: Record<string, (ev: unknown) => void> = {};
+    const docListeners: Record<string, () => void> = {};
+    const lightbox = { innerHTML: '', requestFullscreen: async () => { doc.fullscreenElement = lightbox; } };
+    const dialog: Record<string, unknown> = {
+      className: '', open: false, innerHTML: '', showModal() { this.open = true; }, close() { this.open = false; },
+      addEventListener: (t: string, f: (ev: unknown) => void) => { listeners[t] = f; },
+      setAttribute: () => undefined, querySelectorAll: () => [],
+      querySelector: (sel: string) => (sel === '.wr-lightbox' ? lightbox : null),
+      contains: (el: unknown) => el === lightbox,
+    };
+    const doc: Record<string, unknown> = {
+      fullscreenEnabled: true,
+      fullscreenElement: null,
+      exitFullscreen: async () => { doc.fullscreenElement = null; },
+      createElement: () => dialog,
+      body: { appendChild: () => undefined },
+      addEventListener: (t: string, f: () => void) => { docListeners[t] = f; },
+    };
+    const root = { querySelectorAll: () => [], addEventListener: () => undefined, querySelector: () => null };
+    const loc = { pathname: '/albums/trips/', search: '', hash: '#photo-p1', protocol: 'https:', href: 'https://alice.ring.test/albums/trips/' };
+    const run = new Function('document', 'history', 'location', 'window', 'HTMLDialogElement', `return ${installPageEnhancements.toString()}`);
+    const install = run(doc, { replaceState: () => undefined }, loc, { addEventListener: () => undefined }, class {});
+    const esc = (v: unknown) => String(v);
+    const photos = [{ id: 'p1', url: 'media/p1.jpg', caption: 'One' }, { id: 'p2', url: 'media/p2.jpg', caption: 'Two' }];
+    install({ root, profile: {}, albums: [{ id: 'a', title: 'Trips', photos }], items: [], esc, safeUrl: esc, buildDeepLink: () => '#', renderItem: () => '' });
+    const opened = String(dialog.innerHTML);
+    expect(opened).toContain('data-wr="fullscreen" aria-label="Full screen"');
+    expect(opened).toContain('>Open full size</a>');
+    expect(opened).not.toContain('Open original');
+    const click = (action: string) =>
+      listeners.click({ target: { closest: (sel: string) => (sel === '[data-wr]' ? { getAttribute: () => action } : null) } });
+    click('fullscreen');
+    expect(doc.fullscreenElement).toBe(lightbox);
+    // Next swaps the photo inside the full-screen lightbox instead of replacing it
+    click('next');
+    expect(lightbox.innerHTML).toContain('media/p2.jpg');
+    expect(lightbox.innerHTML).toContain('aria-label="Exit full screen"');
+    expect(dialog.innerHTML).toBe(opened);
+    click('fullscreen');
+    expect(doc.fullscreenElement).toBeNull();
+  });
+
+  it('leaves out the full screen button where the browser has no element full screen', () => {
+    const dialog: Record<string, unknown> = {
+      className: '', open: false, innerHTML: '', showModal() { this.open = true; }, close() { this.open = false; },
+      addEventListener: () => undefined, setAttribute: () => undefined, querySelector: () => null, querySelectorAll: () => [],
+    };
+    const doc = { createElement: () => dialog, body: { appendChild: () => undefined }, addEventListener: () => undefined };
+    const root = { querySelectorAll: () => [], addEventListener: () => undefined, querySelector: () => null };
+    const loc = { pathname: '/', search: '', hash: '#photo-p1', protocol: 'https:', href: 'https://alice.ring.test/' };
+    const run = new Function('document', 'history', 'location', 'window', 'HTMLDialogElement', `return ${installPageEnhancements.toString()}`);
+    const install = run(doc, { replaceState: () => undefined }, loc, { addEventListener: () => undefined }, class {});
+    const esc = (v: unknown) => String(v);
+    install({ root, profile: {}, albums: [{ id: 'a', title: 'Trips', photos: [{ id: 'p1', url: 'u', caption: 'c' }] }], items: [], esc, safeUrl: esc, buildDeepLink: () => '#', renderItem: () => '' });
+    expect(String(dialog.innerHTML)).toContain('Open full size');
+    expect(String(dialog.innerHTML)).not.toContain('data-wr="fullscreen"');
+  });
+
   it('writes a page for an empty album, without a link preview image', async () => {
     const db = new StudioDatabase(dir, 'a.sqlite');
     db.updateProfile({ siteUrl: 'https://alice.ring.test/', displayName: 'Alice' });

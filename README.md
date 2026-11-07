@@ -50,6 +50,7 @@ There are no packaged releases yet; run Webring Studio from source.
 git clone https://github.com/lnsCorey/webring.git
 cd webring
 npm install
+npm run build  
 npm run dev          # builds the UI and app, then opens Webring Studio (the first run downloads Electron)
 ```
 

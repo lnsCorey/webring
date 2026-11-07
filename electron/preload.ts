@@ -80,6 +80,7 @@ contextBridge.exposeInMainWorld('studioApi', {
   testExportPreview: (openInBrowser?: boolean) =>
     ipcRenderer.invoke('studio:test-export-preview', openInBrowser),
   openExternal: (url: string) => ipcRenderer.invoke('studio:open-external', url),
+  openMedia: (url: string) => ipcRenderer.invoke('studio:open-media', url),
   publishRemote: (settings: unknown) => ipcRenderer.invoke('studio:publish-remote', settings),
   publishGithub: (settings: unknown) => ipcRenderer.invoke('studio:publish-github', settings),
   checkGithubRepo: (settings: unknown) => ipcRenderer.invoke('studio:check-github-repo', settings),

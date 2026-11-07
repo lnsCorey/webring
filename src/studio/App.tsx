@@ -507,6 +507,7 @@ declare global {
       }>;
       testExportPreview: (openInBrowser?: boolean) => Promise<TestExportPreviewState>;
       openExternal: (url: string) => Promise<unknown>;
+      openMedia: (url: string) => Promise<{ ok: boolean }>;
       publishRemote: (settings: unknown) => Promise<{
         success: boolean;
         destination: string;
@@ -984,6 +985,8 @@ export const App: React.FC = () => {
         if (parsed) handleIncomingDeepLink(parsed);
       } else if (data.type === 'webring-preview-open' && /^https?:/i.test(data.href)) {
         window.studioApi?.openExternal(data.href);
+      } else if (data.type === 'webring-preview-media' && data.href.startsWith('studio-media:')) {
+        void window.studioApi?.openMedia(data.href);
       }
     };
     window.addEventListener('message', onMessage);
@@ -4466,6 +4469,9 @@ export const App: React.FC = () => {
                   onAction={handleIncomingDeepLink}
                   onToggleSave={handleToggleSaved}
                   onOpenSite={(url) => window.studioApi?.openExternal(url)}
+                  onOpenImage={(url) =>
+                    url.startsWith('studio-media:') ? window.studioApi?.openMedia(url) : window.studioApi?.openExternal(url)
+                  }
                 />
               ) : (
                 <div className="space-y-4">
@@ -4949,6 +4955,7 @@ export const App: React.FC = () => {
                   <iframe
                     key={`${testExportResult.previewUrl}-${iframeRefreshKey}`}
                     src={testExportResult.previewUrl}
+                    allow="fullscreen"
                     title="Exported Static Profile Site Preview"
                     className="w-full h-[75vh] border-0 bg-slate-950"
                   />
@@ -4957,6 +4964,7 @@ export const App: React.FC = () => {
                     ref={previewFrameRef}
                     srcDoc={previewHtml}
                     sandbox="allow-scripts"
+                    allow="fullscreen"
                     title="Site preview"
                     className="w-full h-[75vh] border-0 bg-slate-950"
                   />
