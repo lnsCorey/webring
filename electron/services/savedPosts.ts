@@ -23,7 +23,11 @@ export async function savePost(
   const saved = db.saveFeedEntry(canonicalUrl, options.note);
   if (!saved.localMediaUrl && /^https?:\/\//i.test(saved.mediaUrl)) {
     try {
-      const image = await (options.fetchImage || fetchPublicImage)(saved.mediaUrl);
+      // The image comes from the friend's host, so it takes the persona's proxy like a sync does
+      const proxy = db.getProxySettings();
+      const image = options.fetchImage
+        ? await options.fetchImage(saved.mediaUrl)
+        : await fetchPublicImage(saved.mediaUrl, proxy.enabled && proxy.proxyUrl ? proxy.proxyUrl : undefined);
       db.setSavedLocalMedia(saved.id, library.importSavedImage(image.body, image.contentType));
     } catch {
       // Keep the saved text and the link to the original image
