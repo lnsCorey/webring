@@ -4600,3 +4600,92 @@ describe('Published page freshness and the Studio preview', () => {
     db.close();
   });
 });
+
+describe('Editing friend details', () => {
+  let dir: string;
+
+  beforeEach(() => {
+    dir = fs.mkdtempSync(path.join(os.tmpdir(), 'webring-friend-edit-'));
+  });
+
+  afterEach(() => {
+    fs.rmSync(dir, { recursive: true, force: true });
+  });
+
+  it('updates a friend in place, allows clearing optional fields, and cleans up old feed data when siteUrl changes', async () => {
+    const manager = new PersonaManager(dir);
+    const mcpServer = new WebringMcpServer(manager, dir);
+    const db = manager.getActiveContext().db;
+
+    const devon = db.addOrUpdateFriend({
+      siteUrl: 'https://devon.ring.test',
+      displayName: 'Devon K.',
+      avatarUrl: 'https://devon.ring.test/avatar.png',
+      bio: 'Synth builder',
+      relationship: ['friend', 'met'],
+      visibility: 'private',
+    });
+    const sam = db.addOrUpdateFriend({
+      siteUrl: 'https://sam.ring.test',
+      displayName: 'Sam Okafor',
+    });
+
+    // Seed a crawled feed entry for Devon's original URL
+    db.upsertNetworkFeedEntry({
+      friendSiteUrl: 'https://devon.ring.test',
+      friendName: 'Devon K.',
+      friendAvatarUrl: '',
+      friendDid: 'did:web:devon.ring.test',
+      entryType: 'post',
+      title: 'Old post',
+      canonicalUrl: 'https://devon.ring.test/api/items.json#item-1',
+      targetUrl: 'https://devon.ring.test/api/items.json#item-1',
+      commentary: 'Hello from old domain',
+      mediaUrl: '',
+      tags: [],
+      createdAt: new Date().toISOString(),
+      verifiedSignature: true,
+    });
+
+    // 1. Edit metadata in place (including clearing avatarUrl and bio)
+    const edited = db.updateFriend(devon.id, {
+      displayName: 'Devon Kass',
+      handle: 'devon.kass',
+      avatarUrl: '',
+      bio: '',
+      relationship: ['friend', 'colleague'],
+      visibility: 'public',
+    });
+    expect(edited.id).toBe(devon.id);
+    expect(edited.addedAt).toBe(devon.addedAt);
+    expect(edited.displayName).toBe('Devon Kass');
+    expect(edited.handle).toBe('devon.kass');
+    expect(edited.avatarUrl).toBe('');
+    expect(edited.bio).toBe('');
+    expect(edited.relationship).toEqual(['friend', 'colleague']);
+    expect(edited.visibility).toBe('public');
+    expect(db.getNetworkFeed()).toHaveLength(1);
+
+    // 2. Reject changing siteUrl to another existing friend's URL
+    expect(() =>
+      db.updateFriend(devon.id, { siteUrl: 'https://sam.ring.test/' })
+    ).toThrow(/already uses https:\/\/sam\.ring\.test/);
+    expect(sam.siteUrl).toBe('https://sam.ring.test');
+
+    // 3. Change siteUrl via MCP tool: updates DID and cleans up old URL's feed entries
+    const mcpRes = await mcpServer.executeToolCall('webring_update_friend', {
+      friendId: devon.id,
+      siteUrl: 'https://devon-new.ring.test/',
+      bio: 'Moved to a new domain',
+    });
+    expect(mcpRes.isError).toBeUndefined();
+    const moved = db.getFriends().find((f) => f.id === devon.id)!;
+    expect(moved.siteUrl).toBe('https://devon-new.ring.test');
+    expect(moved.did).toBe('did:web:devon-new.ring.test');
+    expect(moved.bio).toBe('Moved to a new domain');
+    expect(db.getNetworkFeed()).toHaveLength(0);
+
+    manager.closeAll();
+  });
+});
+
