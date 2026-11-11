@@ -32,6 +32,7 @@ import {
   SchedulerConfig,
 } from './services/scheduler';
 import { publishTo, runScheduledPublish, runSyncAll, summarizeSync } from './services/jobs';
+import { parseProxyUrl } from './security/proxyAgent';
 import {
   cleanUpLibrary,
   deleteAlbumWithFiles,
@@ -448,6 +449,8 @@ function registerIpcHandlers() {
       feedRetentionDays: ctx.db.getFeedRetentionDays(),
       friendNotices: ctx.db.getFriendNotices(),
       mutualFriendUrls: ctx.db.getMutualFriendUrls(),
+      proxySettings: ctx.db.getProxySettings(),
+      keyRotations: ctx.db.getKeyRotations(),
     };
   });
 
@@ -644,6 +647,25 @@ function registerIpcHandlers() {
 
   ipcMain.handle('studio:update-friend', (_e, friendId: string, updates) => {
     return personaManager.getActiveContext().db.updateFriend(String(friendId), updates || {});
+  });
+
+  ipcMain.handle('studio:rotate-keys', () => {
+    return personaManager.getActiveContext().db.rotateSigningKeys();
+  });
+
+  ipcMain.handle('studio:trust-friend-key', (_e, friendId: string, newPublicKeyPem?: string) => {
+    return personaManager.getActiveContext().db.trustNewFriendKey(String(friendId), newPublicKeyPem);
+  });
+
+  ipcMain.handle('studio:set-proxy-settings', (_e, input: { enabled?: boolean; proxyUrl?: string }) => {
+    const rawUrl = typeof input?.proxyUrl === 'string' ? input.proxyUrl.trim() : '';
+    if (rawUrl) {
+      parseProxyUrl(rawUrl);
+    }
+    return personaManager.getActiveContext().db.setProxySettings({
+      enabled: input?.enabled,
+      proxyUrl: rawUrl,
+    });
   });
 
   ipcMain.handle('studio:set-friend-visibility', (_e, friendId: string, visibility: 'private' | 'public') => {

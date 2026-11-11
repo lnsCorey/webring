@@ -17,6 +17,7 @@ import {
   buildCanonicalUrl,
   buildDidDocument,
   buildWebringUri,
+  createKeyRotationCertificate,
   documentFingerprint,
   generateIdentityKeyPair,
   isPlaceholderSiteUrl,
@@ -31,8 +32,11 @@ import {
   signDocument,
   siteUrlToDidWeb,
   verifyDocumentSignature,
+  verifyKeyRotationChain,
   WebringManifestSchema,
 } from '../src/shared/schema';
+import { parseProxyUrl } from '../electron/security/proxyAgent';
+import { encodeQrMatrix } from '../src/studio/QrCodeSvg';
 import { STORED_SECRET_PLACEHOLDER, StudioDatabase } from '../electron/db/database';
 import { LEGACY_DEMO_PHOTOS, LEGACY_DEMO_PROFILE } from '../electron/db/legacyDemoContent';
 import { buildRingDirectoryHtml, StaticSiteGenerator } from '../electron/services/siteGenerator';
@@ -4689,3 +4693,207 @@ describe('Editing friend details', () => {
   });
 });
 
+describe('Architectural Hardening: Key Rotation Certificates, Archive Hashes, Sync Jitter & Proxy Config', () => {
+  let dir: string;
+
+  beforeEach(() => {
+    dir = fs.mkdtempSync(path.join(os.tmpdir(), 'webring-arch-hardening-'));
+  });
+
+  afterEach(() => {
+    fs.rmSync(dir, { recursive: true, force: true });
+  });
+
+  it('verifies planned Ed25519 key rotations (single-hop and multi-hop) while rejecting forged certificates, and supports emergency re-pinning', async () => {
+    const aliceDb = new StudioDatabase(dir, 'alice.sqlite');
+    const bobDb = new StudioDatabase(dir, 'bob.sqlite');
+    const aliceExportDir = path.join(dir, 'alice-site');
+
+    aliceDb.updateProfile({
+      siteUrl: 'https://alice.ring.test',
+      displayName: 'Alice',
+    });
+    bobDb.updateProfile({
+      siteUrl: 'https://bob.ring.test',
+      displayName: 'Bob',
+    });
+
+    aliceDb.createItem({
+      type: 'post',
+      title: 'Post under Key 1',
+      commentary: 'Signed with initial Ed25519 keypair',
+    });
+    new StaticSiteGenerator(aliceDb).generateToDirectory(aliceExportDir);
+    const key1Pem = aliceDb.getKeys().publicKeyPem;
+
+    // 1. Bob adds Alice and crawls her site (TOFU pins Key 1)
+    const friendRecord = bobDb.addOrUpdateFriend({
+      siteUrl: 'https://alice.ring.test',
+      displayName: 'Alice',
+    });
+    const crawler = new RingCrawler(bobDb);
+    const firstCrawl = await crawler.crawlFriendSite('https://alice.ring.test', aliceExportDir);
+    expect(firstCrawl.success).toBe(true);
+    expect(firstCrawl.keyChangedWarning).toBeFalsy();
+    expect(bobDb.getSiteKey('https://alice.ring.test')?.publicKeyPem).toBe(key1Pem);
+    expect(bobDb.getFriendBySiteUrl('https://alice.ring.test')?.keyStatus).toBe('pinned');
+
+    // 2. Alice rotates her signing key (Key 1 -> Key 2) and exports her site
+    const rot1 = aliceDb.rotateSigningKeys();
+    expect(rot1.publicKeyPem).not.toBe(key1Pem);
+    expect(rot1.rotationCount).toBe(1);
+    aliceDb.createItem({
+      type: 'post',
+      title: 'Post under Key 2',
+      commentary: 'Signed after planned key rotation',
+    });
+    new StaticSiteGenerator(aliceDb).generateToDirectory(aliceExportDir);
+
+    // Bob crawls Alice again: verifies KeyRotationCertificate and advances pinned key to Key 2
+    const secondCrawl = await crawler.crawlFriendSite('https://alice.ring.test', aliceExportDir);
+    expect(secondCrawl.success).toBe(true);
+    expect(secondCrawl.keyChangedWarning).toBeFalsy();
+    expect(secondCrawl.verifiedSignature).toBe(true);
+    expect(secondCrawl.itemsIndexed).toBe(2);
+    expect(bobDb.getSiteKey('https://alice.ring.test')?.publicKeyPem).toBe(rot1.publicKeyPem);
+    expect(bobDb.getFriendBySiteUrl('https://alice.ring.test')?.keyStatus).toBe('pinned');
+
+    // 3. Multi-hop rotation: Alice rotates twice (Key 2 -> Key 3 -> Key 4) before Bob syncs
+    aliceDb.rotateSigningKeys();
+    const rot3 = aliceDb.rotateSigningKeys();
+    expect(rot3.rotationCount).toBe(3);
+    new StaticSiteGenerator(aliceDb).generateToDirectory(aliceExportDir);
+
+    const multiHopCrawl = await crawler.crawlFriendSite('https://alice.ring.test', aliceExportDir);
+    expect(multiHopCrawl.success).toBe(true);
+    expect(multiHopCrawl.keyChangedWarning).toBeFalsy();
+    expect(bobDb.getSiteKey('https://alice.ring.test')?.publicKeyPem).toBe(rot3.publicKeyPem);
+
+    // 4. Forged rotation certificate: attacker swaps key without Alice's private key
+    const attackerKeys = generateIdentityKeyPair();
+    const forgedCert = createKeyRotationCertificate({
+      siteUrl: 'https://alice.ring.test',
+      oldPublicKeyPem: rot3.publicKeyPem,
+      oldPrivateKeyPem: attackerKeys.privateKeyPem, // wrong private key!
+      newPublicKeyPem: attackerKeys.publicKeyPem,
+    });
+    expect(
+      verifyKeyRotationChain({
+        pinnedPublicKeyPem: rot3.publicKeyPem,
+        targetPublicKeyPem: attackerKeys.publicKeyPem,
+        did: 'did:web:alice.ring.test',
+        siteUrl: 'https://alice.ring.test',
+        certificates: [forgedCert],
+      })
+    ).toBe(false);
+
+    // Write tampered did.json with attacker's key and forged cert
+    const tamperedDid = buildDidDocument(
+      'https://alice.ring.test',
+      attackerKeys.publicKeyPem,
+      'alice',
+      undefined,
+      [forgedCert]
+    );
+    fs.writeFileSync(
+      path.join(aliceExportDir, '.well-known', 'did.json'),
+      JSON.stringify(tamperedDid, null, 2),
+      'utf8'
+    );
+    // Also update manifest fingerprint so crawler doesn't skip did.json
+    const manifestPath = path.join(aliceExportDir, 'api', 'manifest.json');
+    const rawManifest = JSON.parse(fs.readFileSync(manifestPath, 'utf8'));
+    rawManifest.documents.did.sha256 = documentFingerprint(tamperedDid);
+    rawManifest.keyRotations = [forgedCert];
+    fs.writeFileSync(manifestPath, JSON.stringify(rawManifest, null, 2), 'utf8');
+
+    const forgedCrawl = await crawler.crawlFriendSite('https://alice.ring.test', aliceExportDir);
+    expect(forgedCrawl.keyChangedWarning).toBe(true);
+    expect(bobDb.getFriendBySiteUrl('https://alice.ring.test')?.keyStatus).toBe('changed');
+    // Pinned key remains Alice's legitimate Key 4
+    expect(bobDb.getSiteKey('https://alice.ring.test')?.publicKeyPem).toBe(rot3.publicKeyPem);
+
+    // 5. Emergency recovery: Bob explicitly trusts a new key after out-of-band verification
+    // Restore legitimate export with a brand-new uncertified keypair
+    const recoveredFriend = bobDb.trustNewFriendKey(friendRecord.id);
+    expect(recoveredFriend.keyStatus).toBe('unverified');
+    expect(bobDb.getSiteKey('https://alice.ring.test')).toBeUndefined();
+
+    aliceDb.close();
+    bobDb.close();
+  });
+
+  it('attaches content-addressed sha256 fingerprints to monthly archive entries in items.json', () => {
+    const db = new StudioDatabase(dir, 'archive.sqlite');
+    db.updateProfile({ siteUrl: 'https://archive.ring.test', displayName: 'Archivist' });
+
+    // Create 55 recent items + 1 old item (>90 days ago) so splitItemsForPublishing archives the old one
+    for (let i = 0; i < 55; i++) {
+      db.createItem({ type: 'post', title: `Recent ${i}`, commentary: `Body ${i}` });
+    }
+    const oldItem = db.createItem({ type: 'post', title: 'Old 2024 Post', commentary: 'From 2024' });
+    const rawSqlite = new DatabaseSync(path.join(dir, 'archive.sqlite'));
+    rawSqlite
+      .prepare(`UPDATE items SET created_at = '2024-05-15T12:00:00.000Z', updated_at = '2024-05-15T12:00:00.000Z' WHERE id = ?`)
+      .run(oldItem.id);
+    rawSqlite.close();
+
+    const publishedBundle = db.buildSignedSiteBundle({ publish: true });
+    expect(publishedBundle.archives).toBeDefined();
+    expect(publishedBundle.archives!.length).toBe(1);
+    const monthArchive = publishedBundle.archives![0];
+    const monthIndex = publishedBundle.items.archive?.months.find((m) => m.month === '2024-05');
+    expect(monthIndex).toBeDefined();
+    expect(monthIndex!.sha256).toBe(documentFingerprint(monthArchive.doc));
+
+    db.close();
+  });
+
+  it('staggers scheduled jobs with per-persona sync jitter, isolates proxy settings in local_settings, and encodes QR matrices', () => {
+    let now = new Date('2026-06-01T12:00:00.000Z');
+    const scheduler = new Scheduler({
+      configPath: path.join(dir, 'schedules.json'),
+      listPersonaIds: () => ['default', 'pseudonym'],
+      now: () => now,
+      random: () => 0.5, // 50% of jitter window
+      runner: {
+        sync: async () => ({ at: now.toISOString(), status: 'ok', message: 'synced' }),
+        publish: async () => ({ at: now.toISOString(), status: 'ok', message: 'published' }),
+      },
+    });
+
+    const updated = scheduler.setPersonaSchedule('default', {
+      sync: { enabled: true, preset: { kind: 'interval', minutes: 60 }, jitterMinutes: 10 },
+    });
+    expect(updated.sync.jitterMinutes).toBe(10);
+    // 0.5 * 10 minutes = 5 minutes (300,000 ms)
+    expect(updated.sync.nextJitterMs).toBe(5 * 60 * 1000);
+    expect(jobNextRunAt(updated.sync).toISOString()).toBe('2026-06-01T13:05:00.000Z');
+
+    // Proxy settings are stored per-persona and never exported in the public site bundle
+    const db = new StudioDatabase(dir, 'proxy.sqlite');
+    expect(parseProxyUrl('socks5h://127.0.0.1:9050')).toEqual({
+      protocol: 'socks5h:',
+      host: '127.0.0.1',
+      port: 9050,
+    });
+    expect(() => parseProxyUrl('ftp://127.0.0.1:21')).toThrow(/Unsupported proxy protocol/);
+
+    const savedProxy = db.setProxySettings({
+      enabled: true,
+      proxyUrl: 'socks5h://127.0.0.1:9050',
+    });
+    expect(savedProxy).toEqual({ enabled: true, proxyUrl: 'socks5h://127.0.0.1:9050' });
+    expect(db.getProxySettings()).toEqual(savedProxy);
+    const bundleJson = JSON.stringify(db.buildSignedSiteBundle({ publish: true }));
+    expect(bundleJson).not.toContain('9050');
+    expect(bundleJson).not.toContain('socks5h');
+    db.close();
+
+    // QR matrix encodes a webring:// capability link cleanly
+    const qr = encodeQrMatrix('webring://ring-request?token=eyJ2IjoxLCJyaW5nSWQiOiJyaW5nLTEifQ');
+    expect(qr).not.toBeNull();
+    expect(qr!.length).toBeGreaterThanOrEqual(29);
+    expect(qr![0][0]).toBe(true); // top-left finder pattern corner
+  });
+});

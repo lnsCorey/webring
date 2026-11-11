@@ -27,6 +27,10 @@ export interface JobSchedule {
   preset: SchedulePreset;
   /** When the schedule was turned on or changed; the anchor before the first run. */
   since: string;
+  /** Max random delay (minutes, 0..60) added per cycle so multiple personas don't poll at the exact same second. */
+  jitterMinutes?: number;
+  /** Sampled random offset (ms) for the upcoming run slot. */
+  nextJitterMs?: number;
   lastRunAt?: string;
   lastResult?: JobResult;
 }
@@ -106,8 +110,16 @@ export function nextRunAt(preset: SchedulePreset, anchor: Date): Date {
   return candidate;
 }
 
+export function sampleJitterMs(jitterMinutes: number | undefined, rng: () => number = Math.random): number {
+  const clamped = Math.max(0, Math.min(60, Math.floor(Number(jitterMinutes || 0))));
+  if (clamped <= 0) return 0;
+  return Math.floor(rng() * clamped * 60 * 1000);
+}
+
 export function jobNextRunAt(job: JobSchedule): Date {
-  return nextRunAt(job.preset, new Date(job.lastRunAt || job.since));
+  const base = nextRunAt(job.preset, new Date(job.lastRunAt || job.since));
+  const jitterMs = job.nextJitterMs && job.nextJitterMs > 0 ? job.nextJitterMs : 0;
+  return jitterMs ? new Date(base.getTime() + jitterMs) : base;
 }
 
 export function describePreset(preset: SchedulePreset): string {
@@ -130,6 +142,7 @@ export interface SchedulerOptions {
   /** Persona ids that still exist; schedules for anything else are dropped. */
   listPersonaIds: () => string[];
   now?: () => Date;
+  random?: () => number;
   onJobFinished?: (personaId: string, job: ScheduledJobKind, result: JobResult) => void;
 }
 
@@ -144,6 +157,10 @@ export class Scheduler {
 
   private now(): Date {
     return this.options.now ? this.options.now() : new Date();
+  }
+
+  private rng(): number {
+    return this.options.random ? this.options.random() : Math.random();
   }
 
   // ---------------------------------------------------------------------------
@@ -184,8 +201,8 @@ export class Scheduler {
   public setPersonaSchedule(
     personaId: string,
     patch: {
-      sync?: Partial<Pick<JobSchedule, 'enabled' | 'preset'>>;
-      publish?: Partial<Pick<PersonaSchedule['publish'], 'enabled' | 'preset' | 'destination' | 'syncFirst'>>;
+      sync?: Partial<Pick<JobSchedule, 'enabled' | 'preset' | 'jitterMinutes'>>;
+      publish?: Partial<Pick<PersonaSchedule['publish'], 'enabled' | 'preset' | 'destination' | 'syncFirst' | 'jitterMinutes'>>;
     }
   ): PersonaSchedule {
     const config = this.loadConfig();
@@ -196,7 +213,16 @@ export class Scheduler {
       const resetsAnchor =
         (change.enabled === true && !job.enabled) ||
         (change.preset !== undefined && JSON.stringify(change.preset) !== JSON.stringify(job.preset));
-      return { ...job, ...change, ...(resetsAnchor ? { since, lastRunAt: undefined } : {}) };
+      const merged = { ...job, ...change, ...(resetsAnchor ? { since, lastRunAt: undefined } : {}) };
+      if (resetsAnchor || change.jitterMinutes !== undefined) {
+        const jitterMinutes =
+          change.jitterMinutes !== undefined
+            ? Math.max(0, Math.min(60, Math.floor(Number(change.jitterMinutes || 0))))
+            : merged.jitterMinutes;
+        merged.jitterMinutes = jitterMinutes;
+        merged.nextJitterMs = sampleJitterMs(jitterMinutes, () => this.rng());
+      }
+      return merged;
     };
     config.personas[personaId] = {
       sync: apply<JobSchedule>(current.sync, patch.sync),
@@ -310,8 +336,19 @@ export class Scheduler {
     const current = config.personas[personaId];
     if (current) {
       const ran = { lastRunAt: this.now().toISOString(), lastResult: result };
-      if (job === 'sync') current.sync = { ...current.sync, ...ran };
-      else current.publish = { ...current.publish, ...ran };
+      if (job === 'sync') {
+        current.sync = {
+          ...current.sync,
+          ...ran,
+          nextJitterMs: sampleJitterMs(current.sync.jitterMinutes, () => this.rng()),
+        };
+      } else {
+        current.publish = {
+          ...current.publish,
+          ...ran,
+          nextJitterMs: sampleJitterMs(current.publish.jitterMinutes, () => this.rng()),
+        };
+      }
     }
     config.history = [{ ...result, personaId, job }, ...config.history].slice(0, HISTORY_LIMIT);
     this.saveConfig(config);
