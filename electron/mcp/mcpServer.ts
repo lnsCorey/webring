@@ -5,6 +5,7 @@ import { LocalPreviewServer } from '../services/localPreviewServer';
 import { cleanUpLibrary, deleteAlbumWithFiles, deletePhotoWithFiles, setProfileImageFromFile } from '../services/mediaLibrary';
 import { savePost, unsavePost } from '../services/savedPosts';
 import { jobNextRunAt, Scheduler, SchedulePreset } from '../services/scheduler';
+import { parseProxyUrl } from '../security/proxyAgent';
 import {
   FriendVisibility,
   isValidAdSlotId,
@@ -814,6 +815,46 @@ export class WebringMcpServer {
         inputSchema: { type: 'object', properties: { personaId: personaIdProp } },
       },
       {
+        name: 'webring_rotate_keys',
+        description:
+          'Rotate the persona’s Ed25519 signing keypair and issue a signed KeyRotationCertificate so peers who pinned the previous key via TOFU automatically advance their pin to the new key on next sync.',
+        inputSchema: {
+          type: 'object',
+          properties: {
+            personaId: personaIdProp,
+          },
+        },
+      },
+      {
+        name: 'webring_trust_friend_key',
+        description:
+          'Emergency TOFU re-pinning: clear a friend’s "key changed" warning when they lost their previous private key without a KeyRotationCertificate, so the next crawl pins their new key.',
+        inputSchema: {
+          type: 'object',
+          properties: {
+            personaId: personaIdProp,
+            friendId: { type: 'string', description: 'ID of the friend whose new key should be trusted.' },
+          },
+          required: ['friendId'],
+        },
+      },
+      {
+        name: 'webring_set_proxy',
+        description:
+          'Configure per-persona outbound SOCKS5 / Tor (socks5h://) / HTTP proxy routing for crawling friends and webring hubs. Kept in local_settings and never exported.',
+        inputSchema: {
+          type: 'object',
+          properties: {
+            personaId: personaIdProp,
+            enabled: { type: 'boolean', description: 'Enable or disable proxy routing for this persona.' },
+            proxyUrl: {
+              type: 'string',
+              description: 'Proxy URL (e.g. "socks5h://127.0.0.1:9050" for Tor, "socks5://127.0.0.1:1080", or "http://127.0.0.1:8080").',
+            },
+          },
+        },
+      },
+      {
         name: 'webring_set_schedule',
         description:
           'Set the persona’s schedules. Presets: {"kind":"interval","minutes":15|60|360|720}, {"kind":"daily","time":"HH:MM"}, {"kind":"weekly","weekday":0-6,"time":"HH:MM"}. Publish destinations: local, remote (SFTP/FTP), github. Scheduled publishes skip when nothing changed. Jobs run while Webring Studio is open or in the menu bar.',
@@ -823,8 +864,16 @@ export class WebringMcpServer {
             personaId: personaIdProp,
             syncEnabled: { type: 'boolean' },
             syncPreset: { type: 'object' },
+            syncJitterMinutes: {
+              type: 'number',
+              description: 'Optional random jitter window in minutes (0..60) added per sync cycle to prevent cross-persona timing correlation.',
+            },
             publishEnabled: { type: 'boolean' },
             publishPreset: { type: 'object' },
+            publishJitterMinutes: {
+              type: 'number',
+              description: 'Optional random jitter window in minutes (0..60) added per publish cycle.',
+            },
             publishDestination: { type: 'string', enum: ['local', 'remote', 'github'] },
             syncBeforePublish: { type: 'boolean' },
           },
@@ -1645,16 +1694,51 @@ export class WebringMcpServer {
             sync: {
               ...(typeof args.syncEnabled === 'boolean' ? { enabled: args.syncEnabled } : {}),
               ...(args.syncPreset ? { preset: args.syncPreset as SchedulePreset } : {}),
+              ...(args.syncJitterMinutes !== undefined ? { jitterMinutes: Number(args.syncJitterMinutes) } : {}),
             },
             publish: {
               ...(typeof args.publishEnabled === 'boolean' ? { enabled: args.publishEnabled } : {}),
               ...(args.publishPreset ? { preset: args.publishPreset as SchedulePreset } : {}),
+              ...(args.publishJitterMinutes !== undefined ? { jitterMinutes: Number(args.publishJitterMinutes) } : {}),
               ...(destination ? { destination: destination as 'local' | 'remote' | 'github' } : {}),
               ...(typeof args.syncBeforePublish === 'boolean' ? { syncFirst: args.syncBeforePublish } : {}),
             },
           });
           resultData = { personaId: ctx.persona.id, schedule: updated };
           summary = `Updated schedules for ${ctx.persona.label}`;
+          break;
+        }
+
+        case 'webring_rotate_keys': {
+          const ctx = this.resolveContext(args);
+          const rotation = ctx.db.rotateSigningKeys();
+          resultData = rotation;
+          summary = `Rotated Ed25519 signing key for ${ctx.persona.displayName} (fingerprint: ${rotation.publicKeyFingerprint})`;
+          break;
+        }
+
+        case 'webring_trust_friend_key': {
+          const ctx = this.resolveContext(args);
+          const friendId = String(args.friendId || '').trim();
+          if (!friendId) throw new Error('friendId is required');
+          const updated = ctx.db.trustNewFriendKey(friendId);
+          resultData = updated;
+          summary = `Cleared key-change warning for friend ${updated.displayName} (${updated.siteUrl})`;
+          break;
+        }
+
+        case 'webring_set_proxy': {
+          const ctx = this.resolveContext(args);
+          const rawUrl = typeof args.proxyUrl === 'string' ? args.proxyUrl.trim() : undefined;
+          if (rawUrl) {
+            parseProxyUrl(rawUrl);
+          }
+          const updated = ctx.db.setProxySettings({
+            enabled: typeof args.enabled === 'boolean' ? args.enabled : undefined,
+            proxyUrl: rawUrl,
+          });
+          resultData = updated;
+          summary = `Updated proxy settings for ${ctx.persona.displayName} (${updated.enabled ? updated.proxyUrl : 'disabled'})`;
           break;
         }
 

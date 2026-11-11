@@ -14,6 +14,7 @@ import {
   FriendKeyStatus,
   isUrlWithinSite,
   ItemsDocumentSchema,
+  KeyRotationCertificate,
   ManifestDocumentKey,
   normalizeSiteUrl,
   ProfileDocumentSchema,
@@ -26,6 +27,7 @@ import {
   PrivateNetworkAddressError,
   privatePeersAllowed,
 } from '../security/networkGuard';
+import { createProxyAgent } from '../security/proxyAgent';
 
 export interface CrawlSiteResult {
   siteUrl: string;
@@ -72,11 +74,28 @@ export const defaultConditionalJsonFetcher: ConditionalJsonFetcher = async (url,
   return { json: JSON.parse(res.body.toString('utf8')), etag: res.etag, lastModified: res.lastModified };
 };
 
+/** Builds a conditional fetcher that tunnels HTTP(S) requests through an optional SOCKS5/Tor/HTTP proxy. */
+export function createConditionalJsonFetcher(getProxyUrl: () => string | undefined): ConditionalJsonFetcher {
+  return async (url, validators) => {
+    const proxyUrl = getProxyUrl();
+    if (!/^https?:\/\//i.test(url)) return { json: await defaultJsonFetcher(url, proxyUrl) };
+    const res = await fetchPublic(url, {
+      accept: 'application/json',
+      maxBytes: MAX_JSON_BYTES,
+      validators,
+      compressed: true,
+      proxyUrl,
+    });
+    if (res.status === 'not-modified') return { notModified: true };
+    return { json: JSON.parse(res.body.toString('utf8')), etag: res.etag, lastModified: res.lastModified };
+  };
+}
+
 const MAX_IMAGE_BYTES = 15 * 1024 * 1024;
 
 /** Downloads an image from the public internet (same guards as the crawler), up to 15 MB. */
-export async function fetchPublicImage(url: string): Promise<{ body: Buffer; contentType: string }> {
-  const res = await fetchPublic(url, { accept: 'image/*', maxBytes: MAX_IMAGE_BYTES, validators: null });
+export async function fetchPublicImage(url: string, proxyUrl?: string): Promise<{ body: Buffer; contentType: string }> {
+  const res = await fetchPublic(url, { accept: 'image/*', maxBytes: MAX_IMAGE_BYTES, validators: null, proxyUrl });
   if (res.status === 'not-modified') throw new Error('Unexpected 304');
   if (!/^image\//i.test(res.contentType)) throw new Error(`Not an image: ${res.contentType || 'unknown type'}`);
   return { body: res.body, contentType: res.contentType };
@@ -88,7 +107,7 @@ const MAX_JSON_BYTES = 5 * 1024 * 1024; // 5 MB limit per crawled JSON document
  * Default fetcher that supports both HTTP(S) URLs and local `file://` or directory paths
  * (making local multi-site testing and offline ring folders work seamlessly).
  */
-export async function defaultJsonFetcher(urlOrPath: string): Promise<unknown> {
+export async function defaultJsonFetcher(urlOrPath: string, proxyUrl?: string): Promise<unknown> {
   if (urlOrPath.startsWith('file://')) {
     const filePath = new URL(urlOrPath).pathname.replace(/^\/([A-Za-z]:)/, '$1');
     const stat = fs.statSync(filePath);
@@ -106,7 +125,13 @@ export async function defaultJsonFetcher(urlOrPath: string): Promise<unknown> {
     const raw = fs.readFileSync(urlOrPath, 'utf8');
     return JSON.parse(raw);
   }
-  const res = await fetchPublic(urlOrPath, { accept: 'application/json', maxBytes: MAX_JSON_BYTES, validators: null, compressed: true });
+  const res = await fetchPublic(urlOrPath, {
+    accept: 'application/json',
+    maxBytes: MAX_JSON_BYTES,
+    validators: null,
+    compressed: true,
+    proxyUrl,
+  });
   if (res.status === 'not-modified') throw new Error(`Unexpected 304 fetching ${urlOrPath}`);
   return JSON.parse(res.body.toString('utf8'));
 }
@@ -125,6 +150,8 @@ interface PublicFetchOptions {
   validators: FetchValidators | null;
   /** Ask for gzip / brotli (JSON compresses about 5x; images don't, so they don't ask). */
   compressed?: boolean;
+  /** Optional per-persona outbound proxy URL (socks5://, socks5h://, or http://). */
+  proxyUrl?: string;
 }
 
 /** Errors where the connection dropped (often a reused keep-alive socket the host had closed). */
@@ -173,6 +200,15 @@ function fetchPublicOnce(
     }
 
     const client = url.protocol === 'https:' ? https : http;
+    let proxyAgent: http.Agent | https.Agent | undefined;
+    if (options.proxyUrl) {
+      try {
+        proxyAgent = createProxyAgent(options.proxyUrl, url.protocol as 'http:' | 'https:', FETCH_TIMEOUT_MS);
+      } catch (err) {
+        reject(err instanceof Error ? err : new Error(String(err)));
+        return;
+      }
+    }
     const req = client.get(
       url,
       {
@@ -184,7 +220,7 @@ function fetchPublicOnce(
           ...(options.validators?.etag ? { 'If-None-Match': options.validators.etag } : {}),
           ...(options.validators?.lastModified ? { 'If-Modified-Since': options.validators.lastModified } : {}),
         },
-        lookup: guardedLookup,
+        ...(proxyAgent ? { agent: proxyAgent } : { lookup: guardedLookup }),
         timeout: FETCH_TIMEOUT_MS,
       },
       (res) => {
@@ -292,7 +328,12 @@ export class RingCrawler {
   constructor(private db: StudioDatabase, customFetcher?: JsonFetcher, conditionalFetcher?: ConditionalJsonFetcher) {
     this.conditionalFetcher =
       conditionalFetcher ||
-      (customFetcher ? async (url: string) => ({ json: await customFetcher(url) }) : defaultConditionalJsonFetcher);
+      (customFetcher
+        ? async (url: string) => ({ json: await customFetcher(url) })
+        : createConditionalJsonFetcher(() => {
+            const proxy = this.db.getProxySettings();
+            return proxy.enabled && proxy.proxyUrl ? proxy.proxyUrl : undefined;
+          }));
   }
 
   /**
@@ -397,11 +438,15 @@ export class RingCrawler {
 
       // Fetch DID document for public key signature verification
       let fetchedPublicKeyPem = '';
+      let didKeyRotations: KeyRotationCertificate[] | undefined = manifest.keyRotations;
       let didFetch: SavedCopyFetch | null = null;
       try {
         didFetch = await fetchWithSavedCopy(manifest.endpoints.did, listedFingerprint('did'));
         const didDoc = DidDocumentSchema.parse(didFetch.json);
         fetchedPublicKeyPem = didDoc.verificationMethod[0]?.publicKeyPem || '';
+        if (didDoc.keyRotations && didDoc.keyRotations.length > 0) {
+          didKeyRotations = didDoc.keyRotations;
+        }
       } catch {
         // Optional if DID doc isn't reachable
         didFetch = null;
@@ -412,9 +457,10 @@ export class RingCrawler {
       // One pinned key per site, shared with ring hubs and members (site_keys)
       const existingPinnedKey =
         this.db.getSiteKey(normalizedFriendUrl)?.publicKeyPem || existingFriend?.pinnedPublicKeyPem || '';
+      let pinStatus: 'pinned' | 'changed' = 'pinned';
       if (fetchedPublicKeyPem) {
-        // Pins on first sight; marks the site 'changed' if the key differs from the pinned one
-        this.db.pinSiteKey(normalizedFriendUrl, manifest.did, fetchedPublicKeyPem);
+        // Pins on first sight; advances if a signed KeyRotationCertificate chain verifies; marks 'changed' otherwise
+        pinStatus = this.db.pinSiteKey(normalizedFriendUrl, manifest.did, fetchedPublicKeyPem, didKeyRotations);
       }
 
       let keyChangedWarning = false;
@@ -423,8 +469,8 @@ export class RingCrawler {
       let effectiveVerifyKeyPem = fetchedPublicKeyPem;
 
       if (fetchedPublicKeyPem) {
-        if (existingPinnedKey && existingPinnedKey !== fetchedPublicKeyPem) {
-          // Domain key changed unexpectedly! Flag warning and refuse to verify with the unpinned key
+        if (pinStatus === 'changed') {
+          // Domain key changed unexpectedly without a valid KeyRotationCertificate!
           keyChangedWarning = true;
           keyStatus = 'changed';
           pinnedKeyToSave = existingPinnedKey;

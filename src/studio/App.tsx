@@ -9,6 +9,7 @@ import {
   FriendConnection,
   FriendVisibility,
   isPlaceholderSiteUrl,
+  KeyRotationCertificate,
   parseWebringUri,
   PersonaSummary,
   ProfileDocument,
@@ -31,6 +32,7 @@ import { MarkdownField } from './MarkdownField';
 import { renderMarkdown } from '../shared/markdown';
 import { ProfileImagePicker } from './ProfileImagePicker';
 import { HostedRingPageEditor } from './HostedRingPageEditor';
+import { WebringShareBlock } from './QrCodeSvg';
 import {
   BookOpen,
   Camera,
@@ -220,6 +222,8 @@ interface ScheduleJobResult {
 interface ScheduleJob {
   enabled: boolean;
   preset: SchedulePreset;
+  jitterMinutes?: number;
+  nextJitterMs?: number;
   lastRunAt?: string;
   lastResult?: ScheduleJobResult;
 }
@@ -388,6 +392,8 @@ declare global {
         feedRetentionDays?: number;
         friendNotices?: FriendNoticeView[];
         mutualFriendUrls?: string[];
+        proxySettings?: { enabled: boolean; proxyUrl: string };
+        keyRotations?: KeyRotationCertificate[];
       }>;
       listPersonas: () => Promise<{
         activePersonaId: string;
@@ -450,6 +456,17 @@ declare global {
       setFeedRetention: (days: number) => Promise<{ days: number; pruned: number }>;
       addFriend: (input: unknown) => Promise<unknown>;
       updateFriend: (friendId: string, updates: FriendEdit) => Promise<FriendConnection>;
+      rotateKeys?: () => Promise<{
+        publicKeyPem: string;
+        publicKeyFingerprint: string;
+        rotationCertificate: KeyRotationCertificate;
+        rotationCount: number;
+      }>;
+      trustFriendKey?: (friendId: string, newPublicKeyPem?: string) => Promise<FriendConnection>;
+      setProxySettings?: (input: {
+        enabled?: boolean;
+        proxyUrl?: string;
+      }) => Promise<{ enabled: boolean; proxyUrl: string }>;
       setFriendVisibility: (
         friendId: string,
         visibility: FriendVisibility
@@ -763,6 +780,12 @@ export const App: React.FC = () => {
   const [scheduleOverview, setScheduleOverview] = useState<ScheduleOverview | null>(null);
   const [runningJob, setRunningJob] = useState<'sync' | 'publish' | null>(null);
   const [publishedUpToDate, setPublishedUpToDate] = useState(false);
+  const [proxySettings, setProxySettings] = useState<{ enabled: boolean; proxyUrl: string }>({
+    enabled: false,
+    proxyUrl: '',
+  });
+  const [keyRotations, setKeyRotations] = useState<KeyRotationCertificate[]>([]);
+  const [friendNoticeLinks, setFriendNoticeLinks] = useState<Record<string, string>>({});
 
   // Editing an already-joined webring's name/description/neighbors
   const [editingRingId, setEditingRingId] = useState<string | null>(null);
@@ -859,6 +882,10 @@ export const App: React.FC = () => {
     setJoinedRings(data.joinedRings || []);
     setHostedRings(data.hostedRings || []);
     setPublishedUpToDate(Boolean(data.publishedUpToDate));
+    if (data.proxySettings) {
+      setProxySettings(data.proxySettings);
+    }
+    setKeyRotations(data.keyRotations || []);
     if (window.studioApi.getSchedule) {
       window.studioApi.getSchedule().then(setScheduleOverview).catch(() => undefined);
     }
@@ -1688,12 +1715,74 @@ export const App: React.FC = () => {
     if (!window.studioApi?.createFriendNotice) return;
     try {
       const link = await window.studioApi.createFriendNotice(friend.siteUrl);
+      setFriendNoticeLinks((prev) => ({ ...prev, [friend.siteUrl]: link }));
       await navigator.clipboard.writeText(link);
       notify(
         `Link copied. Send it to ${friend.displayName} by email or message; when they open it, Studio checks it was signed by your site.`
       );
     } catch (err) {
       notify(`Couldn't make the link: ${errorMessage(err)}`);
+    }
+  };
+
+  const handleRotateKeys = async () => {
+    if (!window.studioApi?.rotateKeys) return;
+    if (
+      !window.confirm(
+        'Rotate your Ed25519 signing keypair? Your previous private key will sign a KeyRotationCertificate endorsing the new public key in did.json and manifest.json so friends who pinned your old key via TOFU automatically trust the new key on their next sync.'
+      )
+    ) {
+      return;
+    }
+    try {
+      const res = await window.studioApi.rotateKeys();
+      await refreshStudioData();
+      notify(
+        `Rotated Ed25519 key (new fingerprint: ${res.publicKeyFingerprint.slice(0, 18)}...). Publish your site so peers receive the signed KeyRotationCertificate.`
+      );
+    } catch (err) {
+      notify(`Couldn't rotate keys: ${errorMessage(err)}`);
+    }
+  };
+
+  const handleTrustFriendKey = async (friend: FriendConnection) => {
+    if (!window.studioApi?.trustFriendKey) return;
+    if (
+      !window.confirm(
+        `Trust ${friend.displayName}'s new public key without a rotation certificate? Only do this if you confirmed out-of-band with ${friend.displayName} that they lost their previous signing key.`
+      )
+    ) {
+      return;
+    }
+    try {
+      await window.studioApi.trustFriendKey(friend.id);
+      const crawlRes = await window.studioApi.crawlFriend(friend.siteUrl);
+      await refreshStudioData();
+      if (crawlRes?.success) {
+        notify(`Re-pinned ${friend.displayName}'s new Ed25519 key and verified their site!`);
+      } else {
+        notify(`Cleared old pin for ${friend.displayName}. Sync again when their site is reachable.`);
+      }
+    } catch (err) {
+      notify(`Couldn't re-pin key: ${errorMessage(err)}`);
+    }
+  };
+
+  const handleSaveProxySettings = async (next: { enabled?: boolean; proxyUrl?: string }) => {
+    if (!window.studioApi?.setProxySettings) return;
+    try {
+      const updated = await window.studioApi.setProxySettings({
+        enabled: next.enabled ?? proxySettings.enabled,
+        proxyUrl: next.proxyUrl ?? proxySettings.proxyUrl,
+      });
+      setProxySettings(updated);
+      notify(
+        updated.enabled && updated.proxyUrl
+          ? `Outbound proxy enabled for this persona (${updated.proxyUrl}).`
+          : 'Outbound proxy disabled for this persona.'
+      );
+    } catch (err) {
+      notify(`Invalid proxy configuration: ${errorMessage(err)}`);
     }
   };
 
@@ -2545,10 +2634,28 @@ export const App: React.FC = () => {
                   ))}
                 </div>
 
-                <div className="pt-2 flex items-center justify-between">
-                  <div className="text-xs text-slate-400">
-                    Ed25519 Verification Method:{' '}
-                    <code className="text-indigo-300">{bundle.profile.did}#key-1</code>
+                <div className="pt-2 flex flex-wrap items-center justify-between gap-3">
+                  <div className="flex flex-wrap items-center gap-2 text-xs text-slate-400">
+                    <span>
+                      Ed25519 Verification Method:{' '}
+                      <code className="text-indigo-300">{bundle.profile.did}#key-1</code>
+                    </span>
+                    {keyRotations.length > 0 && (
+                      <span
+                        className="px-2 py-0.5 rounded-full bg-emerald-500/15 border border-emerald-500/30 text-emerald-300 font-medium"
+                        title="Signed KeyRotationCertificate statements published in did.json and manifest.json so TOFU-pinned peers automatically advance to your current key"
+                      >
+                        {keyRotations.length} rotation cert{keyRotations.length === 1 ? '' : 's'}
+                      </span>
+                    )}
+                    <button
+                      type="button"
+                      onClick={handleRotateKeys}
+                      className="px-2.5 py-1 rounded-lg bg-slate-800 hover:bg-slate-700 border border-slate-700 text-slate-200 font-medium transition"
+                      title="Generate a fresh Ed25519 keypair and sign a KeyRotationCertificate with the old key so friends who pinned your previous key automatically trust the new one"
+                    >
+                      Rotate Signing Key...
+                    </button>
                   </div>
                   <button
                     type="submit"
@@ -3617,21 +3724,14 @@ export const App: React.FC = () => {
                         (email, chat, anything). You'll appear in the ring after they approve it and
                         publish, and you next sync.
                       </p>
-                      <div className="flex gap-2">
-                        <code className="flex-1 truncate px-2 py-1 rounded bg-slate-950 text-slate-300">
-                          {lastRequestLink.link}
-                        </code>
-                        <button
-                          type="button"
-                          onClick={() => {
-                            navigator.clipboard.writeText(lastRequestLink.link);
-                            notify('Copied request link.');
-                          }}
-                          className="px-2.5 py-1 rounded-lg bg-slate-800 hover:bg-slate-700 flex items-center gap-1"
-                        >
-                          <Copy className="w-3 h-3" /> Copy
-                        </button>
-                      </div>
+                      <code className="block truncate px-2 py-1 rounded bg-slate-950 text-slate-300">
+                        {lastRequestLink.link}
+                      </code>
+                      <WebringShareBlock
+                        uri={lastRequestLink.link}
+                        markdownLabel={`Join request for ${lastRequestLink.ringName}`}
+                        onStatus={notify}
+                      />
                     </div>
                   )}
                 </form>
@@ -4313,6 +4413,16 @@ export const App: React.FC = () => {
                           >
                             <RefreshCw className="w-3 h-3" /> Sync JSON
                           </button>
+                          {friend.keyStatus === 'changed' && (
+                            <button
+                              type="button"
+                              onClick={() => handleTrustFriendKey(friend)}
+                              className="px-2.5 py-1.5 rounded-lg bg-rose-500/20 hover:bg-rose-500/30 border border-rose-500/40 text-rose-200 text-xs font-medium"
+                              title="Emergency TOFU recovery: re-pin their new key if they lost their previous private key without a KeyRotationCertificate"
+                            >
+                              Trust New Key &amp; Re-sync
+                            </button>
+                          )}
                           {!mutualFriendUrls.includes(friend.siteUrl) && (
                             <button
                               onClick={() => handleLetThemKnow(friend)}
@@ -4363,6 +4473,15 @@ export const App: React.FC = () => {
                             <Trash2 className="w-4 h-4" />
                           </button>
                         </div>
+                        {friendNoticeLinks[friend.siteUrl] && (
+                          <div className="pt-2 border-t border-slate-800/70">
+                            <WebringShareBlock
+                              uri={friendNoticeLinks[friend.siteUrl]}
+                              markdownLabel={`Added you on Webring Studio (${bundle.profile.displayName})`}
+                              onStatus={notify}
+                            />
+                          </div>
+                        )}
                           </>
                         )}
                       </div>
@@ -5190,6 +5309,22 @@ export const App: React.FC = () => {
                       {renderPresetPicker(activeSchedule.schedule.sync.preset, (preset) =>
                         handleSetSchedule({ sync: { preset } })
                       )}
+                      <div className="flex flex-wrap items-center gap-2 text-xs text-slate-400">
+                        <span>Anti-correlation jitter:</span>
+                        <select
+                          value={activeSchedule.schedule.sync.jitterMinutes || 0}
+                          onChange={(e) =>
+                            handleSetSchedule({ sync: { jitterMinutes: Number(e.target.value) } })
+                          }
+                          className="px-2 py-1 rounded-lg bg-slate-900 border border-slate-800 text-slate-200"
+                          title="Adds a random offset per cycle so multiple personas on the same machine don't poll remote hosts at the exact same second"
+                        >
+                          <option value={0}>Exact (0 min)</option>
+                          <option value={5}>Up to 5 min</option>
+                          <option value={15}>Up to 15 min</option>
+                          <option value={30}>Up to 30 min</option>
+                        </select>
+                      </div>
                       {renderJobStatus(activeSchedule.schedule.sync, activeSchedule.nextSyncAt)}
                       <button
                         type="button"
@@ -5237,6 +5372,19 @@ export const App: React.FC = () => {
                           />
                           Sync first
                         </label>
+                        <select
+                          value={activeSchedule.schedule.publish.jitterMinutes || 0}
+                          onChange={(e) =>
+                            handleSetSchedule({ publish: { jitterMinutes: Number(e.target.value) } })
+                          }
+                          className="px-2 py-1 rounded-lg bg-slate-900 border border-slate-800 text-slate-200"
+                          title="Random delay added to scheduled publishes to prevent timing correlation across personas"
+                        >
+                          <option value={0}>No jitter</option>
+                          <option value={5}>+0–5m jitter</option>
+                          <option value={15}>+0–15m jitter</option>
+                          <option value={30}>+0–30m jitter</option>
+                        </select>
                       </div>
                       {renderJobStatus(activeSchedule.schedule.publish, activeSchedule.nextPublishAt)}
                       <button
@@ -5312,6 +5460,41 @@ export const App: React.FC = () => {
                       With background mode off, schedules only run while the Studio window is open.
                     </p>
                   )}
+
+                  <div className="border-t border-slate-800 pt-4 space-y-2">
+                    <div className="flex flex-wrap items-center justify-between gap-2">
+                      <label className="flex items-center gap-2 text-xs font-semibold text-slate-200">
+                        <input
+                          type="checkbox"
+                          checked={proxySettings.enabled}
+                          onChange={(e) => handleSaveProxySettings({ enabled: e.target.checked })}
+                          className="accent-indigo-500"
+                        />
+                        Route this persona's outbound syncs via SOCKS5 / Tor / HTTP Proxy
+                      </label>
+                      <span className="text-[11px] text-slate-500">
+                        Stored locally per persona · never exported
+                      </span>
+                    </div>
+                    <div className="flex flex-wrap gap-2">
+                      <input
+                        type="text"
+                        value={proxySettings.proxyUrl}
+                        onChange={(e) =>
+                          setProxySettings((prev) => ({ ...prev, proxyUrl: e.target.value }))
+                        }
+                        placeholder="socks5h://127.0.0.1:9050 (Tor) or socks5://127.0.0.1:1080"
+                        className="flex-1 min-w-[16rem] px-3 py-1.5 rounded-lg bg-slate-950 border border-slate-800 text-xs font-mono"
+                      />
+                      <button
+                        type="button"
+                        onClick={() => handleSaveProxySettings({ proxyUrl: proxySettings.proxyUrl })}
+                        className="px-3 py-1.5 rounded-lg bg-slate-800 hover:bg-slate-700 text-xs font-medium"
+                      >
+                        Save Proxy
+                      </button>
+                    </div>
+                  </div>
                 </div>
               )}
 
