@@ -69,6 +69,22 @@ The first launch creates an empty primary persona. Start by setting your site's 
 
 ## Getting started
 
+**The quick way: the setup wizard.** A new persona opens the setup wizard, which gets you from nothing to a live site in about 5 minutes:
+
+1. It explains how Studio works: your computer holds the database and keys, and **Publish** copies signed files to your public site.
+2. You enter your name.
+3. **Sign in with GitHub:** Studio shows a short code and you approve it on github.com. There's no token to create. The sign-in is kept in your system keychain, only for this persona, and is never published.
+4. **Create my site:** Studio creates a public `<username>.github.io` repository and sets your site address (`https://<username>.github.io`) and `did:web` identity. If that name is taken by another project, it suggests a different name instead of overwriting it.
+5. **Publish:** your site is uploaded.
+6. **Going live:** Studio waits for GitHub Pages and checks that your site is reachable and signed with your key.
+7. **What's next:** Publish vs Sync, adding friends, and an optional one-click schedule.
+
+You can close the wizard at any point and continue later from **Start setup** in the banner, or from the **Setup & Health** card on the Publish tab. That card stays useful afterwards: it flags a GitHub sign-in that stopped working, a site address that doesn't match the repository, or a site that's down.
+
+> Sign in with GitHub needs the project's GitHub OAuth App client ID (built in, or set `WEBRING_GITHUB_CLIENT_ID` for a fork). Without one, the wizard walks you through creating an access token instead.
+
+**Or set things up yourself:**
+
 1. **Set up your profile.** In **Profile & Identity**, set your site's public URL (for example `https://yourname.github.io` or your own domain), name, bio and links. Your `did:web` identity comes from that URL.
 
    For the **profile photo** and **banner**, upload a JPEG or PNG from your computer (or drop it on the preview), pick a photo from one of your albums, or enter an image address. Uploads are resized, have camera and GPS data removed, and are published with your site. There's only ever one of each: a new one replaces the old, and a replaced upload is deleted, from Studio and from your host at the next publish.
@@ -202,6 +218,8 @@ Schedules run while Studio is running. With **background mode** on (the default)
 
 Studio includes a [Model Context Protocol](https://modelcontextprotocol.io) server, so an AI agent (Claude Code, Claude Desktop, Cursor, or your own scripts) can read and manage your personas, posts, friends, rings, schedules and publishing. The **AI Agent (MCP)** tab lists every tool and has a console for trying them.
 
+**Guided setup by an agent.** The server tells agents about the `guided-setup` prompt, which walks a new user through signing in to GitHub, creating their site, publishing and checking it's live. It uses the same steps as the in-app wizard. The tools are `webring_get_setup_status`, `webring_github_login_start` / `webring_github_login_poll` (the user approves a code on github.com, and the agent never sees the token), `webring_setup_github_site`, `webring_publish` and `webring_check_live_site`. Signing in, creating the site and publishing need the live connection below.
+
 There are two ways to connect.
 
 **1. Live connection to the running app (recommended)**
@@ -253,12 +271,13 @@ Then configure your MCP client to run:
 |---|---|
 | `electron/main.ts`, `electron/preload.ts` | App lifecycle, tray, IPC |
 | `electron/db/database.ts` | SQLite schema and queries, and the signed site bundle |
-| `electron/services/` | Friend crawler, webrings, site generator, publisher, personas, scheduler |
+| `electron/services/` | Friend crawler, webrings, site generator, publisher, personas, scheduler, guided setup and GitHub sign-in (`setupService.ts`, `githubAuth.ts`) |
 | `electron/mcp/` | MCP server (stdio CLI, and loopback HTTP/SSE) |
 | `electron/security/` | Keychain encryption, private-network guard |
 | `src/shared/schema.ts` | Data schemas (zod), signing and verification, `did:web` |
 | `src/studio/App.tsx` | The Studio UI |
 | `src/studio/SiteDesignPanel.tsx` | Site Design: look & feel options and page layout blocks |
+| `src/studio/SetupWizard.tsx` | The first-run setup wizard and the Setup & Health card |
 | `src/shared/markdown.ts` | Safe Markdown renderer for text blocks (also embedded in published pages) |
 | `docs/architecture/federation.md` | How federation, signing and webrings fit together |
 

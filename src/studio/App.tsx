@@ -33,6 +33,8 @@ import { renderMarkdown } from '../shared/markdown';
 import { ProfileImagePicker } from './ProfileImagePicker';
 import { HostedRingPageEditor } from './HostedRingPageEditor';
 import { WebringShareBlock } from './QrCodeSvg';
+import { SetupApi, SetupHealthCard, SetupWizard } from './SetupWizard';
+import type { SetupStatus } from '../shared/setup';
 import {
   BookOpen,
   Camera,
@@ -539,6 +541,15 @@ declare global {
         filesPublished: number;
         message: string;
       }>;
+      getSetupStatus?: SetupApi['getSetupStatus'];
+      githubLoginAvailable?: SetupApi['githubLoginAvailable'];
+      githubLoginStart?: SetupApi['githubLoginStart'];
+      githubLoginPoll?: SetupApi['githubLoginPoll'];
+      githubConnectToken?: SetupApi['githubConnectToken'];
+      setupConfigureSite?: SetupApi['setupConfigureSite'];
+      setupPublish?: SetupApi['setupPublish'];
+      setupCheckLive?: SetupApi['setupCheckLive'];
+      setupDismiss?: SetupApi['setupDismiss'];
       checkGithubRepo: (settings: unknown) => Promise<{
         success: boolean;
         defaultBranch?: string;
@@ -659,6 +670,10 @@ export const App: React.FC = () => {
 
   // Multi-Persona compartmentalization state
   const [activePersonaId, setActivePersonaId] = useState<string>('default');
+  const [setupStatus, setSetupStatus] = useState<SetupStatus | null>(null);
+  const [showSetupWizard, setShowSetupWizard] = useState(false);
+  /** Personas the wizard has already opened for by itself this session */
+  const setupAutoOpened = useRef(new Set<string>());
   const [personas, setPersonas] = useState<PersonaSummary[]>([]);
   const [showPersonaModal, setShowPersonaModal] = useState(false);
   const [newPersonaLabel, setNewPersonaLabel] = useState('');
@@ -859,8 +874,57 @@ export const App: React.FC = () => {
     }, 5000);
   };
 
+  useEffect(() => {
+    if (!bundle || !setupStatus || showSetupWizard) return;
+    if (setupStatus.complete || setupStatus.dismissed || setupAutoOpened.current.has(activePersonaId)) return;
+    if (!isPlaceholderSiteUrl(bundle.profile.siteUrl)) return;
+    setupAutoOpened.current.add(activePersonaId);
+    setShowSetupWizard(true);
+  }, [bundle, setupStatus, activePersonaId]);
+
+  const setupApi: SetupApi | null =
+    window.studioApi?.getSetupStatus &&
+    window.studioApi.githubLoginAvailable &&
+    window.studioApi.githubLoginStart &&
+    window.studioApi.githubLoginPoll &&
+    window.studioApi.githubConnectToken &&
+    window.studioApi.setupConfigureSite &&
+    window.studioApi.setupPublish &&
+    window.studioApi.setupCheckLive &&
+    window.studioApi.setupDismiss
+      ? {
+          getSetupStatus: window.studioApi.getSetupStatus,
+          githubLoginAvailable: window.studioApi.githubLoginAvailable,
+          githubLoginStart: window.studioApi.githubLoginStart,
+          githubLoginPoll: window.studioApi.githubLoginPoll,
+          githubConnectToken: window.studioApi.githubConnectToken,
+          setupConfigureSite: window.studioApi.setupConfigureSite,
+          setupPublish: window.studioApi.setupPublish,
+          setupCheckLive: window.studioApi.setupCheckLive,
+          setupDismiss: window.studioApi.setupDismiss,
+          openExternal: window.studioApi.openExternal,
+        }
+      : null;
+
+  const openSetupWizard = async () => {
+    await window.studioApi?.setupDismiss?.(false).catch(() => undefined);
+    setShowSetupWizard(true);
+  };
+
+  const refreshSetupStatus = async (checkGitHub = false) => {
+    if (!window.studioApi?.getSetupStatus) return null;
+    try {
+      const status = await window.studioApi.getSetupStatus({ checkGitHub });
+      setSetupStatus(status);
+      return status;
+    } catch {
+      return null;
+    }
+  };
+
   const refreshStudioData = async () => {
     if (!window.studioApi) return;
+    void refreshSetupStatus();
     const data = await window.studioApi.getBundle();
     if (data.activePersonaId) {
       setActivePersonaId(data.activePersonaId);
@@ -2429,19 +2493,30 @@ export const App: React.FC = () => {
           {isPlaceholderSiteUrl(bundle.profile.siteUrl) && activeTab !== 'profile' && (
             <div className="max-w-5xl mx-auto mb-5 p-4 rounded-2xl bg-amber-500/10 border border-amber-500/30 flex flex-wrap items-center justify-between gap-3 text-sm">
               <div>
-                <strong className="text-amber-200">Set up your profile first.</strong>{' '}
+                <strong className="text-amber-200">Finish setting up your site.</strong>{' '}
                 <span className="text-slate-300">
-                  Add your site's public address (for example <code>https://yourname.github.io</code>)
-                  and your name. Your identity and everything you publish are based on that address.
+                  The setup wizard connects GitHub, creates your free site (for example{' '}
+                  <code>https://yourname.github.io</code>) and publishes it, in about 5 minutes.
                 </span>
               </div>
-              <button
-                type="button"
-                onClick={() => setActiveTab('profile')}
-                className="px-3 py-1.5 rounded-lg bg-amber-500/20 hover:bg-amber-500/30 text-amber-200 text-xs font-semibold"
-              >
-                Open Profile →
-              </button>
+              <div className="flex gap-2">
+                {setupApi && (
+                  <button
+                    type="button"
+                    onClick={() => void openSetupWizard()}
+                    className="px-3 py-1.5 rounded-lg bg-indigo-600 hover:bg-indigo-500 text-white text-xs font-semibold"
+                  >
+                    Start setup →
+                  </button>
+                )}
+                <button
+                  type="button"
+                  onClick={() => setActiveTab('profile')}
+                  className="px-3 py-1.5 rounded-lg bg-amber-500/20 hover:bg-amber-500/30 text-amber-200 text-xs font-semibold"
+                >
+                  Set it up myself
+                </button>
+              </div>
             </div>
           )}
           {/* TAB 1: PROFILE & IDENTITY */}
@@ -5228,6 +5303,14 @@ export const App: React.FC = () => {
                 </button>
               </div>
 
+              {setupApi && (
+                <SetupHealthCard
+                  status={setupStatus}
+                  onOpenWizard={() => void openSetupWizard()}
+                  onRefresh={() => void refreshSetupStatus(true)}
+                />
+              )}
+
               <div className="bg-slate-900 border border-slate-800 rounded-2xl p-4 text-sm flex flex-wrap items-center justify-between gap-3">
                 {publishSettings.lastPublishedAt ? (
                   <div className="space-y-0.5">
@@ -7205,15 +7288,62 @@ export const App: React.FC = () => {
                       </p>
                     </div>
 
+                    <div className="p-4 rounded-xl bg-emerald-500/10 border border-emerald-500/30 text-xs text-emerald-100 flex flex-wrap items-center justify-between gap-3">
+                      <span className="flex items-start gap-2.5">
+                        <Sparkles className="w-4 h-4 mt-0.5 shrink-0" />
+                        <span>
+                          <strong>Easiest: use the setup wizard.</strong> Sign in with GitHub, and Studio
+                          creates your <code>&lt;username&gt;.github.io</code> repository, sets your site
+                          address, publishes, and checks that your site is live. About 5 minutes, no
+                          terminal or tokens needed.
+                        </span>
+                      </span>
+                      {setupApi && (
+                        <button
+                          type="button"
+                          onClick={() => void openSetupWizard()}
+                          className="px-3 py-1.5 rounded-lg bg-emerald-600 hover:bg-emerald-500 text-white font-semibold"
+                        >
+                          Open the setup wizard →
+                        </button>
+                      )}
+                    </div>
+
                     <div className="p-3.5 rounded-xl bg-indigo-500/10 border border-indigo-500/30 text-xs text-indigo-200 flex items-start gap-2.5">
                       <UploadCloud className="w-4 h-4 mt-0.5 shrink-0" />
-                      <span>
-                        <strong>Skip the terminal:</strong> Webring Studio can push and deploy for you
-                        directly from the app. Go to the <strong>Publish & SFTP</strong> tab → <em>3.
-                        GitHub Pages Deploy</em>, add a repo + access token, and click{' '}
-                        <strong>Save & Deploy to GitHub Pages</strong>. The steps below are what it does
-                        under the hood, and are here for anyone who prefers plain <code>git</code>.
-                      </span>
+                      <div className="space-y-1.5">
+                        <p>
+                          <strong>Or deploy from the app with your own repo and token:</strong> Publish &
+                          SFTP tab → <em>3. GitHub Pages Deploy</em>.
+                        </p>
+                        <ol className="list-decimal list-inside space-y-1 text-indigo-100/90">
+                          <li>
+                            Create a <strong>Public</strong> repository on GitHub and tick{' '}
+                            <strong>Add a README</strong> (Studio can't publish to a repo with no commits).
+                          </li>
+                          <li>
+                            Create a token at <strong>GitHub → Settings → Developer settings → Personal
+                            access tokens → Tokens (classic) → Generate new token</strong>, with the{' '}
+                            <code>public_repo</code> scope. (A fine-grained token needs{' '}
+                            <strong>Contents: Read and write</strong> and <strong>Pages: Read and
+                            write</strong> on that repository.)
+                          </li>
+                          <li>
+                            Enter the owner, repository and token. For a{' '}
+                            <code>&lt;username&gt;.github.io</code> repo, set the branch to{' '}
+                            <code>main</code>: GitHub serves that repo from its main branch. For any other
+                            repo, keep <code>gh-pages</code>.
+                          </li>
+                          <li>
+                            Click <strong>Check Repo Access</strong>, then <strong>Save & Deploy to GitHub
+                            Pages</strong>.
+                          </li>
+                        </ol>
+                        <p>
+                          The steps below do the same by hand with plain <code>git</code>, for anyone who
+                          prefers it.
+                        </p>
+                      </div>
                     </div>
 
                     {/* Step 1 */}
@@ -7771,6 +7901,28 @@ git push -u origin main --force`}
                       </div>
                     </div>
 
+                    <div className="p-4 rounded-xl bg-emerald-500/5 border border-emerald-500/30 space-y-2 text-xs text-slate-300">
+                      <strong className="text-white block">🧭 Guided Setup for New Users (6 tools + a prompt)</strong>
+                      <p className="leading-relaxed">
+                        An agent can walk someone through getting their site online, step by step. Ask
+                        your MCP client to run the <code>guided-setup</code> prompt, or say "help me set up
+                        Webring Studio". The agent signs you in to GitHub (you enter a short code on
+                        github.com; the token stays in your keychain and is never shown to the agent),
+                        creates your <code>&lt;username&gt;.github.io</code> site, publishes it and checks
+                        that it's live. It follows the same steps as the in-app setup wizard, so you can
+                        switch between them.
+                      </p>
+                      <p>
+                        <code>webring_get_setup_status</code>, <code>webring_github_login_start</code>,{' '}
+                        <code>webring_github_login_poll</code>, <code>webring_setup_github_site</code>,{' '}
+                        <code>webring_publish</code>, <code>webring_check_live_site</code>
+                      </p>
+                      <p className="text-slate-400">
+                        Sign-in, site creation and publishing need the live connection to the running app
+                        (SSE/HTTP), not the standalone stdio server.
+                      </p>
+                    </div>
+
                     <div className="flex items-center justify-between pt-2">
                       <p className="text-xs text-slate-400">
                         Ready to copy your one-click MCP configuration or test tools interactively?
@@ -8177,6 +8329,34 @@ git push -u origin main --force`}
           )}
         </div>
       </main>
+
+      {/* Guided setup: GitHub sign-in, site creation, first publish and live check */}
+      {showSetupWizard && setupApi && bundle && (
+        <SetupWizard
+          key={activePersonaId}
+          api={setupApi}
+          profile={{
+            displayName: bundle.profile.displayName,
+            bio: bundle.profile.bio,
+            siteUrl: bundle.profile.siteUrl,
+          }}
+          onSaveProfile={async (changes) => {
+            await window.studioApi?.updateProfile(changes);
+            await refreshStudioData();
+          }}
+          onEnableSchedule={async () => {
+            await handleSetSchedule({
+              sync: { enabled: true, preset: { kind: 'interval', minutes: 60 } },
+              publish: { enabled: true, preset: { kind: 'daily', time: '09:00' }, destination: 'github', syncFirst: true },
+            });
+          }}
+          onChanged={() => void refreshStudioData()}
+          onClose={() => {
+            setShowSetupWizard(false);
+            void refreshStudioData();
+          }}
+        />
+      )}
 
       {/* Multi-Persona Compartmentalization Manager Modal */}
       {showPersonaModal && (

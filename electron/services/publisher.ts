@@ -13,6 +13,7 @@ import {
 } from './publishSync';
 import { PublishSettings } from '../db/database';
 import { StaticSiteGenerator } from './siteGenerator';
+import { githubPagesSiteUrl } from '../../src/shared/setup';
 
 export interface PublishResult {
   success: boolean;
@@ -47,6 +48,49 @@ export interface GitHubRepoCheckResult {
 }
 
 const GITHUB_API_BASE = 'https://api.github.com';
+
+/** A `<owner>.github.io` repo: GitHub Pages serves it at `https://<owner>.github.io` from its default branch. */
+export function isUserPagesRepo(owner: string, repo: string): boolean {
+  return repo.trim().toLowerCase() === `${owner.trim().toLowerCase()}.github.io`;
+}
+
+export { githubPagesSiteUrl };
+
+function pagesSettingsNote(owner: string, repo: string, branch: string, status: number): string {
+  return (
+    ` GitHub Pages couldn't be turned on automatically (HTTP ${status}). Turn it on at ` +
+    `https://github.com/${owner}/${repo}/settings/pages: "Deploy from a branch", branch "${branch}", folder "/ (root)".`
+  );
+}
+
+export interface GitHubUser {
+  login: string;
+  name?: string;
+  avatarUrl?: string;
+  htmlUrl?: string;
+}
+
+export type GitHubRepoCreateResult =
+  | { status: 'created'; owner: string; repo: string; defaultBranch: string }
+  | {
+      status: 'exists';
+      owner: string;
+      repo: string;
+      defaultBranch: string;
+      canPush: boolean;
+      isEmpty: boolean;
+      publishedByStudio: boolean;
+    }
+  | { status: 'error'; message: string };
+
+export type PagesBuildStatus =
+  | { status: 'built'; updatedAt?: string }
+  | { status: 'building' | 'queued' | 'unknown'; updatedAt?: string }
+  | { status: 'errored'; message: string }
+  | { status: 'not-enabled' };
+
+/** Files GitHub can add to a new repo; a repo holding only these counts as empty. */
+const STARTER_FILE = /^(readme(\.md)?|license(\.md|\.txt)?|\.gitignore)$/i;
 
 export class SitePublisher {
   constructor(private generator: StaticSiteGenerator) {}
@@ -406,7 +450,14 @@ export class SitePublisher {
         if (pagesCreateRes.status === 201) {
           pagesNote = ' GitHub Pages was enabled for this repo.';
         } else if (pagesCreateRes.status === 409) {
-          await gh(`${repoPath}/pages`, 'PUT', { source: { branch, path: '/' } });
+          const pagesUpdateRes = await gh(`${repoPath}/pages`, 'PUT', { source: { branch, path: '/' } });
+          if (pagesUpdateRes.status >= 400 && !isUserPagesRepo(owner, repo)) {
+            pagesNote = pagesSettingsNote(owner, repo, branch, pagesUpdateRes.status);
+          }
+        } else if (!isUserPagesRepo(owner, repo)) {
+          // A <owner>.github.io repo is served from its default branch without this call; any
+          // other repo needs Pages turned on, so say so instead of failing silently
+          pagesNote = pagesSettingsNote(owner, repo, branch, pagesCreateRes.status);
         }
       } catch {
         pagesNote = ' (Could not confirm GitHub Pages site settings — check them in the repo settings.)';
@@ -498,6 +549,95 @@ export class SitePublisher {
         ? `Connected to ${owner}/${repo}. Branch "${branch}" exists.${pagesEnabled ? ' GitHub Pages is already enabled.' : ' GitHub Pages is not yet enabled — it will be enabled on first deploy.'}`
         : `Connected to ${owner}/${repo}. Branch "${branch}" doesn't exist yet — it will be created from "${defaultBranch}" on first deploy.`,
     };
+  }
+
+  /** Who the token belongs to, or null when GitHub rejects it (revoked, expired or wrong). */
+  public async getGitHubUser(token: string): Promise<GitHubUser | null> {
+    const res = await this.githubRequest(token, '/user');
+    if (res.status !== 200) return null;
+    const body = res.body as { login?: string; name?: string | null; avatar_url?: string; html_url?: string };
+    if (!body.login) return null;
+    return {
+      login: body.login,
+      ...(body.name ? { name: body.name } : {}),
+      ...(body.avatar_url ? { avatarUrl: body.avatar_url } : {}),
+      ...(body.html_url ? { htmlUrl: body.html_url } : {}),
+    };
+  }
+
+  /**
+   * Creates a public repo for the site with a first commit (a repo with no commits can't be
+   * published to). If the name is taken, reports whether it's usable: empty, or already holding a
+   * site Studio published.
+   */
+  public async createPagesRepo(token: string, owner: string, repo: string): Promise<GitHubRepoCreateResult> {
+    const createRes = await this.githubRequest(token, '/user/repos', 'POST', {
+      name: repo,
+      description: 'My Webring Studio site',
+      homepage: githubPagesSiteUrl(owner, repo),
+      private: false,
+      auto_init: true,
+      has_issues: false,
+      has_wiki: false,
+      has_projects: false,
+    });
+    if (createRes.status === 201) {
+      const body = createRes.body as { default_branch?: string; owner?: { login?: string }; name?: string };
+      return {
+        status: 'created',
+        owner: body.owner?.login || owner,
+        repo: body.name || repo,
+        defaultBranch: body.default_branch || 'main',
+      };
+    }
+    if (createRes.status !== 422) {
+      return {
+        status: 'error',
+        message: `GitHub couldn't create ${owner}/${repo} (HTTP ${createRes.status})${this.githubErrorDetail(createRes.body)}`,
+      };
+    }
+    // 422: the name is taken (or invalid); look at what's there
+    const repoRes = await this.githubRequest(token, `/repos/${owner}/${repo}`);
+    if (repoRes.status !== 200) {
+      return { status: 'error', message: `GitHub couldn't create ${owner}/${repo}${this.githubErrorDetail(createRes.body)}` };
+    }
+    const info = repoRes.body as { default_branch?: string; permissions?: { push?: boolean } };
+    const defaultBranch = info.default_branch || 'main';
+    const contents = await this.githubRequest(
+      token,
+      `/repos/${owner}/${repo}/contents/?ref=${encodeURIComponent(defaultBranch)}`
+    );
+    const names =
+      contents.status === 200 && Array.isArray(contents.body)
+        ? (contents.body as Array<{ name?: string }>).map((e) => String(e.name || ''))
+        : [];
+    return {
+      status: 'exists',
+      owner,
+      repo,
+      defaultBranch,
+      canPush: info.permissions?.push !== false,
+      isEmpty: contents.status === 404 || names.every((n) => STARTER_FILE.test(n)),
+      publishedByStudio: names.includes('.nojekyll') && names.includes('api'),
+    };
+  }
+
+  /** The latest GitHub Pages build for the repo: whether the site has finished going live. */
+  public async getPagesBuildStatus(token: string, owner: string, repo: string): Promise<PagesBuildStatus> {
+    const res = await this.githubRequest(token, `/repos/${owner}/${repo}/pages/builds/latest`);
+    if (res.status === 404) {
+      const pages = await this.githubRequest(token, `/repos/${owner}/${repo}/pages`);
+      return pages.status === 200 ? { status: 'unknown' } : { status: 'not-enabled' };
+    }
+    if (res.status !== 200) return { status: 'unknown' };
+    const body = res.body as { status?: string; updated_at?: string; error?: { message?: string | null } };
+    const updatedAt = body.updated_at ? { updatedAt: body.updated_at } : {};
+    if (body.status === 'built') return { status: 'built', ...updatedAt };
+    if (body.status === 'errored') {
+      return { status: 'errored', message: body.error?.message || 'GitHub Pages reported a build error.' };
+    }
+    if (body.status === 'building' || body.status === 'queued') return { status: body.status, ...updatedAt };
+    return { status: 'unknown' };
   }
 
   /**
