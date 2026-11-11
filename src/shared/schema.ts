@@ -25,6 +25,21 @@ export const SignatureProofSchema = z.object({
 export type SignatureProof = z.infer<typeof SignatureProofSchema>;
 
 /**
+ * Signed statement where a persona's previous Ed25519 private key endorses its replacement
+ * public key, allowing peers who pinned the old key via TOFU to verify a planned key rotation.
+ */
+export const KeyRotationCertificateSchema = z.object({
+  type: z.literal('webring-key-rotation').default('webring-key-rotation'),
+  did: z.string(),
+  siteUrl: z.string(),
+  oldPublicKeyPem: z.string(),
+  newPublicKeyPem: z.string(),
+  rotatedAt: z.string(),
+  proof: SignatureProofSchema,
+});
+export type KeyRotationCertificate = z.infer<typeof KeyRotationCertificateSchema>;
+
+/**
  * W3C / ATProto compatible did:web Document (/.well-known/did.json)
  */
 export const DidDocumentSchema = z.object({
@@ -47,6 +62,7 @@ export const DidDocumentSchema = z.object({
       serviceEndpoint: z.string(),
     })
   ),
+  keyRotations: z.array(KeyRotationCertificateSchema).optional().catch(undefined),
 });
 export type DidDocument = z.infer<typeof DidDocumentSchema>;
 
@@ -79,6 +95,7 @@ export const WebringManifestSchema = z.object({
    * current can skip the site, and otherwise fetch only the documents whose fingerprint changed.
    */
   documents: z.record(z.string(), z.object({ sha256: z.string() })).optional().catch(undefined),
+  keyRotations: z.array(KeyRotationCertificateSchema).optional().catch(undefined),
   proof: SignatureProofSchema.optional(),
 });
 export type WebringManifest = z.infer<typeof WebringManifestSchema>;
@@ -464,7 +481,14 @@ export type SharedItem = z.infer<typeof SharedItemSchema>;
  */
 export const ItemsArchiveIndexSchema = z.object({
   since: z.string(),
-  months: z.array(z.object({ month: z.string().regex(/^\d{4}-\d{2}$/), url: z.string(), count: z.number() })),
+  months: z.array(
+    z.object({
+      month: z.string().regex(/^\d{4}-\d{2}$/),
+      url: z.string(),
+      count: z.number(),
+      sha256: z.string().optional(),
+    })
+  ),
 });
 export type ItemsArchiveIndex = z.infer<typeof ItemsArchiveIndexSchema>;
 
@@ -982,13 +1006,82 @@ export function verifyDocumentSignature(
 }
 
 /**
+ * Signs a KeyRotationCertificate using the persona's OLD Ed25519 private key so peers who
+ * pinned the old public key via TOFU can cryptographically verify the transition to the new key.
+ */
+export function createKeyRotationCertificate(params: {
+  siteUrl: string;
+  oldPublicKeyPem: string;
+  oldPrivateKeyPem: string;
+  newPublicKeyPem: string;
+  rotatedAt?: string;
+}): KeyRotationCertificate {
+  const normalizedUrl = normalizeSiteUrl(params.siteUrl);
+  const did = siteUrlToDidWeb(normalizedUrl);
+  const rotatedAt = params.rotatedAt || new Date().toISOString();
+  const unsigned = {
+    type: 'webring-key-rotation' as const,
+    did,
+    siteUrl: normalizedUrl,
+    oldPublicKeyPem: params.oldPublicKeyPem.trim(),
+    newPublicKeyPem: params.newPublicKeyPem.trim(),
+    rotatedAt,
+  };
+  return signDocument(unsigned, did, params.oldPrivateKeyPem, rotatedAt);
+}
+
+/**
+ * Verifies whether a list of KeyRotationCertificates forms a valid Ed25519-signed chain
+ * from `pinnedPublicKeyPem` to `targetPublicKeyPem` for the given `did` and `siteUrl`.
+ */
+export function verifyKeyRotationChain(params: {
+  pinnedPublicKeyPem: string;
+  targetPublicKeyPem: string;
+  did: string;
+  siteUrl: string;
+  certificates?: KeyRotationCertificate[];
+}): boolean {
+  const startKey = params.pinnedPublicKeyPem.trim();
+  const targetKey = params.targetPublicKeyPem.trim();
+  if (!startKey || !targetKey) return false;
+  if (startKey === targetKey) return true;
+  const certs = params.certificates;
+  if (!Array.isArray(certs) || certs.length === 0) return false;
+
+  const expectedSite = normalizeSiteUrl(params.siteUrl);
+  const visited = new Set<string>([startKey]);
+  let currentKey = startKey;
+  const maxHops = Math.min(certs.length, 10);
+
+  for (let hop = 0; hop < maxHops; hop++) {
+    const nextCert = certs.find((c) => {
+      if (!c || typeof c !== 'object') return false;
+      if ((c.oldPublicKeyPem || '').trim() !== currentKey) return false;
+      const nextKey = (c.newPublicKeyPem || '').trim();
+      if (!nextKey || visited.has(nextKey)) return false;
+      if (c.did !== params.did || normalizeSiteUrl(c.siteUrl) !== expectedSite) return false;
+      return verifyDocumentSignature(
+        c as unknown as Record<string, unknown> & { proof?: SignatureProof },
+        currentKey
+      );
+    });
+    if (!nextCert) return false;
+    currentKey = nextCert.newPublicKeyPem.trim();
+    visited.add(currentKey);
+    if (currentKey === targetKey) return true;
+  }
+  return false;
+}
+
+/**
  * Builds a W3C / ATProto compatible /.well-known/did.json document
  */
 export function buildDidDocument(
   siteUrl: string,
   publicKeyPem: string,
   handle?: string,
-  atprotoPdsUrl?: string
+  atprotoPdsUrl?: string,
+  keyRotations?: KeyRotationCertificate[]
 ): DidDocument {
   const normalizedUrl = normalizeSiteUrl(siteUrl);
   const did = siteUrlToDidWeb(normalizedUrl);
@@ -1025,6 +1118,7 @@ export function buildDidDocument(
       },
     ],
     service: services,
+    ...(keyRotations && keyRotations.length > 0 ? { keyRotations } : {}),
   };
 }
 

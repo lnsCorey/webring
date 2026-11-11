@@ -85,7 +85,12 @@ export class RingService {
   private fetcher: JsonFetcher;
 
   constructor(private db: StudioDatabase, customFetcher?: JsonFetcher) {
-    this.fetcher = customFetcher || defaultJsonFetcher;
+    this.fetcher =
+      customFetcher ||
+      ((url: string) => {
+        const proxy = this.db.getProxySettings();
+        return defaultJsonFetcher(url, proxy.enabled && proxy.proxyUrl ? proxy.proxyUrl : undefined);
+      });
   }
 
   /**
@@ -131,7 +136,7 @@ export class RingService {
     if (!fetchedPem) {
       throw new Error(`did.json at ${normalized} has no public key`);
     }
-    const status = this.db.pinSiteKey(normalized, expectedDid, fetchedPem);
+    const status = this.db.pinSiteKey(normalized, expectedDid, fetchedPem, didDoc.keyRotations);
     const pinned = this.db.getSiteKey(normalized)!;
     return { did: expectedDid, publicKeyPem: pinned.publicKeyPem, keyChanged: status === 'changed' };
   }

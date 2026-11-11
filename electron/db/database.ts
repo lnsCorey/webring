@@ -19,6 +19,7 @@ import {
   canonicalizeJson,
   CompleteSiteBundle,
   ConnectionsDocument,
+  createKeyRotationCertificate,
   EndorsementItem,
   FriendConnection,
   FriendKeyStatus,
@@ -28,6 +29,8 @@ import {
   isUrlWithinSite,
   isValidGa4MeasurementId,
   ItemsDocument,
+  KeyRotationCertificate,
+  KeyRotationCertificateSchema,
   normalizeRingPagePath,
   computeRingNeighbors,
   documentFingerprint,
@@ -43,6 +46,7 @@ import {
   SharedItemType,
   signDocument,
   siteUrlToDidWeb,
+  verifyKeyRotationChain,
   WEBRING_SCHEMA_VERSION,
   publicKeyFingerprint,
   WebringHubDocument,
@@ -1310,6 +1314,82 @@ export class StudioDatabase {
     return {
       publicKeyPem: row.public_key_pem,
       privateKeyPem: openPrivateKey(row.private_key_pem, this.keyCipher),
+    };
+  }
+
+  /**
+   * Signed key rotation certificates for this persona's current site URL, published in did.json
+   * and manifest.json so peers who pinned an earlier key can verify the rotation chain.
+   */
+  public getKeyRotations(): KeyRotationCertificate[] {
+    const row = this.db
+      .prepare("SELECT value FROM local_settings WHERE key = 'keyRotationsJson'")
+      .get() as { value: string } | undefined;
+    if (!row?.value) return [];
+    try {
+      const parsed = JSON.parse(row.value);
+      if (!Array.isArray(parsed)) return [];
+      const siteUrl = normalizeSiteUrl(this.getProfile().siteUrl);
+      const did = siteUrlToDidWeb(siteUrl);
+      const valid: KeyRotationCertificate[] = [];
+      for (const item of parsed) {
+        const res = KeyRotationCertificateSchema.safeParse(item);
+        if (res.success && normalizeSiteUrl(res.data.siteUrl) === siteUrl && res.data.did === did) {
+          valid.push(res.data);
+        }
+      }
+      return valid;
+    } catch {
+      return [];
+    }
+  }
+
+  /**
+   * Generates a fresh Ed25519 signing keypair for this persona, signs a KeyRotationCertificate
+   * with the previous private key endorsing the new public key, seals the new private key in the
+   * OS keychain, and clears published document stamps so the next publish re-signs everything.
+   */
+  public rotateSigningKeys(): {
+    publicKeyPem: string;
+    publicKeyFingerprint: string;
+    rotationCertificate: KeyRotationCertificate;
+    rotationCount: number;
+  } {
+    const profile = this.getProfile();
+    const { publicKeyPem: oldPublicKeyPem, privateKeyPem: oldPrivateKeyPem } = this.getKeys();
+    const { publicKeyPem: newPublicKeyPem, privateKeyPem: newPrivateKeyPem } =
+      generateIdentityKeyPair();
+    const now = new Date().toISOString();
+
+    const cert = createKeyRotationCertificate({
+      siteUrl: profile.siteUrl,
+      oldPublicKeyPem,
+      oldPrivateKeyPem,
+      newPublicKeyPem,
+      rotatedAt: now,
+    });
+
+    const existing = this.getKeyRotations();
+    const updatedRotations = [...existing, cert].slice(-10);
+    const sealedNewPrivate = sealPrivateKey(newPrivateKeyPem, this.keyCipher);
+
+    this.transaction(() => {
+      this.db
+        .prepare('UPDATE profile SET public_key_pem = ?, private_key_pem = ?, updated_at = ? WHERE id = 1')
+        .run(newPublicKeyPem, sealedNewPrivate, now);
+      this.db
+        .prepare(
+          "INSERT INTO local_settings (key, value) VALUES ('keyRotationsJson', ?) ON CONFLICT(key) DO UPDATE SET value = excluded.value"
+        )
+        .run(JSON.stringify(updatedRotations));
+      this.db.exec('DELETE FROM published_documents');
+    });
+
+    return {
+      publicKeyPem: newPublicKeyPem,
+      publicKeyFingerprint: publicKeyFingerprint(newPublicKeyPem),
+      rotationCertificate: cert,
+      rotationCount: updatedRotations.length,
     };
   }
 
@@ -2730,13 +2810,23 @@ export class StudioDatabase {
   }
 
   /**
-   * Pins a site's key the first time it's seen. A different key later is reported as 'changed'
-   * and the original key stays pinned.
+   * Pins a site's key the first time it's seen. If a different key is presented later, verifies
+   * whether `keyRotations` carries a valid Ed25519-signed rotation chain from the pinned key to
+   * the new key; if so, advances the pinned key to the new one. Otherwise reports 'changed' and
+   * keeps the original key pinned.
    */
-  public pinSiteKey(siteUrl: string, did: string, publicKeyPem: string): 'pinned' | 'changed' {
+  public pinSiteKey(
+    siteUrl: string,
+    did: string,
+    publicKeyPem: string,
+    keyRotations?: KeyRotationCertificate[]
+  ): 'pinned' | 'changed' {
     const normalized = normalizeSiteUrl(siteUrl);
     const existing = this.getSiteKey(normalized);
-    if (!existing) {
+    const existingFriend = this.getFriendBySiteUrl(normalized);
+    const priorPinnedPem = existing?.publicKeyPem || existingFriend?.pinnedPublicKeyPem || '';
+
+    if (!existing && !priorPinnedPem) {
       this.db
         .prepare(
           'INSERT INTO site_keys (site_url, did, public_key_pem, key_status, first_seen_at) VALUES (?, ?, ?, ?, ?)'
@@ -2744,9 +2834,161 @@ export class StudioDatabase {
         .run(normalized, did, publicKeyPem, 'pinned', new Date().toISOString());
       return 'pinned';
     }
-    const status = existing.publicKeyPem.trim() === publicKeyPem.trim() ? 'pinned' : 'changed';
-    this.db.prepare('UPDATE site_keys SET key_status = ? WHERE site_url = ?').run(status, normalized);
-    return status;
+
+    if (priorPinnedPem.trim() === publicKeyPem.trim()) {
+      if (!existing) {
+        this.db
+          .prepare(
+            'INSERT INTO site_keys (site_url, did, public_key_pem, key_status, first_seen_at) VALUES (?, ?, ?, ?, ?)'
+          )
+          .run(normalized, did, publicKeyPem, 'pinned', new Date().toISOString());
+      } else {
+        this.db.prepare('UPDATE site_keys SET key_status = ? WHERE site_url = ?').run('pinned', normalized);
+      }
+      return 'pinned';
+    }
+
+    const effectiveDid = did || existing?.did || siteUrlToDidWeb(normalized);
+    const rotationVerified = verifyKeyRotationChain({
+      pinnedPublicKeyPem: priorPinnedPem,
+      targetPublicKeyPem: publicKeyPem,
+      did: effectiveDid,
+      siteUrl: normalized,
+      certificates: keyRotations,
+    });
+
+    if (rotationVerified) {
+      this.transaction(() => {
+        if (!existing) {
+          this.db
+            .prepare(
+              'INSERT INTO site_keys (site_url, did, public_key_pem, key_status, first_seen_at) VALUES (?, ?, ?, ?, ?)'
+            )
+            .run(normalized, effectiveDid, publicKeyPem, 'pinned', new Date().toISOString());
+        } else {
+          this.db
+            .prepare('UPDATE site_keys SET did = ?, public_key_pem = ?, key_status = ? WHERE site_url = ?')
+            .run(effectiveDid, publicKeyPem, 'pinned', normalized);
+        }
+        this.db
+          .prepare('UPDATE friends SET pinned_public_key_pem = ?, key_status = ? WHERE site_url = ?')
+          .run(publicKeyPem, 'pinned', normalized);
+        this.db
+          .prepare('UPDATE ring_members SET key_fingerprint = ? WHERE site_url = ?')
+          .run(publicKeyFingerprint(publicKeyPem), normalized);
+      });
+      return 'pinned';
+    }
+
+    if (!existing) {
+      this.db
+        .prepare(
+          'INSERT INTO site_keys (site_url, did, public_key_pem, key_status, first_seen_at) VALUES (?, ?, ?, ?, ?)'
+        )
+        .run(normalized, effectiveDid, priorPinnedPem, 'changed', new Date().toISOString());
+    } else {
+      this.db.prepare('UPDATE site_keys SET key_status = ? WHERE site_url = ?').run('changed', normalized);
+    }
+    return 'changed';
+  }
+
+  /**
+   * Manually resets or replaces a friend's pinned Ed25519 key (for emergency key recovery when
+   * the friend lost their previous private key and could not sign a KeyRotationCertificate).
+   * If `newPublicKeyPem` is omitted, clears the pinned key so the next sync pins their live key.
+   */
+  public trustNewFriendKey(friendId: string, newPublicKeyPem?: string): FriendConnection {
+    const current = this.getFriendById(friendId);
+    if (!current) {
+      throw new Error(`Friend "${friendId}" not found.`);
+    }
+    const normalized = normalizeSiteUrl(current.siteUrl);
+    const cleanKey = newPublicKeyPem?.trim() || '';
+    this.transaction(() => {
+      this.db.prepare('DELETE FROM fetch_cache WHERE site_url = ?').run(normalized);
+      if (cleanKey) {
+        const did = current.did || siteUrlToDidWeb(normalized);
+        this.db
+          .prepare(
+            `INSERT INTO site_keys (site_url, did, public_key_pem, key_status, first_seen_at)
+             VALUES (?, ?, ?, 'pinned', ?)
+             ON CONFLICT(site_url) DO UPDATE SET did = excluded.did, public_key_pem = excluded.public_key_pem, key_status = 'pinned'`
+          )
+          .run(normalized, did, cleanKey, new Date().toISOString());
+        this.db
+          .prepare(
+            "UPDATE friends SET pinned_public_key_pem = ?, key_status = 'pinned', sync_failures = 0, retry_after = NULL WHERE id = ?"
+          )
+          .run(cleanKey, friendId);
+      } else {
+        this.db.prepare('DELETE FROM site_keys WHERE site_url = ?').run(normalized);
+        this.db
+          .prepare(
+            "UPDATE friends SET pinned_public_key_pem = '', key_status = 'unverified', sync_failures = 0, retry_after = NULL WHERE id = ?"
+          )
+          .run(friendId);
+      }
+    });
+    return this.getFriendById(friendId)!;
+  }
+
+  // ---------------------------------------------------------------------------
+  // Per-persona outbound proxy settings (local only, never exported)
+
+  public getProxySettings(): { enabled: boolean; proxyUrl: string } {
+    const row = this.db
+      .prepare("SELECT value FROM local_settings WHERE key = 'proxySettingsJson'")
+      .get() as { value: string } | undefined;
+    if (!row?.value) return { enabled: false, proxyUrl: '' };
+    try {
+      const parsed = JSON.parse(row.value) as { enabled?: unknown; proxyUrl?: unknown };
+      return {
+        enabled: Boolean(parsed.enabled && typeof parsed.proxyUrl === 'string' && parsed.proxyUrl.trim()),
+        proxyUrl: typeof parsed.proxyUrl === 'string' ? parsed.proxyUrl.trim() : '',
+      };
+    } catch {
+      return { enabled: false, proxyUrl: '' };
+    }
+  }
+
+  public setProxySettings(input: { enabled?: boolean; proxyUrl?: string }): {
+    enabled: boolean;
+    proxyUrl: string;
+  } {
+    const current = this.getProxySettings();
+    const nextUrl = input.proxyUrl !== undefined ? input.proxyUrl.trim() : current.proxyUrl;
+    if (nextUrl) {
+      let parsed: URL;
+      try {
+        parsed = new URL(nextUrl);
+      } catch {
+        throw new Error(
+          'Invalid proxy URL. Expected socks5h://127.0.0.1:9050, socks5://host:port, or http://host:port.'
+        );
+      }
+      const proto = parsed.protocol.toLowerCase();
+      if (proto !== 'socks5:' && proto !== 'socks5h:' && proto !== 'http:') {
+        throw new Error(
+          `Unsupported proxy protocol "${parsed.protocol}". Use socks5h:// (recommended for Tor), socks5://, or http://.`
+        );
+      }
+      const port = Number(parsed.port);
+      if (!parsed.hostname || !Number.isInteger(port) || port < 1 || port > 65535) {
+        throw new Error('Proxy URL must include a valid hostname and port (e.g. socks5h://127.0.0.1:9050).');
+      }
+    }
+    const nextEnabled =
+      input.enabled !== undefined ? Boolean(input.enabled && nextUrl) : Boolean(current.enabled && nextUrl);
+    const next = { enabled: nextEnabled, proxyUrl: nextUrl };
+    this.db
+      .prepare(
+        "INSERT INTO local_settings (key, value) VALUES ('proxySettingsJson', ?) ON CONFLICT(key) DO UPDATE SET value = excluded.value"
+      )
+      .run(JSON.stringify(next));
+    if (next.enabled !== current.enabled || next.proxyUrl !== current.proxyUrl) {
+      this.clearFetchCache();
+    }
+    return next;
   }
 
   // ---------------------------------------------------------------------------
@@ -3478,11 +3720,13 @@ export class StudioDatabase {
       return signDocument({ ...unsigned, updatedAt }, did, privateKeyPem, updatedAt);
     };
 
+    const keyRotations = this.getKeyRotations();
     const didDocument = buildDidDocument(
       siteUrl,
       publicKeyPem,
       rawProfile.atprotoHandle || rawProfile.handle,
-      publishSettings?.atprotoPdsUrl
+      publishSettings?.atprotoPdsUrl,
+      keyRotations
     );
 
     const profileUnsigned: ProfileDocument = {
@@ -3559,6 +3803,7 @@ export class StudioDatabase {
                 month: archivePath.slice(-12, -5),
                 url: `/${archivePath}`,
                 count: doc.items.length,
+                sha256: documentFingerprint(doc),
               })),
             },
           }
@@ -3619,6 +3864,7 @@ export class StudioDatabase {
         items: { sha256: documentFingerprint(items) },
         connections: { sha256: documentFingerprint(connections) },
       },
+      ...(keyRotations.length > 0 ? { keyRotations } : {}),
     };
     const manifest = signStable('manifest', manifestUnsigned);
 
