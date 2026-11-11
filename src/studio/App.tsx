@@ -23,6 +23,7 @@ import {
 } from '../shared/schema';
 import { SiteDesignPanel } from './SiteDesignPanel';
 import { ItemEdit, ItemEditor } from './ItemEditor';
+import { FriendEdit, FriendEditor } from './FriendEditor';
 import { SavedPostView, SavedPostsView } from './SavedPostsView';
 import { FriendAlbumView } from './FriendAlbumView';
 import { AddBackTarget, FriendNoticeReviewView, FriendNoticeView, FriendNoticesPanel } from './FriendNoticesPanel';
@@ -448,6 +449,7 @@ declare global {
       updateSavedNote: (savedId: string, note: string) => Promise<unknown>;
       setFeedRetention: (days: number) => Promise<{ days: number; pruned: number }>;
       addFriend: (input: unknown) => Promise<unknown>;
+      updateFriend: (friendId: string, updates: FriendEdit) => Promise<FriendConnection>;
       setFriendVisibility: (
         friendId: string,
         visibility: FriendVisibility
@@ -746,6 +748,7 @@ export const App: React.FC = () => {
   const [friendBio, setFriendBio] = useState('');
   const [friendRel, setFriendRel] = useState('friend, met');
   const [friendVisibility, setFriendVisibility] = useState<FriendVisibility>('private');
+  const [editingFriendId, setEditingFriendId] = useState<string | null>(null);
 
   const [ringHubUrl, setRingHubUrl] = useState('');
   const [isJoiningRing, setIsJoiningRing] = useState(false);
@@ -917,6 +920,9 @@ export const App: React.FC = () => {
     if (!window.studioApi || personaId === activePersonaId) return;
     await window.studioApi.switchPersona(personaId);
     setSelectedAlbumId('');
+    setEditingFriendId(null);
+    setEditingItemId(null);
+    setEditingRingId(null);
     setTestExportResult(null);
     setPreviewRenderMode('studio');
     await refreshStudioData();
@@ -1386,6 +1392,19 @@ export const App: React.FC = () => {
         ? `Added ${friendName} as Private (Local Crawler Only — hidden from public connections.json)!`
         : `Added ${friendName} as Public (exported to connections.json)!`
     );
+  };
+
+  const handleSaveFriendEdit = async (friend: FriendConnection, edit: FriendEdit) => {
+    if (!window.studioApi) return;
+    const updated = await window.studioApi.updateFriend(friend.id, edit);
+    if (edit.visibility === 'public' && !publishSettings.publishFriendsList) {
+      const nextSettings = { ...publishSettings, publishFriendsList: true };
+      setPublishSettings(nextSettings);
+      await window.studioApi.updateProfile({ publishSettings: nextSettings });
+    }
+    setEditingFriendId(null);
+    await refreshStudioData();
+    notify(`Updated friend "${updated.displayName}".`);
   };
 
   const handleUpdatePrivacySetting = async (patch: Partial<PublishSettingsState>) => {
@@ -4116,11 +4135,21 @@ export const App: React.FC = () => {
                     const isPublic = friend.visibility === 'public';
                     const isActuallyExported =
                       isPublic && Boolean(publishSettings.publishFriendsList);
+                    const isEditingFriend = editingFriendId === friend.id;
                     return (
                       <div
                         key={friend.id}
                         className="bg-slate-900 border border-slate-800 rounded-xl p-4 flex flex-col gap-3"
                       >
+                        {isEditingFriend ? (
+                          <FriendEditor
+                            friend={friend}
+                            errorMessage={errorMessage}
+                            onSave={(edit) => handleSaveFriendEdit(friend, edit)}
+                            onCancel={() => setEditingFriendId(null)}
+                          />
+                        ) : (
+                          <>
                         <div className="flex items-start gap-3 min-w-0">
                           <img
                             src={
@@ -4133,7 +4162,18 @@ export const App: React.FC = () => {
                             className="w-12 h-12 rounded-full object-cover bg-slate-800 shrink-0"
                           />
                           <div className="min-w-0 flex-1">
-                            <h4 className="font-bold text-sm truncate">{friend.displayName}</h4>
+                            <div className="flex items-center justify-between gap-2">
+                              <h4 className="font-bold text-sm truncate">{friend.displayName}</h4>
+                              <button
+                                type="button"
+                                onClick={() => setEditingFriendId(friend.id)}
+                                className="text-slate-500 hover:text-indigo-300 shrink-0"
+                                title={`Edit ${friend.displayName}`}
+                                aria-label={`Edit ${friend.displayName}`}
+                              >
+                                <Pencil className="w-3.5 h-3.5" />
+                              </button>
+                            </div>
                             <div className="flex flex-wrap items-center gap-1.5 mt-1">
                               <span
                                 className={`text-[10px] px-2 py-0.5 rounded-full font-medium whitespace-nowrap ${
@@ -4204,6 +4244,14 @@ export const App: React.FC = () => {
                           </div>
                         </div>
                         <div className="flex flex-wrap items-center gap-2 pt-3 border-t border-slate-800">
+                          <button
+                            type="button"
+                            onClick={() => setEditingFriendId(friend.id)}
+                            className="px-2.5 py-1.5 rounded-lg bg-slate-800 hover:bg-slate-700 text-xs flex items-center gap-1"
+                            title={`Edit ${friend.displayName}'s details`}
+                          >
+                            <Pencil className="w-3 h-3" /> Edit
+                          </button>
                           <button
                             onClick={async () => {
                               const nextVis: FriendVisibility = isPublic ? 'private' : 'public';
@@ -4305,6 +4353,7 @@ export const App: React.FC = () => {
                                 return;
                               }
                               await window.studioApi?.deleteFriend(friend.id);
+                              if (editingFriendId === friend.id) setEditingFriendId(null);
                               await refreshStudioData();
                             }}
                             className="ml-auto text-slate-500 hover:text-rose-400 p-1"
@@ -4314,6 +4363,8 @@ export const App: React.FC = () => {
                             <Trash2 className="w-4 h-4" />
                           </button>
                         </div>
+                          </>
+                        )}
                       </div>
                     );
                   })}

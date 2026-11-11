@@ -539,6 +539,34 @@ export class WebringMcpServer {
         },
       },
       {
+        name: 'webring_update_friend',
+        description:
+          'Edit an existing friend’s details by friendId (displayName, siteUrl, handle, avatarUrl, bio, relationship tags, or visibility). Only the fields passed are changed.',
+        inputSchema: {
+          type: 'object',
+          properties: {
+            personaId: personaIdProp,
+            friendId: { type: 'string', description: 'ID of the friend to edit (e.g. friend-...).' },
+            siteUrl: { type: 'string', description: 'Friend’s profile website root URL.' },
+            displayName: { type: 'string', description: 'Friend’s display name.' },
+            handle: { type: 'string', description: 'Friend’s handle.' },
+            avatarUrl: { type: 'string', description: 'Avatar image URL, or "" to clear.' },
+            bio: { type: 'string', description: 'Short bio note, or "" to clear.' },
+            relationship: {
+              type: 'array',
+              items: { type: 'string' },
+              description: 'Local XFN relationship tags (e.g. ["friend", "colleague"]).',
+            },
+            visibility: {
+              type: 'string',
+              enum: ['private', 'public'],
+              description: 'Whether to keep private or export on public blogroll.',
+            },
+          },
+          required: ['friendId'],
+        },
+      },
+      {
         name: 'webring_set_friend_visibility',
         description:
           'Toggle a friend’s connection visibility between "private" (local crawler only) and "public" (allowed on blogroll).',
@@ -1328,6 +1356,27 @@ export class WebringMcpServer {
           });
           resultData = friend;
           summary = `Added/updated friend ${friend.displayName} (${friend.visibility})`;
+          break;
+        }
+
+        case 'webring_update_friend': {
+          const ctx = this.resolveContext(args);
+          const friendId = String(args.friendId || '');
+          const updated = ctx.db.updateFriend(friendId, {
+            ...(args.siteUrl !== undefined ? { siteUrl: String(args.siteUrl) } : {}),
+            ...(args.displayName !== undefined ? { displayName: String(args.displayName) } : {}),
+            ...(args.handle !== undefined ? { handle: String(args.handle) } : {}),
+            ...(args.avatarUrl !== undefined ? { avatarUrl: String(args.avatarUrl) } : {}),
+            ...(args.bio !== undefined ? { bio: String(args.bio) } : {}),
+            ...(Array.isArray(args.relationship)
+              ? { relationship: args.relationship.map(String) }
+              : {}),
+            ...(args.visibility === 'public' || args.visibility === 'private'
+              ? { visibility: args.visibility }
+              : {}),
+          });
+          resultData = updated;
+          summary = `Updated friend ${updated.displayName} (${updated.id})`;
           break;
         }
 

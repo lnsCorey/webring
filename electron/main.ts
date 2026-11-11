@@ -642,6 +642,10 @@ function registerIpcHandlers() {
     return personaManager.getActiveContext().db.addOrUpdateFriend(input);
   });
 
+  ipcMain.handle('studio:update-friend', (_e, friendId: string, updates) => {
+    return personaManager.getActiveContext().db.updateFriend(String(friendId), updates || {});
+  });
+
   ipcMain.handle('studio:set-friend-visibility', (_e, friendId: string, visibility: 'private' | 'public') => {
     return personaManager.getActiveContext().db.setFriendVisibility(friendId, visibility);
   });

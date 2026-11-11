@@ -2070,6 +2070,144 @@ export class StudioDatabase {
   }
 
   /**
+   * Edits a friend's details in place, keeping their id and addedAt. If their website URL changes,
+   * crawled entries and cached validators for the old URL are removed and key status is updated for
+   * the new URL.
+   */
+  public updateFriend(
+    friendId: string,
+    updates: {
+      siteUrl?: string;
+      displayName?: string;
+      handle?: string;
+      avatarUrl?: string;
+      bio?: string;
+      relationship?: string[];
+      visibility?: FriendVisibility;
+    }
+  ): FriendConnection {
+    const current = this.getFriendById(friendId);
+    if (!current) {
+      throw new Error(`Friend "${friendId}" not found.`);
+    }
+    const nextSiteUrl =
+      updates.siteUrl !== undefined && updates.siteUrl.trim()
+        ? normalizeSiteUrl(updates.siteUrl)
+        : current.siteUrl;
+    if (nextSiteUrl !== current.siteUrl) {
+      const taken = this.db
+        .prepare('SELECT id, display_name FROM friends WHERE site_url = ? AND id != ?')
+        .get(nextSiteUrl, friendId) as { id: string; display_name: string } | undefined;
+      if (taken) {
+        throw new Error(`"${taken.display_name}" already uses ${nextSiteUrl}.`);
+      }
+    }
+
+    const displayName =
+      (updates.displayName !== undefined ? updates.displayName.trim() : '') || current.displayName;
+    const oldDefaultHandle = (() => {
+      try {
+        return new URL(current.siteUrl).hostname;
+      } catch {
+        return '';
+      }
+    })();
+    const newDefaultHandle = (() => {
+      try {
+        return new URL(nextSiteUrl).hostname;
+      } catch {
+        return '';
+      }
+    })();
+    const handle =
+      updates.handle !== undefined
+        ? updates.handle.trim() || newDefaultHandle
+        : nextSiteUrl !== current.siteUrl && current.handle === oldDefaultHandle
+        ? newDefaultHandle
+        : current.handle;
+    const avatarUrl = updates.avatarUrl !== undefined ? updates.avatarUrl.trim() : current.avatarUrl;
+    const bio = updates.bio !== undefined ? updates.bio.trim() : current.bio;
+    const relationship =
+      updates.relationship !== undefined
+        ? updates.relationship.map((r) => r.trim()).filter(Boolean)
+        : current.relationship;
+    const visibility: FriendVisibility =
+      updates.visibility === 'public'
+        ? 'public'
+        : updates.visibility === 'private'
+        ? 'private'
+        : current.visibility || 'private';
+
+    this.transaction(() => {
+      if (nextSiteUrl !== current.siteUrl) {
+        this.db.prepare('DELETE FROM network_feed WHERE friend_site_url = ?').run(current.siteUrl);
+        this.db.prepare('DELETE FROM endorsements WHERE author_site_url = ?').run(current.siteUrl);
+        this.db.prepare('DELETE FROM fetch_cache WHERE site_url = ?').run(current.siteUrl);
+        this.db.prepare('DELETE FROM friend_notices WHERE site_url = ?').run(nextSiteUrl);
+        const siteKey = this.getSiteKey(nextSiteUrl);
+        const did = siteKey?.did || siteUrlToDidWeb(nextSiteUrl);
+        const pinnedPublicKeyPem = siteKey?.publicKeyPem || '';
+        const keyStatus: FriendKeyStatus = siteKey ? siteKey.keyStatus : 'unverified';
+        this.db
+          .prepare(
+            `UPDATE friends SET
+              site_url = ?,
+              did = ?,
+              display_name = ?,
+              handle = ?,
+              avatar_url = ?,
+              bio = ?,
+              relationship_json = ?,
+              visibility = ?,
+              pinned_public_key_pem = ?,
+              key_status = ?,
+              last_crawled_at = NULL,
+              lists_me_at = NULL,
+              sync_failures = 0,
+              retry_after = NULL
+            WHERE id = ?`
+          )
+          .run(
+            nextSiteUrl,
+            did,
+            displayName,
+            handle,
+            avatarUrl,
+            bio,
+            JSON.stringify(relationship),
+            visibility,
+            pinnedPublicKeyPem,
+            keyStatus,
+            friendId
+          );
+      } else {
+        this.db
+          .prepare(
+            `UPDATE friends SET
+              display_name = ?,
+              handle = ?,
+              avatar_url = ?,
+              bio = ?,
+              relationship_json = ?,
+              visibility = ?
+            WHERE id = ?`
+          )
+          .run(
+            displayName,
+            handle,
+            avatarUrl,
+            bio,
+            JSON.stringify(relationship),
+            visibility,
+            friendId
+          );
+      }
+    });
+
+    return this.getFriendById(friendId)!;
+  }
+
+  /**
    * Removes a friend along with everything crawled from their site, so their posts and
    * endorsements don't linger in the feed or the next export.
    */

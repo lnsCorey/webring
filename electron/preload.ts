@@ -39,6 +39,8 @@ contextBridge.exposeInMainWorld('studioApi', {
   setFeedRetention: (days: number) => ipcRenderer.invoke('studio:set-feed-retention', days),
   updateItem: (itemId: string, updates: unknown) => ipcRenderer.invoke('studio:update-item', itemId, updates),
   addFriend: (input: unknown) => ipcRenderer.invoke('studio:add-friend', input),
+  updateFriend: (friendId: string, updates: unknown) =>
+    ipcRenderer.invoke('studio:update-friend', friendId, updates),
   setFriendVisibility: (friendId: string, visibility: 'private' | 'public') =>
     ipcRenderer.invoke('studio:set-friend-visibility', friendId, visibility),
   deleteFriend: (friendId: string) => ipcRenderer.invoke('studio:delete-friend', friendId),
