@@ -6,6 +6,15 @@ import { cleanUpLibrary, deleteAlbumWithFiles, deletePhotoWithFiles, setProfileI
 import { savePost, unsavePost } from '../services/savedPosts';
 import { jobNextRunAt, Scheduler, SchedulePreset } from '../services/scheduler';
 import { parseProxyUrl } from '../security/proxyAgent';
+import { GitHubDeviceLogin } from '../services/githubAuth';
+import { publishTo, PublishPaths } from '../services/jobs';
+import {
+  checkLiveSite,
+  configureGitHubSite,
+  connectGitHub,
+  getSetupStatus,
+  publishGitHubSite,
+} from '../services/setupService';
 import {
   FriendVisibility,
   isValidAdSlotId,
@@ -75,6 +84,20 @@ export interface McpActivityLogEntry {
 
 export const MCP_PROTOCOL_VERSION = '2024-11-05';
 
+/** Told to every MCP client at `initialize`, so an agent knows how to help a new user. */
+export const MCP_SERVER_INSTRUCTIONS =
+  'Webring Studio runs a personal website as static files: the app (on this computer) holds the database and signing keys, ' +
+  'and publishing copies signed files to a host such as GitHub Pages. If the user is new or their site is not live yet, ' +
+  'call webring_get_setup_status first, or use the "guided-setup" prompt to walk them through connecting GitHub, ' +
+  'creating their site and publishing it.';
+
+/** What only the running app can provide: publishing (keychain), GitHub sign-in and the browser. */
+export interface McpAppServices {
+  publishPaths: () => PublishPaths;
+  deviceLogin: GitHubDeviceLogin;
+  openExternal?: (url: string) => void;
+}
+
 export class WebringMcpServer {
   private activityLog: McpActivityLogEntry[] = [];
   private previewServer: LocalPreviewServer;
@@ -89,6 +112,22 @@ export class WebringMcpServer {
   }
 
   private attachedScheduler: Scheduler | null = null;
+  private appServices: McpAppServices | null = null;
+
+  /** The running app attaches publishing and GitHub sign-in; the stdio CLI can't use the keychain. */
+  public attachAppServices(services: McpAppServices): void {
+    this.appServices = services;
+  }
+
+  private requireApp(action: string): McpAppServices {
+    if (!this.appServices) {
+      throw new Error(
+        `Open Webring Studio to ${action}. This needs the running app (it unlocks your keys and GitHub sign-in from the system keychain); ` +
+          'connect your MCP client to the app\'s live HTTP/SSE endpoint instead of the stdio server.'
+      );
+    }
+    return this.appServices;
+  }
 
   /** The running app attaches its scheduler; the stdio CLI only edits the schedule file. */
   public attachScheduler(scheduler: Scheduler): void {
@@ -938,6 +977,89 @@ export class WebringMcpServer {
         },
       },
 
+      // 5b. Guided setup & publishing (GitHub sign-in, site creation, publish, live check)
+      {
+        name: 'webring_get_setup_status',
+        description:
+          'Where the persona stands in setup: name, GitHub sign-in, site address/repo, first publish and whether the site is live. Each step has a state (done/todo/attention) and a plain-language detail to relay to the user. Start here for new users.',
+        inputSchema: {
+          type: 'object',
+          properties: {
+            personaId: personaIdProp,
+            checkGitHub: {
+              type: 'boolean',
+              description: 'Ask GitHub whether the saved sign-in still works (default true).',
+            },
+          },
+        },
+      },
+      {
+        name: 'webring_github_login_start',
+        description:
+          'Start "Sign in with GitHub" (device flow). Returns a short userCode and the verificationUri: tell the user to open the page (Studio opens it in their browser) and enter the code, then call webring_github_login_poll with the loginId. App only.',
+        inputSchema: {
+          type: 'object',
+          properties: {
+            personaId: personaIdProp,
+            openBrowser: { type: 'boolean', description: 'Open the GitHub page in the browser (default true).' },
+          },
+        },
+      },
+      {
+        name: 'webring_github_login_poll',
+        description:
+          'Wait (up to waitSeconds, default 60) for the user to approve the GitHub code from webring_github_login_start. On approval the sign-in is saved for the persona (the token is never returned). Call again while status is "pending". App only.',
+        inputSchema: {
+          type: 'object',
+          properties: {
+            personaId: personaIdProp,
+            loginId: { type: 'string' },
+            waitSeconds: { type: 'number', description: '0-120 seconds (default 60).' },
+          },
+          required: ['loginId'],
+        },
+      },
+      {
+        name: 'webring_setup_github_site',
+        description:
+          'Create the public GitHub repository for the site (default <login>.github.io, served at https://<login>.github.io) or reuse an empty one, then set the persona\'s site address, repo and branch. Refuses to move an address already in use unless allowAddressChange is true (ask the user first: it changes their identity). App only.',
+        inputSchema: {
+          type: 'object',
+          properties: {
+            personaId: personaIdProp,
+            repoName: {
+              type: 'string',
+              description: 'Repository name. Default "<login>.github.io". Another name (e.g. "webring") gives https://<login>.github.io/<name>.',
+            },
+            allowAddressChange: { type: 'boolean' },
+          },
+        },
+      },
+      {
+        name: 'webring_publish',
+        description:
+          'Publish the signed static site: "github" (GitHub Pages), "remote" (SFTP/FTP) or "local" (export folder), using the persona\'s saved settings. Uploads only changed files. App only.',
+        inputSchema: {
+          type: 'object',
+          properties: {
+            personaId: personaIdProp,
+            destination: { type: 'string', enum: ['github', 'remote', 'local'] },
+          },
+          required: ['destination'],
+        },
+      },
+      {
+        name: 'webring_check_live_site',
+        description:
+          'Check the public site: whether GitHub has finished building it, whether it is reachable, signed with this persona\'s key, and showing the latest publish. States: not-published, building, live, stale, wrong-key, unreachable, errored.',
+        inputSchema: {
+          type: 'object',
+          properties: {
+            personaId: personaIdProp,
+          },
+        },
+      },
+
       // 6. Optional Profile Add-Ons (Google Analytics GA4 & Google AdSense Monetization)
       {
         name: 'webring_get_addons',
@@ -1098,6 +1220,18 @@ export class WebringMcpServer {
           {
             name: 'tags',
             description: 'Optional comma-separated tags.',
+            required: false,
+          },
+        ],
+      },
+      {
+        name: 'guided-setup',
+        description:
+          'Walk a new user step by step through getting their site online: their name, signing in with GitHub, creating the site, publishing and checking it is live, explaining how Studio works along the way.',
+        arguments: [
+          {
+            name: 'personaId',
+            description: 'Optional persona ID to set up.',
             required: false,
           },
         ],
@@ -1784,6 +1918,83 @@ export class WebringMcpServer {
           break;
         }
 
+        case 'webring_get_setup_status': {
+          const ctx = this.resolveContext(args);
+          resultData = await getSetupStatus(ctx, { checkGitHub: args.checkGitHub !== false });
+          const status = resultData as Awaited<ReturnType<typeof getSetupStatus>>;
+          summary = status.complete ? 'Setup complete' : `Setup: next step "${status.nextStep}"`;
+          break;
+        }
+
+        case 'webring_github_login_start': {
+          const app = this.requireApp('sign in with GitHub');
+          this.resolveContext(args);
+          const login = await app.deviceLogin.start();
+          if (args.openBrowser !== false) app.openExternal?.(login.verificationUri);
+          resultData = {
+            ...login,
+            message: `Open ${login.verificationUri} and enter the code ${login.userCode}. Then call webring_github_login_poll with loginId "${login.loginId}".`,
+          };
+          summary = 'Started GitHub sign-in';
+          break;
+        }
+
+        case 'webring_github_login_poll': {
+          const app = this.requireApp('sign in with GitHub');
+          const ctx = this.resolveContext(args);
+          const waitSeconds = Math.max(0, Math.min(120, Number(args.waitSeconds ?? 60) || 0));
+          const result = await app.deviceLogin.waitForApproval(String(args.loginId || ''), waitSeconds * 1000);
+          if (result.status === 'approved') {
+            const user = await connectGitHub(ctx, result.token);
+            resultData = { status: 'approved', login: user.login, message: `Signed in to GitHub as ${user.login}.` };
+            summary = `Signed in to GitHub as ${user.login}`;
+          } else if (result.status === 'pending') {
+            resultData = { status: 'pending', message: 'Still waiting for the code to be approved on GitHub. Call again to keep waiting.' };
+            summary = 'Waiting for GitHub sign-in';
+          } else {
+            resultData = result;
+            summary = `GitHub sign-in ${result.status}`;
+          }
+          break;
+        }
+
+        case 'webring_setup_github_site': {
+          this.requireApp('create your site on GitHub');
+          const ctx = this.resolveContext(args);
+          const res = await configureGitHubSite(ctx, {
+            repoName: typeof args.repoName === 'string' && args.repoName.trim() ? args.repoName.trim() : undefined,
+            allowAddressChange: args.allowAddressChange === true,
+          });
+          resultData = res;
+          summary = res.message;
+          break;
+        }
+
+        case 'webring_publish': {
+          const app = this.requireApp('publish');
+          const ctx = this.resolveContext(args);
+          const destination = String(args.destination || '');
+          if (destination !== 'github' && destination !== 'remote' && destination !== 'local') {
+            throw new Error('destination must be "github", "remote" or "local".');
+          }
+          const res =
+            destination === 'github'
+              ? await publishGitHubSite(ctx, app.publishPaths())
+              : await publishTo(ctx, destination, app.publishPaths());
+          if (!res.success) throw new Error(res.message);
+          resultData = res;
+          summary = res.message;
+          break;
+        }
+
+        case 'webring_check_live_site': {
+          const ctx = this.resolveContext(args);
+          const res = await checkLiveSite(ctx);
+          resultData = res;
+          summary = `Live site: ${res.state}`;
+          break;
+        }
+
         case 'webring_export_static_site': {
           const ctx = this.resolveContext(args);
           const profile = ctx.db.getProfile();
@@ -2123,6 +2334,36 @@ export class WebringMcpServer {
           ],
         };
       }
+      case 'guided-setup': {
+        const personaClause = args?.personaId
+          ? `Pass personaId "${args.personaId}" to every tool.`
+          : 'Use the currently active persona.';
+        return {
+          description: 'Guide a new user through setting up and publishing their site.',
+          messages: [
+            {
+              role: 'user',
+              content: {
+                type: 'text',
+                text: [
+                  `Please help me get my Webring Studio site online. I'm not technical, so explain each step in plain language and wait for me where I need to do something. ${personaClause}`,
+                  '',
+                  'Start by explaining in two or three sentences how it works: Webring Studio on my computer keeps my posts, photos and signing key in a local database; publishing copies signed, static files to my public site (GitHub Pages, free); nothing is public until I publish; syncing fetches my friends\' sites into my local feed.',
+                  '',
+                  'Then call webring_get_setup_status and work through the steps that are not "done", in order:',
+                  '1. profile: ask what name I want people to see (and an optional one-line bio), then save it with webring_update_profile.',
+                  '2. github: if I have no GitHub account, tell me to create a free one at https://github.com/signup first. Then call webring_github_login_start, show me the code in large text and tell me to enter it on the page that opens. Call webring_github_login_poll with the loginId until it is approved (reassure me while waiting).',
+                  '3. site: explain that my site will be at https://<my-github-login>.github.io and that this address becomes my identity, then call webring_setup_github_site. If the name is taken, explain the options and ask before choosing another name. Only pass allowAddressChange after I agree.',
+                  '4. published: call webring_publish with destination "github" and tell me what was uploaded.',
+                  '5. live: call webring_check_live_site. If it is "building" or "stale", wait about 30 seconds and check again (up to ~5 minutes), explaining that GitHub takes a minute or two. When it is "live", give me the address.',
+                  '',
+                  'Finish by explaining what to do next: Publish whenever I change something (or turn on the schedule with webring_set_schedule), Sync to see friends\' posts, and adding a friend by their site address. If any step fails, explain the message simply and suggest the fix.',
+                ].join('\n'),
+              },
+            },
+          ],
+        };
+      }
       case 'opsec-privacy-audit': {
         return {
           description: 'Audit cross-persona OPSEC, privacy shield flags, and friend TOFU keys.',
@@ -2172,6 +2413,7 @@ export class WebringMcpServer {
                 name: 'webring-studio-mcp',
                 version: '1.0.0',
               },
+              instructions: MCP_SERVER_INSTRUCTIONS,
             },
           };
 

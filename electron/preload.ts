@@ -91,6 +91,16 @@ contextBridge.exposeInMainWorld('studioApi', {
   publishRemote: (settings: unknown) => ipcRenderer.invoke('studio:publish-remote', settings),
   publishGithub: (settings: unknown) => ipcRenderer.invoke('studio:publish-github', settings),
   checkGithubRepo: (settings: unknown) => ipcRenderer.invoke('studio:check-github-repo', settings),
+  getSetupStatus: (options?: { checkGitHub?: boolean }) => ipcRenderer.invoke('studio:setup-status', options),
+  githubLoginAvailable: () => ipcRenderer.invoke('studio:github-login-available'),
+  githubLoginStart: () => ipcRenderer.invoke('studio:github-login-start'),
+  githubLoginPoll: (loginId: string) => ipcRenderer.invoke('studio:github-login-poll', loginId),
+  githubConnectToken: (token: string) => ipcRenderer.invoke('studio:github-connect-token', token),
+  setupConfigureSite: (options?: { repoName?: string; allowAddressChange?: boolean }) =>
+    ipcRenderer.invoke('studio:setup-configure-site', options),
+  setupPublish: () => ipcRenderer.invoke('studio:setup-publish'),
+  setupCheckLive: () => ipcRenderer.invoke('studio:setup-check-live'),
+  setupDismiss: (dismissed: boolean) => ipcRenderer.invoke('studio:setup-dismiss', dismissed),
   openPath: (targetPath: string) => ipcRenderer.invoke('studio:open-path', targetPath),
   getMcpInfo: () => ipcRenderer.invoke('studio:get-mcp-info'),
   callMcpTool: (toolName: string, args?: Record<string, unknown>) =>
