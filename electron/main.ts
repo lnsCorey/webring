@@ -1,6 +1,7 @@
 import {
   app,
   BrowserWindow,
+  clipboard,
   dialog,
   ipcMain,
   Menu,
@@ -18,6 +19,7 @@ import * as path from 'path';
 import * as fs from 'fs';
 import { pathToFileURL } from 'url';
 import { PersonaManager } from './services/personaManager';
+import { buildEditContextMenu } from './editContextMenu';
 import { LocalPreviewServer } from './services/localPreviewServer';
 import { WebringMcpServer } from './mcp/mcpServer';
 import { McpHttpServer } from './mcp/mcpHttpServer';
@@ -315,6 +317,20 @@ function createWindow(show = true) {
     if (sameDocument) return;
     event.preventDefault();
     if (/^https?:\/\//i.test(url) && !url.startsWith(process.env.VITE_DEV_SERVER_URL || '\u0000')) void shell.openExternal(url);
+  });
+
+  // Right-click menu: Cut/Copy/Paste and spelling in text fields, Copy for selected text, and
+  // Copy Link / Open in Browser for web links
+  mainWindow.webContents.on('context-menu', (_event, params) => {
+    const contents = mainWindow?.webContents;
+    if (!contents) return;
+    const template = buildEditContextMenu(params, {
+      replaceMisspelling: (word) => contents.replaceMisspelling(word),
+      addToDictionary: (word) => contents.session.addWordToSpellCheckerDictionary(word),
+      copyText: (text) => clipboard.writeText(text),
+      openExternal: (url) => void shell.openExternal(url),
+    });
+    if (template.length) Menu.buildFromTemplate(template).popup({ window: mainWindow ?? undefined });
   });
 
   // In background mode, closing the window hides it so schedules keep running in the tray
