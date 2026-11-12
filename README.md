@@ -94,6 +94,8 @@ You can close the wizard at any point and continue later from **Start setup** in
 5. **Add friends.** In **Friends & Webrings**, add a friend's site URL, then **Sync All Friends**. Their posts appear in your **Neighborhood Feed**. To fix a friend's name, address, tags or note later, use the **Edit** (pencil) button on their card. Changing their site address resets their pinned key and clears posts synced from the old address. The feed shows **Friends only** by default; switch to **Everyone** to see your own posts and photos in the same timeline (with friends' replies threaded under them), or **Just me**.
 6. **Join or start a webring** (see below), and **set a schedule** so syncing and publishing happen on their own.
 
+**Right-click** any text box for Cut, Copy, Paste, Select All and spelling suggestions (with **Add to Dictionary**). Right-click selected text elsewhere to copy it, or a link to copy its address or open it in your browser.
+
 The in-app **Help & Deploy Guide** tab has step-by-step guides for GitHub Pages, SFTP/FTP hosting, add-ons, webrings and MCP.
 
 ## How it works
@@ -278,6 +280,7 @@ Then configure your MCP client to run:
 | Path | Contents |
 |---|---|
 | `electron/main.ts`, `electron/preload.ts` | App lifecycle, tray, IPC |
+| `electron/editContextMenu.ts` | The right-click menu (Cut/Copy/Paste, spelling, link actions) |
 | `electron/db/database.ts` | SQLite schema and queries, and the signed site bundle |
 | `electron/services/` | Friend crawler, webrings, site generator, publisher, personas, scheduler, guided setup and GitHub sign-in (`setupService.ts`, `githubAuth.ts`) |
 | `electron/mcp/` | MCP server (stdio CLI, and loopback HTTP/SSE) |

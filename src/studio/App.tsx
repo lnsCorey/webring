@@ -7065,6 +7065,11 @@ export const App: React.FC = () => {
                           receives a permanent canonical URI so peers in your ring can reply or like it. Use the pencil on any of
                           your items to edit it later; its URI stays the same. Wall posts support Markdown.
                         </p>
+                        <p className="text-xs text-slate-400 leading-relaxed">
+                          <strong>Right-click</strong> any text box for Cut, Copy, Paste, Select All and
+                          spelling suggestions. Right-click selected text to copy it, or a link to copy
+                          its address or open it in your browser.
+                        </p>
                         <div className="flex gap-3 pt-1">
                           <button
                             onClick={() => setActiveTab('items')}

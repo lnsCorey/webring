@@ -9,6 +9,7 @@ import * as crypto from 'crypto';
 import * as http from 'http';
 import * as zlib from 'zlib';
 import { DatabaseSync } from 'node:sqlite';
+import { buildEditContextMenu } from '../electron/editContextMenu';
 import {
   albumDisplay,
   AlbumItemSchema,
@@ -4954,6 +4955,73 @@ describe('Architectural Hardening: Key Rotation Certificates, Archive Hashes, Sy
     const httpPlan = planWindowProxy({ enabled: true, proxyUrl: 'http://me:s%40cret@[::1]:3128' });
     expect(httpPlan.config.proxyRules).toBe('http://[::1]:3128');
     expect(httpPlan.credentials).toEqual({ username: 'me', password: 's@cret' });
+  });
+});
+
+describe('Right-click edit menu', () => {
+  const flags = {
+    canUndo: true,
+    canRedo: false,
+    canCut: true,
+    canCopy: true,
+    canPaste: true,
+    canDelete: true,
+    canSelectAll: true,
+    canEditRichly: false,
+  };
+  const base = {
+    isEditable: false,
+    selectionText: '',
+    editFlags: flags,
+    misspelledWord: '',
+    dictionarySuggestions: [] as string[],
+    linkURL: '',
+  };
+  const actions = () => ({
+    replaceMisspelling: vi.fn(),
+    addToDictionary: vi.fn(),
+    copyText: vi.fn(),
+    openExternal: vi.fn(),
+  });
+
+  it('offers Cut, Copy and Paste in text fields, enabled by what the field allows', () => {
+    const items = buildEditContextMenu({ ...base, isEditable: true }, actions());
+    const roles = items.map((item) => item.role ?? item.type);
+    expect(roles).toEqual(['undo', 'redo', 'separator', 'cut', 'copy', 'paste', 'delete', 'separator', 'selectAll']);
+    expect(items.find((item) => item.role === 'redo')?.enabled).toBe(false);
+    expect(items.find((item) => item.role === 'paste')?.enabled).toBe(true);
+  });
+
+  it('offers only Copy for selected text outside a field, and nothing when there is no selection', () => {
+    expect(buildEditContextMenu({ ...base, selectionText: 'hello' }, actions()).map((item) => item.role)).toEqual(['copy']);
+    expect(buildEditContextMenu(base, actions())).toEqual([]);
+  });
+
+  it('puts spelling suggestions first and replaces the word when one is picked', () => {
+    const act = actions();
+    const items = buildEditContextMenu(
+      { ...base, isEditable: true, misspelledWord: 'webrnig', dictionarySuggestions: ['webring', 'webbing'] },
+      act,
+    );
+    expect(items.slice(0, 3).map((item) => item.label)).toEqual(['webring', 'webbing', 'Add to Dictionary']);
+    (items[0].click as () => void)();
+    expect(act.replaceMisspelling).toHaveBeenCalledWith('webring');
+    (items[2].click as () => void)();
+    expect(act.addToDictionary).toHaveBeenCalledWith('webrnig');
+  });
+
+  it('copies and opens web links, and only copies other links', () => {
+    const act = actions();
+    const web = buildEditContextMenu({ ...base, linkURL: 'https://example.com/a' }, act);
+    expect(web.map((item) => item.label)).toEqual(['Copy Link Address', 'Open Link in Browser']);
+    (web[0].click as () => void)();
+    (web[1].click as () => void)();
+    expect(act.copyText).toHaveBeenCalledWith('https://example.com/a');
+    expect(act.openExternal).toHaveBeenCalledWith('https://example.com/a');
+    expect(buildEditContextMenu({ ...base, linkURL: 'javascript:alert(1)' }, act)).toEqual([]);
+    expect(buildEditContextMenu({ ...base, linkURL: 'webring://add?x=1' }, act).map((item) => item.label)).toEqual([
+      'Copy Link Address',
+    ]);
   });
 });
 
