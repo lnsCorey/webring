@@ -91,7 +91,7 @@ You can close the wizard at any point and continue later from **Start setup** in
 2. **Add content.** Write wall posts, create albums and add photos. Wall posts are written in **Markdown** (links, **bold** and *italic*, headings, lists, quotes and tables), with a Write / Preview switch; they're rendered safely on your page, and HTML is never passed through. To change a post, like, share or comment later, use its **Edit** (pencil) button in **Posts, Likes & Shares**. It keeps the same address, so friends' likes and comments stay attached; your page marks it as *edited*, and friends get the new version at their next sync.
 3. **Preview.** **Test Export & Preview** builds the site into a scratch folder and serves it on `127.0.0.1`, so you can check it in a browser before publishing.
 4. **Publish.** In **Publish & SFTP**, export to a folder, upload over SFTP/FTP, or push to GitHub Pages. The Publish tab shows when you last published and whether anything has changed since. **View live site** opens your site with a fresh copy. Hosts often cache pages (GitHub Pages for up to 10 minutes), so a normal visit may show the old version briefly, but the page checks for new posts as it loads.
-5. **Add friends.** In **Friends & Webrings**, add a friend's site URL, then **Sync All Friends**. Their posts appear in your **Neighborhood Feed**. The feed shows **Friends only** by default; switch to **Everyone** to see your own posts and photos in the same timeline (with friends' replies threaded under them), or **Just me**.
+5. **Add friends.** In **Friends & Webrings**, add a friend's site URL, then **Sync All Friends**. Their posts appear in your **Neighborhood Feed**. To fix a friend's name, address, tags or note later, use the **Edit** (pencil) button on their card. Changing their site address resets their pinned key and clears posts synced from the old address. The feed shows **Friends only** by default; switch to **Everyone** to see your own posts and photos in the same timeline (with friends' replies threaded under them), or **Just me**.
 6. **Join or start a webring** (see below), and **set a schedule** so syncing and publishing happen on their own.
 
 The in-app **Help & Deploy Guide** tab has step-by-step guides for GitHub Pages, SFTP/FTP hosting, add-ons, webrings and MCP.
@@ -105,12 +105,18 @@ A persona is a separate online identity: its own SQLite database, Ed25519 key, `
 ### Security and privacy
 
 - Your signing key, SFTP/FTP password and GitHub token are encrypted with your operating system's keychain (Keychain on macOS, DPAPI on Windows, libsecret on Linux). Studio never shows them again after you save them, and only unlocks them to sign or to connect when publishing.
-- Every document you publish is signed. Friends' keys are pinned the first time Studio sees them, and a changed key is flagged rather than trusted.
+- Every document you publish is signed. Friends' keys are pinned the first time Studio sees them, and a changed key is flagged rather than trusted, unless the old key signed off on it (see [Changing your signing key](#changing-your-signing-key)).
 - Friends are private by default: they aren't listed on your public site unless you mark them public.
 - **Mute** hides a site from your feed. **Block** also stops crawling it and keeps its endorsements off your published site.
 - When crawling, Studio refuses addresses on your own computer or local network, so a peer can't use it to probe devices behind your firewall.
+- **Proxy or Tor, per persona.** On the Publish tab's **Schedule** card, a persona can route its syncing through a `socks5://`, `socks5h://` (Tor, for example `socks5h://127.0.0.1:9050`) or `http://` proxy. That covers syncing friends and rings, checking links people send you, saving a friend's post, and the friends' images and ring pages Studio shows. Publishing (SFTP/FTP, GitHub) and links you open in your browser still connect directly. The setting is stored only in that persona and never exported.
+- **Schedule jitter.** Scheduled syncs and publishes can start at a random time up to 5, 15 or 30 minutes after their slot, so several personas on one computer don't contact hosts at the same moment and give away that they're linked.
 
-If the keychain entry is lost, your signing key can't be recovered: you'd need a new key, and friends would see a key-changed warning.
+#### Changing your signing key
+
+- **Planned change:** **Rotate Signing Key…** in **Profile & Identity** makes a new key and has the old key sign a *rotation certificate* for it. The certificate is published in `did.json` and `manifest.json`, so after your next publish, friends move to the new key at their next sync with no warning. A certificate the old key didn't sign is ignored, and the friend still sees a key-changed warning.
+- **Lost key:** if the keychain entry is lost, your old key can't be recovered or used to sign a certificate. You'd need a new key, and friends would see a key-changed warning.
+- **When a friend's key changes without a certificate:** their card shows a 🚨 warning and **Trust New Key & Re-sync**. Use it only after you've confirmed with them some other way that they really lost their key.
 
 ### Site Design
 
@@ -153,7 +159,7 @@ History grows forever, so Studio keeps syncing small on both sides:
 - **Albums are one card.** A friend's album appears as one card, with a **N new** badge when they add photos, never one entry per photo. Click it to open the album view, where you can like, share, comment or save the album or any photo. Albums a friend didn't post to their feed aren't shown; use **Albums ↗** on their card in Friends to open their Photos section.
 - **Save what matters.** **☆ Save** on a friend's post or photo keeps a private copy under **Saved**, with a local copy of its image (re-encoded without metadata) and your own note. Saved posts stay after they leave your feed window or your friend removes them, and they're never published.
 - **Unchanged files aren't downloaded.** Each friend's signed manifest lists a fingerprint for each of their files, so a friend with nothing new costs one small request. See [Syncing many friends](#syncing-many-friends).
-- **You publish recent posts, with archives.** Your `items.json` holds the last 90 days of posts (at least your 50 newest). Older ones move to signed monthly archives (`api/archive/items-YYYY-MM.json`), so friends download less. Your page lists them under **Older posts**, and each month loads when a visitor opens it. Studio itself still shows all your posts.
+- **You publish recent posts, with archives.** Your `items.json` holds the last 90 days of posts (at least your 50 newest). Older ones move to signed monthly archives (`api/archive/items-YYYY-MM.json`), so friends download less. `items.json` lists each archive's SHA-256, so a copy can be checked against your signed index. Your page lists them under **Older posts**, and each month loads when a visitor opens it. Studio itself still shows all your posts.
 
 ### Syncing many friends
 
@@ -185,7 +191,7 @@ For the **Sync friends & rings** schedule, every 15 minutes is fine up to around
 
 Studio has no server or inbox, so adding someone as a friend doesn't notify them. Instead:
 
-- **Send a signed link.** **Let them know** on a friend's card copies a private `webring://friend-notice` link, signed with your key, to send however you like. Their Studio checks it's addressed to them, under 30 days old and signed by your site's key, then lists you under **Added you** with **Add back**, **Dismiss** and **Block**. Your site must be published first. Nothing is added automatically.
+- **Send a signed link.** **Let them know** on a friend's card makes a private `webring://friend-notice` link, signed with your key, to send however you like: **Copy Link**, **Copy Markdown**, or **Show QR Code** to scan from another device. Their Studio checks it's addressed to them, under 30 days old and signed by your site's key, then lists you under **Added you** with **Add back**, **Dismiss** and **Block**. Your site must be published first. Nothing is added automatically.
 - **Mutual friends.** When you sync a friend whose signed, public friends list includes you, their card shows **↔ Mutual**.
 - **People in your rings.** When rings sync, members whose public friends list includes you appear under **Added you**, even if you haven't added them yet. Studio only checks ring members (at most 200 per sync) and skips your friends and anyone blocked.
 
@@ -196,7 +202,7 @@ Private friends are never published, so they can't be discovered. "Added you" an
 A webring is a circle of sites linked by **← Prev**, **Next →** and **Random**. Each ring has a **maintainer** who decides who's in it. Everything still runs on static files:
 
 - The maintainer publishes a **signed member list** (the ring's *hub*, `api/rings/<name>.json`) and a plain directory page (`rings/<name>/`).
-- **To join:** paste the ring's hub URL into **Join a Webring**. Studio verifies the ring and gives you a private, signed **request link** to send the maintainer however you like. Once they approve it and publish, your next sync makes you a member, and your next publish shows the ring's bar. Requests are never published.
+- **To join:** paste the ring's hub URL into **Join a Webring**. Studio verifies the ring and gives you a private, signed **request link** to send the maintainer however you like (as a link, Markdown or a QR code). Once they approve it and publish, your next sync makes you a member, and your next publish shows the ring's bar. Requests are never published.
 - **To host:** create a ring under **Rings You Host**, share its hub URL, and paste the request links people send you into **Review a Join Request** to approve, decline or ban. One persona can host several rings, separate from its friend list.
 - **Leaving and removal:** if you remove a ring and publish, the maintainer's next sync drops you. If a maintainer removes, bans or closes a ring, members' Studios pick that up on their next sync. Maintainers can also hide a member from Prev/Next/Random without removing them.
 - **Navigation:** Prev/Next are written into your page when you publish. When a visitor clicks them, the page re-reads the ring's hub so removed sites are skipped, falling back to the saved link if that fails.
@@ -209,6 +215,8 @@ In the **Publish** tab, the **Schedule** card sets two jobs per persona:
 
 - **Sync friends & rings**, from every 15 minutes up to weekly
 - **Publish if anything changed**, to your export folder, SFTP/FTP host or GitHub Pages, optionally syncing first
+
+Each job can also add a random delay of up to 5, 15 or 30 minutes (**jitter**), so personas sharing a computer don't all run at the same moment.
 
 Every persona with a schedule runs, even when it isn't the one you have open. Scheduled publishes are skipped when nothing has changed. Jobs run one at a time and never overlap a sync or publish you start by hand.
 
@@ -273,11 +281,13 @@ Then configure your MCP client to run:
 | `electron/db/database.ts` | SQLite schema and queries, and the signed site bundle |
 | `electron/services/` | Friend crawler, webrings, site generator, publisher, personas, scheduler, guided setup and GitHub sign-in (`setupService.ts`, `githubAuth.ts`) |
 | `electron/mcp/` | MCP server (stdio CLI, and loopback HTTP/SSE) |
-| `electron/security/` | Keychain encryption, private-network guard |
+| `electron/security/` | Keychain encryption, private-network guard, SOCKS5/HTTP proxy for syncing and the Studio window |
 | `src/shared/schema.ts` | Data schemas (zod), signing and verification, `did:web` |
 | `src/studio/App.tsx` | The Studio UI |
 | `src/studio/SiteDesignPanel.tsx` | Site Design: look & feel options and page layout blocks |
 | `src/studio/SetupWizard.tsx` | The first-run setup wizard and the Setup & Health card |
+| `src/studio/FriendEditor.tsx` | The inline editor for a friend's details |
+| `src/studio/QrCodeSvg.tsx` | Copy Link / Copy Markdown / QR code for `webring://` links (built-in QR encoder) |
 | `src/shared/markdown.ts` | Safe Markdown renderer for text blocks (also embedded in published pages) |
 | `docs/architecture/federation.md` | How federation, signing and webrings fit together |
 

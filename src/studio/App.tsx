@@ -7109,6 +7109,16 @@ export const App: React.FC = () => {
                             post to curate your feed (see the Security &amp; Privacy FAQ).
                           </li>
                           <li>
+                            Use the <strong>Edit</strong> (pencil) button on a friend's card to fix
+                            their name, address, tags or note. Changing their site address resets
+                            their pinned key and clears posts synced from the old address.
+                          </li>
+                          <li>
+                            <strong>Let them know</strong> makes a signed link telling a friend you
+                            added them. Send it with <strong>Copy Link</strong>,{' '}
+                            <strong>Copy Markdown</strong> or <strong>Show QR Code</strong>.
+                          </li>
+                          <li>
                             Removing a friend also deletes the posts and endorsements crawled from
                             their site.
                           </li>
@@ -7220,7 +7230,9 @@ export const App: React.FC = () => {
                           automatically for each persona (every 15 minutes up to weekly). Scheduled
                           publishes skip when nothing changed. With background mode on, closing the window
                           keeps Studio in the menu bar so schedules keep running; it can also start at
-                          login. Missed runs happen once when Studio is back.
+                          login. Missed runs happen once when Studio is back. Each job can add a
+                          random delay (<strong>jitter</strong>) of up to 30 minutes, so personas on
+                          the same computer don't contact hosts at the same moment.
                         </p>
                         <div className="flex gap-3 pt-1">
                           <button
@@ -7254,17 +7266,20 @@ export const App: React.FC = () => {
 ├── .nojekyll                # Tells GitHub Pages NOT to ignore the .well-known folder
 ├── ads.txt                  # (Optional) IAB Authorized Digital Sellers file when AdSense is enabled
 ├── .well-known/
-│   └── did.json             # W3C / ATProto did:web identity & Ed25519 public key
+│   └── did.json             # W3C / ATProto did:web identity, Ed25519 public key & key rotation certificates
 ├── api/
-│   ├── manifest.json        # Signed discovery entrypoint for RingCrawler peers
+│   ├── manifest.json        # Signed discovery entrypoint: file fingerprints & key rotation certificates
 │   ├── profile.json         # Signed bio, avatar, links, theme, handle & add-on metadata
 │   ├── albums.json          # Signed photo galleries with canonical item URIs
-│   ├── items.json           # Signed wall posts, threaded comments, likes & recommendations
+│   ├── items.json           # Signed recent posts, comments, likes & shares, plus the archive index (with SHA-256s)
+│   ├── archive/
+│   │   └── items-YYYY-MM.json  # Signed monthly archives of older posts
 │   ├── connections.json     # Signed webring bars, opt-in public friends & incoming peer replies
 │   └── rings/<name>.json    # Signed member list for each ring you host
 ├── rings/<name>/index.html  # Script-free directory page for each ring you host
+├── albums/<name>/index.html # A page per album, with a link preview
 └── media/
-    └── albums/              # Local imported photos copied automatically`}
+    └── albums/<album>/      # Resized, metadata-free photos and thumbnails, plus a signed manifest.json`}
                     </pre>
                   </div>
                 </div>
@@ -7853,47 +7868,82 @@ git push -u origin main --force`}
                       <div className="grid grid-cols-1 md:grid-cols-2 gap-3 text-xs text-slate-300">
                         <div className="p-3 rounded-xl bg-slate-950 border border-slate-800">
                           <strong className="text-white block mb-1">
-                            🎭 Personas & Identity (5 tools)
+                            🎭 Personas & Identity (7 tools)
                           </strong>
-                          <code>webring_list_personas</code>, <code>webring_create_persona</code>,{' '}
-                          <code>webring_switch_persona</code>, <code>webring_get_profile</code>,{' '}
-                          <code>webring_update_profile</code>
+                          <code>webring_list_personas</code>,{' '}
+                          <code>webring_create_persona</code>,{' '}
+                          <code>webring_switch_persona</code>,{' '}
+                          <code>webring_get_profile</code>,{' '}
+                          <code>webring_update_profile</code>,{' '}
+                          <code>webring_set_profile_image</code>,{' '}
+                          <code>webring_rotate_keys</code>
                         </div>
                         <div className="p-3 rounded-xl bg-slate-950 border border-slate-800">
                           <strong className="text-white block mb-1">
-                            💬 Wall Posts, Replies & Albums (9 tools)
+                            💬 Wall Posts, Replies & Albums (10 tools)
                           </strong>
-                          <code>webring_list_items</code>, <code>webring_create_post</code>,{' '}
-                          <code>webring_interact_with_url</code>, <code>webring_delete_item</code>,{' '}
-                          <code>webring_list_albums</code>, <code>webring_create_album</code>,{' '}
-                          <code>webring_add_photo</code>, <code>webring_delete_album</code>,{' '}
+                          <code>webring_list_items</code>,{' '}
+                          <code>webring_create_post</code>,{' '}
+                          <code>webring_update_item</code>,{' '}
+                          <code>webring_interact_with_url</code>,{' '}
+                          <code>webring_delete_item</code>,{' '}
+                          <code>webring_list_albums</code>,{' '}
+                          <code>webring_create_album</code>,{' '}
+                          <code>webring_add_photo</code>,{' '}
+                          <code>webring_delete_album</code>,{' '}
                           <code>webring_delete_photo</code>
                         </div>
                         <div className="p-3 rounded-xl bg-slate-950 border border-slate-800">
                           <strong className="text-white block mb-1">
-                            🕸️ Friends, Moderation & Neighborhood Feed (9 tools)
+                            🕸️ Friends, Moderation & Neighborhood Feed (12 tools)
                           </strong>
-                          <code>webring_list_friends</code>, <code>webring_add_friend</code>,{' '}
+                          <code>webring_list_friends</code>,{' '}
+                          <code>webring_add_friend</code>,{' '}
+                          <code>webring_update_friend</code>,{' '}
                           <code>webring_set_friend_visibility</code>,{' '}
-                          <code>webring_set_moderation</code>, <code>webring_delete_friend</code>,{' '}
-                          <code>webring_crawl_friend</code>, <code>webring_crawl_all_friends</code>,{' '}
+                          <code>webring_set_moderation</code>,{' '}
+                          <code>webring_delete_friend</code>,{' '}
+                          <code>webring_trust_friend_key</code>,{' '}
+                          <code>webring_crawl_friend</code>,{' '}
+                          <code>webring_crawl_all_friends</code>,{' '}
                           <code>webring_get_neighborhood_feed</code>,{' '}
-                          <code>webring_get_endorsements</code>
-                        </div>
-                        <div className="p-3 rounded-xl bg-slate-950 border border-slate-800">
-                          <strong className="text-white block mb-1">💍 Webrings (7 tools)</strong>
-                          <code>webring_list_rings</code>, <code>webring_join_ring</code>,{' '}
-                          <code>webring_leave_ring</code>, <code>webring_sync_rings</code>,{' '}
-                          <code>webring_create_hosted_ring</code>,{' '}
-                          <code>webring_review_ring_request</code>, <code>webring_set_ring_member</code>
+                          <code>webring_get_endorsements</code>,{' '}
+                          <code>webring_set_feed_retention</code>
                         </div>
                         <div className="p-3 rounded-xl bg-slate-950 border border-slate-800">
                           <strong className="text-white block mb-1">
-                            🚀 Publishing, Schedules & Add-Ons (8 tools)
+                            ☆ Saved Posts & Friend Notices (7 tools)
+                          </strong>
+                          <code>webring_save_post</code>,{' '}
+                          <code>webring_unsave_post</code>,{' '}
+                          <code>webring_list_saved</code>,{' '}
+                          <code>webring_create_friend_notice</code>,{' '}
+                          <code>webring_list_friend_notices</code>,{' '}
+                          <code>webring_review_friend_notice</code>,{' '}
+                          <code>webring_dismiss_friend_notice</code>
+                        </div>
+                        <div className="p-3 rounded-xl bg-slate-950 border border-slate-800">
+                          <strong className="text-white block mb-1">
+                            💍 Webrings (7 tools)
+                          </strong>
+                          <code>webring_list_rings</code>,{' '}
+                          <code>webring_join_ring</code>,{' '}
+                          <code>webring_leave_ring</code>,{' '}
+                          <code>webring_sync_rings</code>,{' '}
+                          <code>webring_create_hosted_ring</code>,{' '}
+                          <code>webring_review_ring_request</code>,{' '}
+                          <code>webring_set_ring_member</code>
+                        </div>
+                        <div className="p-3 rounded-xl bg-slate-950 border border-slate-800">
+                          <strong className="text-white block mb-1">
+                            🚀 Publishing, Schedules, Network & Add-Ons (9 tools)
                           </strong>
                           <code>webring_export_static_site</code>,{' '}
-                          <code>webring_start_preview_server</code>, <code>webring_get_schedule</code>,{' '}
-                          <code>webring_set_schedule</code>, <code>webring_run_scheduled_job</code>,{' '}
+                          <code>webring_start_preview_server</code>,{' '}
+                          <code>webring_get_schedule</code>,{' '}
+                          <code>webring_set_schedule</code>,{' '}
+                          <code>webring_run_scheduled_job</code>,{' '}
+                          <code>webring_set_proxy</code>,{' '}
                           <code>webring_get_addons</code>,{' '}
                           <code>webring_configure_analytics_addon</code>,{' '}
                           <code>webring_configure_ads_addon</code>
@@ -8187,7 +8237,10 @@ git push -u origin main --force`}
                           <li>
                             <strong>Key pinning:</strong> the first key seen for a friend is pinned. If
                             it later changes, the friend gets a 🚨 Key Changed warning and nothing from
-                            them verifies until you sort it out.
+                            them verifies until you sort it out. The exception is a key change their
+                            old key signed (a <em>rotation certificate</em>): Studio checks it and moves
+                            to the new key without a warning. A forged certificate still raises the
+                            warning.
                           </li>
                           <li>
                             <strong>No impersonating other friends:</strong> posts whose address points
@@ -8259,11 +8312,55 @@ git push -u origin main --force`}
                           Changed warning.
                         </p>
                         <p className="text-xs text-slate-300 leading-relaxed">
+                          To change keys on purpose, use <strong>Rotate Signing Key…</strong> in{' '}
+                          <strong>Profile & Identity</strong>. Your old key signs a rotation
+                          certificate for the new one, published in <code>did.json</code> and{' '}
+                          <code>manifest.json</code>, so after your next publish friends switch
+                          over at their next sync with no warning. If a friend's key changes without
+                          one, their card offers <strong>Trust New Key &amp; Re-sync</strong>. Only
+                          use it after you've confirmed with them some other way that they really
+                          lost their key.
+                        </p>
+                        <p className="text-xs text-slate-300 leading-relaxed">
                           Your SFTP/FTP password and GitHub token are encrypted the same way. Studio
                           shows them as <code>••••••••</code> once saved and only unlocks them at the
                           moment it connects to publish, including for scheduled publishes. If the
                           keychain entry is lost, just enter them again.
                         </p>
+                      </div>
+
+                      <div className="p-4 rounded-xl bg-slate-950 border border-slate-800 space-y-1.5">
+                        <h4 className="font-bold text-sm text-violet-400">
+                          Q: Can I sync through Tor or a proxy?
+                        </h4>
+                        <p className="text-xs text-slate-300 leading-relaxed">
+                          Yes, per persona. On the Publish tab's <strong>Schedule</strong> card, turn on{' '}
+                          <strong>Route this persona's outbound syncs via SOCKS5 / Tor / HTTP Proxy</strong>{' '}
+                          and enter a <code>socks5://</code>, <code>socks5h://</code> or{' '}
+                          <code>http://</code> address (for Tor, usually{' '}
+                          <code>socks5h://127.0.0.1:9050</code>, which also keeps name lookups
+                          inside Tor).
+                        </p>
+                        <ul className="text-xs text-slate-400 list-disc list-inside space-y-1 pl-2">
+                          <li>
+                            It covers syncing friends and rings, checking links people send you,
+                            saving a friend's post, and the friends' images and ring pages Studio
+                            shows while that persona is open.
+                          </li>
+                          <li>
+                            Publishing (SFTP/FTP, GitHub) and links you open in your browser still
+                            connect directly.
+                          </li>
+                          <li>
+                            The setting stays in that persona only and is never exported. Other
+                            personas keep their own setting.
+                          </li>
+                          <li>
+                            <strong>Jitter</strong> on the Schedule card adds a random delay of up
+                            to 30 minutes, so personas sharing a computer don't contact hosts at the
+                            same moment and give away that they're linked.
+                          </li>
+                        </ul>
                       </div>
 
                       <div className="p-4 rounded-xl bg-slate-950 border border-slate-800 space-y-1.5">

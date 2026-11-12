@@ -36,6 +36,7 @@ import {
   WebringManifestSchema,
 } from '../src/shared/schema';
 import { parseProxyUrl } from '../electron/security/proxyAgent';
+import { planWindowProxy } from '../electron/security/windowProxy';
 import { encodeQrMatrix } from '../src/studio/QrCodeSvg';
 import { STORED_SECRET_PLACEHOLDER, StudioDatabase } from '../electron/db/database';
 import { LEGACY_DEMO_PHOTOS, LEGACY_DEMO_PROFILE } from '../electron/db/legacyDemoContent';
@@ -4907,6 +4908,52 @@ describe('Architectural Hardening: Key Rotation Certificates, Archive Hashes, Sy
     expect(qr).not.toBeNull();
     expect(qr!.length).toBeGreaterThanOrEqual(29);
     expect(qr![0][0]).toBe(true); // top-left finder pattern corner
+  });
+
+  it("downloads a saved post's image through the persona proxy", async () => {
+    // A local HTTP CONNECT proxy that records where it was asked to connect, then refuses
+    const tunnels: string[] = [];
+    const proxy = http.createServer();
+    proxy.on('connect', (req, socket) => {
+      tunnels.push(String(req.url));
+      socket.end('HTTP/1.1 403 Forbidden\r\n\r\n');
+    });
+    await new Promise<void>((resolve) => proxy.listen(0, '127.0.0.1', resolve));
+    const port = (proxy.address() as { port: number }).port;
+    try {
+      const db = new StudioDatabase(dir, 'saver.sqlite');
+      db.updateProfile({ siteUrl: 'https://bob.ring.test', displayName: 'Bob' });
+      db.setProxySettings({ enabled: true, proxyUrl: `http://127.0.0.1:${port}` });
+      const url = 'https://alice.ring.test/api/items.json#item-item-photo';
+      db.upsertNetworkFeedEntry({
+        friendSiteUrl: 'https://alice.ring.test', friendName: 'Alice', friendAvatarUrl: '', friendDid: 'did:web:alice.ring.test',
+        entryType: 'post', title: 'Photo', canonicalUrl: url, targetUrl: url, commentary: '', tags: [],
+        mediaUrl: 'https://alice.ring.test/media/photo.jpg', createdAt: new Date().toISOString(), verifiedSignature: true,
+      });
+      const saved = await savePost(db, new MediaLibrary(path.join(dir, 'saver-media')), url);
+      expect(tunnels).toEqual(['alice.ring.test:443']);
+      expect(saved.localMediaUrl).toBeFalsy(); // the proxy refused, so the post is saved without a copy
+      db.close();
+    } finally {
+      await new Promise<void>((resolve) => proxy.close(() => resolve()));
+    }
+  });
+
+  it('routes the Studio window through the persona proxy', () => {
+    expect(planWindowProxy({ enabled: false, proxyUrl: 'socks5h://127.0.0.1:9050' })).toEqual({
+      key: 'system',
+      config: { mode: 'system' },
+    });
+    expect(planWindowProxy({ enabled: true, proxyUrl: '' }).config).toEqual({ mode: 'system' });
+    // Chromium's SOCKS5 resolves names at the proxy, so socks5h maps to socks5
+    expect(planWindowProxy({ enabled: true, proxyUrl: 'socks5h://127.0.0.1:9050' }).config).toEqual({
+      mode: 'fixed_servers',
+      proxyRules: 'socks5://127.0.0.1:9050',
+      proxyBypassRules: '127.0.0.1,localhost,[::1]',
+    });
+    const httpPlan = planWindowProxy({ enabled: true, proxyUrl: 'http://me:s%40cret@[::1]:3128' });
+    expect(httpPlan.config.proxyRules).toBe('http://[::1]:3128');
+    expect(httpPlan.credentials).toEqual({ username: 'me', password: 's@cret' });
   });
 });
 
