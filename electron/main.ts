@@ -10,6 +10,7 @@ import {
   powerMonitor,
   protocol,
   safeStorage,
+  session,
   shell,
   Tray,
 } from 'electron';
@@ -33,6 +34,7 @@ import {
 } from './services/scheduler';
 import { publishTo, runScheduledPublish, runSyncAll, summarizeSync } from './services/jobs';
 import { parseProxyUrl } from './security/proxyAgent';
+import { planWindowProxy, WindowProxyPlan } from './security/windowProxy';
 import {
   cleanUpLibrary,
   deleteAlbumWithFiles,
@@ -66,6 +68,40 @@ let scheduler: Scheduler;
 let tray: Tray | null = null;
 let isQuitting = false;
 let startupComplete = false;
+let windowProxyPlan: WindowProxyPlan | null = null;
+
+/**
+ * Points the Studio window's network session at the active persona's proxy, so friends' images and
+ * ring hubs loaded in the window take the same route as syncs. Cheap to call after anything that
+ * might change the active persona or its proxy setting: it only reconfigures on a change.
+ */
+async function applyWindowProxy(): Promise<void> {
+  let plan: WindowProxyPlan;
+  try {
+    plan = planWindowProxy(personaManager.getActiveContext().db.getProxySettings());
+  } catch (err) {
+    // Saved settings are validated, so this shouldn't happen; keep the current route rather than
+    // silently dropping a proxy the user turned on
+    console.error('Could not apply the persona proxy to the Studio window:', err);
+    return;
+  }
+  if (windowProxyPlan?.key === plan.key) {
+    windowProxyPlan = plan;
+    return;
+  }
+  windowProxyPlan = plan;
+  await session.defaultSession.setProxy(plan.config);
+  // Drop connections opened over the previous route so nothing keeps using it
+  await session.defaultSession.closeAllConnections();
+}
+
+// An HTTP proxy that asks for a login gets the one saved in the persona's proxy URL
+app.on('login', (event, _webContents, _details, authInfo, callback) => {
+  const credentials = windowProxyPlan?.credentials;
+  if (!authInfo.isProxy || !credentials) return;
+  event.preventDefault();
+  callback(credentials.username, credentials.password);
+});
 
 const publishPaths = () => ({ userDataDir: app.getPath('userData'), tempDir: app.getPath('temp') });
 
@@ -205,6 +241,8 @@ async function initServices() {
     userDataDir,
     localPreviewServer,
     (entry) => {
+      // An agent can switch persona or change the proxy
+      void applyWindowProxy();
       if (mainWindow && !mainWindow.isDestroyed()) {
         mainWindow.webContents.send('studio:mcp-activity', entry);
       }
@@ -348,6 +386,7 @@ if (!gotTheLock) {
     // Opening the personas reads their keys from the OS keychain, which can block on a macOS
     // Keychain prompt, so this comes before the splash
     await initServices();
+    await applyWindowProxy();
     registerIpcHandlers();
     // The splash plays while the main window loads; skipped in the background, for a webring://
     // link launch, or with --no-splash
@@ -485,20 +524,26 @@ function registerIpcHandlers() {
     return personaManager.listPersonas();
   });
 
-  ipcMain.handle('studio:create-persona', (_e, input: CreatePersonaInput) => {
-    return personaManager.createPersona(input);
+  ipcMain.handle('studio:create-persona', async (_e, input: CreatePersonaInput) => {
+    const result = personaManager.createPersona(input);
+    await applyWindowProxy();
+    return result;
   });
 
-  ipcMain.handle('studio:switch-persona', (_e, personaId: string) => {
-    return personaManager.switchPersona(personaId);
+  ipcMain.handle('studio:switch-persona', async (_e, personaId: string) => {
+    const result = personaManager.switchPersona(personaId);
+    await applyWindowProxy();
+    return result;
   });
 
   ipcMain.handle('studio:update-persona-label', (_e, personaId: string, label: string) => {
     return personaManager.updatePersonaLabel(personaId, label);
   });
 
-  ipcMain.handle('studio:delete-persona', (_e, personaId: string) => {
-    return personaManager.deletePersona(personaId);
+  ipcMain.handle('studio:delete-persona', async (_e, personaId: string) => {
+    const result = personaManager.deletePersona(personaId);
+    await applyWindowProxy();
+    return result;
   });
 
   ipcMain.handle('studio:update-profile', (_e, updates) => {
@@ -657,15 +702,17 @@ function registerIpcHandlers() {
     return personaManager.getActiveContext().db.trustNewFriendKey(String(friendId), newPublicKeyPem);
   });
 
-  ipcMain.handle('studio:set-proxy-settings', (_e, input: { enabled?: boolean; proxyUrl?: string }) => {
+  ipcMain.handle('studio:set-proxy-settings', async (_e, input: { enabled?: boolean; proxyUrl?: string }) => {
     const rawUrl = typeof input?.proxyUrl === 'string' ? input.proxyUrl.trim() : '';
     if (rawUrl) {
       parseProxyUrl(rawUrl);
     }
-    return personaManager.getActiveContext().db.setProxySettings({
+    const updated = personaManager.getActiveContext().db.setProxySettings({
       enabled: input?.enabled,
       proxyUrl: rawUrl,
     });
+    await applyWindowProxy();
+    return updated;
   });
 
   ipcMain.handle('studio:set-friend-visibility', (_e, friendId: string, visibility: 'private' | 'public') => {
