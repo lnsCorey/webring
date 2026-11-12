@@ -142,6 +142,14 @@ export function albumManifestPath(albumId: string): string {
   return `media/albums/${albumId.replace(/[^a-zA-Z0-9_-]/g, '')}/manifest.json`;
 }
 
+/** Guided-setup bookkeeping for a persona (see `setupService.ts`). Never exported. */
+export interface SetupState {
+  /** When the user closed the wizard without finishing; it then stops opening by itself */
+  dismissedAt?: string;
+  /** The last live-site check, so the Setup & Health card can show it without a network call */
+  lastLiveCheck?: { at: string; state: string; message: string };
+}
+
 export interface PublishSettings {
   exportPath: string;
   protocol: 'sftp' | 'ftp';
@@ -2989,6 +2997,44 @@ export class StudioDatabase {
       this.clearFetchCache();
     }
     return next;
+  }
+
+  // ---------------------------------------------------------------------------
+  // Guided setup (local only, never exported). Progress itself is read from the real settings;
+  // this only remembers whether the wizard was dismissed and the last live-site check.
+
+  public getSetupState(): SetupState {
+    const row = this.db
+      .prepare("SELECT value FROM local_settings WHERE key = 'setupStateJson'")
+      .get() as { value: string } | undefined;
+    if (!row?.value) return {};
+    try {
+      const parsed = JSON.parse(row.value) as SetupState;
+      return parsed && typeof parsed === 'object' ? parsed : {};
+    } catch {
+      return {};
+    }
+  }
+
+  public updateSetupState(changes: Partial<SetupState>): SetupState {
+    const next: SetupState = { ...this.getSetupState(), ...changes };
+    for (const key of Object.keys(next) as Array<keyof SetupState>) {
+      if (next[key] === undefined) delete next[key];
+    }
+    this.db
+      .prepare(
+        "INSERT INTO local_settings (key, value) VALUES ('setupStateJson', ?) ON CONFLICT(key) DO UPDATE SET value = excluded.value"
+      )
+      .run(JSON.stringify(next));
+    return next;
+  }
+
+  /** `updatedAt` of the manifest at the last publish, to tell a live copy that's out of date. */
+  public getPublishedManifestUpdatedAt(): string | undefined {
+    const row = this.db.prepare("SELECT updated_at FROM published_documents WHERE key = 'manifest'").get() as
+      | { updated_at: string }
+      | undefined;
+    return row?.updated_at || undefined;
   }
 
   // ---------------------------------------------------------------------------

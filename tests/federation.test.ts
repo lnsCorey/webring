@@ -73,6 +73,18 @@ import { applySyncPlan, hashStagedFiles, planSync } from '../electron/services/p
 import { KeyCipher, KeyVaultUnavailableError } from '../electron/security/keyVault';
 import { LocalPreviewServer } from '../electron/services/localPreviewServer';
 import { WebringMcpServer } from '../electron/mcp/mcpServer';
+import { GitHubDeviceLogin } from '../electron/services/githubAuth';
+import {
+  checkLiveSite,
+  configureGitHubSite,
+  connectGitHub,
+  expectedGitHubSiteUrl,
+  getSetupStatus,
+  publishGitHubSite,
+  SetupGitHubApi,
+  SetupStatus,
+} from '../electron/services/setupService';
+import type { PagesBuildStatus } from '../electron/services/publisher';
 import { McpHttpServer } from '../electron/mcp/mcpHttpServer';
 
 describe('Webring Schema, DID Identity & Ed25519 Signatures', () => {
@@ -4942,5 +4954,290 @@ describe('Architectural Hardening: Key Rotation Certificates, Archive Hashes, Sy
     const httpPlan = planWindowProxy({ enabled: true, proxyUrl: 'http://me:s%40cret@[::1]:3128' });
     expect(httpPlan.config.proxyRules).toBe('http://[::1]:3128');
     expect(httpPlan.credentials).toEqual({ username: 'me', password: 's@cret' });
+  });
+});
+
+describe('Guided setup: GitHub sign-in, site creation, publish and live check', () => {
+  let dir: string;
+  let managers: PersonaManager[] = [];
+  const openManager = () => {
+    const manager = new PersonaManager(dir);
+    managers.push(manager);
+    return manager;
+  };
+
+  beforeEach(() => {
+    dir = fs.mkdtempSync(path.join(os.tmpdir(), 'webring-guided-setup-'));
+  });
+
+  afterEach(() => {
+    vi.unstubAllGlobals();
+    for (const manager of managers) manager.getActiveContext().db.close();
+    managers = [];
+    fs.rmSync(dir, { recursive: true, force: true });
+  });
+
+  /** A scripted GitHub device-flow endpoint: each poll returns the next answer. */
+  function deviceFlowFetch(answers: Array<Record<string, unknown>>) {
+    const calls: Array<{ url: string; body: Record<string, unknown> }> = [];
+    const fetchImpl = async (url: string, init?: { body?: string }) => {
+      const body = init?.body ? JSON.parse(init.body) : {};
+      calls.push({ url, body });
+      const reply = url.endsWith('/login/device/code')
+        ? { device_code: 'dev-123', user_code: 'ABCD-1234', verification_uri: 'https://github.com/login/device', interval: 5, expires_in: 900 }
+        : answers.shift() || { error: 'expired_token' };
+      return { status: 200, text: async () => JSON.stringify(reply) };
+    };
+    return { fetchImpl, calls };
+  }
+
+  /** A fake GitHub API for the setup service. */
+  function fakeGitHub(options: { existing?: 'none' | 'foreign' | 'studio'; build?: PagesBuildStatus } = {}) {
+    const created: string[] = [];
+    const api: SetupGitHubApi = {
+      getGitHubUser: async (token) => (token === 'gho_good' ? { login: 'Alice' } : null),
+      createPagesRepo: async (_token, owner, repo) => {
+        if (!options.existing || options.existing === 'none') {
+          created.push(`${owner}/${repo}`);
+          return { status: 'created', owner, repo, defaultBranch: 'main' };
+        }
+        return {
+          status: 'exists',
+          owner,
+          repo,
+          defaultBranch: 'main',
+          canPush: true,
+          isEmpty: false,
+          publishedByStudio: options.existing === 'studio',
+        };
+      },
+      getPagesBuildStatus: async () => options.build || { status: 'built' },
+    };
+    return { api, created };
+  }
+
+  it('runs the GitHub device sign-in: pending, slow down, approved, and refusals', async () => {
+    const { fetchImpl, calls } = deviceFlowFetch([
+      { error: 'authorization_pending' },
+      { error: 'slow_down', interval: 10 },
+      { access_token: 'gho_good', scope: 'public_repo' },
+    ]);
+    let clock = 1_000_000;
+    const login = new GitHubDeviceLogin(fetchImpl, () => 'client-1', () => clock);
+    const started = await login.start();
+    expect(started).toMatchObject({ userCode: 'ABCD-1234', verificationUri: 'https://github.com/login/device', intervalSeconds: 5 });
+    expect(JSON.stringify(started)).not.toContain('dev-123'); // the device code stays in the engine
+    expect(calls[0].body).toEqual({ client_id: 'client-1', scope: 'public_repo' });
+
+    const slept: number[] = [];
+    const result = await login.waitForApproval(started.loginId, 120_000, async (ms) => {
+      slept.push(ms);
+      clock += ms;
+    });
+    expect(result).toEqual({ status: 'approved', token: 'gho_good', scope: 'public_repo' });
+    expect(slept).toEqual([5000, 10000]); // slow_down raises the interval
+    expect(calls[1].body).toMatchObject({ device_code: 'dev-123', grant_type: 'urn:ietf:params:oauth:grant-type:device_code' });
+    expect(await login.poll(started.loginId)).toMatchObject({ status: 'error' }); // finished logins can't be reused
+
+    const denied = new GitHubDeviceLogin(deviceFlowFetch([{ error: 'access_denied' }]).fetchImpl, () => 'client-1');
+    expect(await denied.poll((await denied.start()).loginId)).toMatchObject({ status: 'denied' });
+
+    let late = 0;
+    const expired = new GitHubDeviceLogin(deviceFlowFetch([]).fetchImpl, () => 'client-1', () => late);
+    const expiring = await expired.start();
+    late = Date.parse(expiring.expiresAt) + 1;
+    expect(await expired.poll(expiring.loginId)).toMatchObject({ status: 'expired' });
+
+    const unconfigured = new GitHubDeviceLogin(deviceFlowFetch([]).fetchImpl, () => '');
+    expect(unconfigured.isConfigured()).toBe(false);
+    await expect(unconfigured.start()).rejects.toThrow(/access token instead/);
+  });
+
+  it('takes a new persona from nothing to a configured GitHub Pages site', async () => {
+    const manager = openManager();
+    const ctx = manager.getActiveContext();
+    const { api, created } = fakeGitHub();
+    const deps = { github: api };
+
+    let status = await getSetupStatus(ctx, { checkGitHub: true }, deps);
+    expect(status.steps.map((s) => [s.id, s.state])).toEqual([
+      ['profile', 'todo'],
+      ['github', 'todo'],
+      ['site', 'todo'],
+      ['published', 'todo'],
+      ['live', 'todo'],
+    ]);
+    expect(status.nextStep).toBe('profile');
+
+    ctx.db.updateProfile({ displayName: 'Alice' });
+    await expect(connectGitHub(ctx, 'gho_bad', deps)).rejects.toThrow(/rejected/);
+    expect(await connectGitHub(ctx, 'gho_good', deps)).toEqual({ login: 'Alice' });
+    // Sealed like any publish secret: the profile only shows the placeholder
+    expect(ctx.db.getProfile().publishSettings.githubToken).toBe(STORED_SECRET_PLACEHOLDER);
+    expect(ctx.db.getProfile().publishSettings.githubOwner).toBe('Alice');
+
+    const site = await configureGitHubSite(ctx, {}, deps);
+    expect(created).toEqual(['Alice/Alice.github.io']);
+    expect(site).toMatchObject({
+      owner: 'Alice',
+      repo: 'Alice.github.io',
+      branch: 'main', // a <login>.github.io repo is served from its default branch
+      siteUrl: 'https://alice.github.io',
+      did: 'did:web:alice.github.io',
+      created: true,
+    });
+    const profile = ctx.db.getProfile();
+    expect(profile.siteUrl).toBe('https://alice.github.io');
+    expect(profile.handle).toBe('alice.github.io');
+
+    status = await getSetupStatus(ctx, { checkGitHub: true }, deps);
+    expect(status.githubLogin).toBe('Alice');
+    expect(status.steps.filter((s) => s.state === 'done').map((s) => s.id)).toEqual(['profile', 'github', 'site']);
+    expect(status.nextStep).toBe('published');
+
+    // A hand-edited address that doesn't match the repo is flagged
+    ctx.db.updateProfile({ siteUrl: 'https://elsewhere.example' });
+    status = await getSetupStatus(ctx, {}, deps);
+    expect(status.steps.find((s) => s.id === 'site')).toMatchObject({ state: 'attention' });
+    expect(status.steps.find((s) => s.id === 'site')!.detail).toContain('https://alice.github.io');
+  });
+
+  it('reuses its own repo, refuses to overwrite someone else\'s, and protects an address in use', async () => {
+    const manager = openManager();
+    const ctx = manager.getActiveContext();
+    ctx.db.updateProfile({ displayName: 'Alice' });
+    await connectGitHub(ctx, 'gho_good', { github: fakeGitHub().api });
+
+    await expect(configureGitHubSite(ctx, {}, { github: fakeGitHub({ existing: 'foreign' }).api })).rejects.toThrow(
+      /won't overwrite it.*https:\/\/alice\.github\.io\/webring/
+    );
+    const reused = await configureGitHubSite(ctx, {}, { github: fakeGitHub({ existing: 'studio' }).api });
+    expect(reused).toMatchObject({ created: false, siteUrl: 'https://alice.github.io' });
+
+    // A project repo is served from a sub-path and published to gh-pages
+    ctx.db.addOrUpdateFriend({ siteUrl: 'https://bob.example', displayName: 'Bob' });
+    await expect(
+      configureGitHubSite(ctx, { repoName: 'webring' }, { github: fakeGitHub().api })
+    ).rejects.toThrow(/changes its identity/);
+    const moved = await configureGitHubSite(ctx, { repoName: 'webring', allowAddressChange: true }, { github: fakeGitHub().api });
+    expect(moved).toMatchObject({ branch: 'gh-pages', siteUrl: 'https://alice.github.io/webring', did: 'did:web:alice.github.io:webring' });
+    expect(expectedGitHubSiteUrl('Alice', 'webring', 'https://me.example/')).toBe('https://me.example');
+  });
+
+  it('publishes and checks the live site: building, live, out of date and wrong key', async () => {
+    const manager = openManager();
+    const ctx = manager.getActiveContext();
+    ctx.db.updateProfile({ displayName: 'Alice' });
+    await connectGitHub(ctx, 'gho_good', { github: fakeGitHub().api });
+    await configureGitHubSite(ctx, {}, { github: fakeGitHub().api });
+
+    expect(await checkLiveSite(ctx, { github: fakeGitHub().api })).toMatchObject({ state: 'not-published' });
+
+    const published = await publishGitHubSite(
+      ctx,
+      { userDataDir: dir, tempDir: dir },
+      {
+        publish: async (c) => {
+          c.siteGenerator.recordPublished(c.db.buildSignedSiteBundle({ publish: true }));
+          return { success: true, mode: 'github-pages', destination: 'x', filesPublished: 9, message: 'Pushed.' };
+        },
+      }
+    );
+    expect(published.success).toBe(true);
+
+    const fetched: string[] = [];
+    const offline = async (url: string) => {
+      fetched.push(url);
+      throw new Error('HTTP 404');
+    };
+    const building = await checkLiveSite(ctx, { github: fakeGitHub({ build: { status: 'building' } }).api, fetchJson: offline });
+    expect(building.state).toBe('building');
+    expect(fetched[0]).toMatch(/^https:\/\/alice\.github\.io\/\.well-known\/did\.json\?check=\d+$/);
+    expect((await getSetupStatus(ctx)).steps.find((s) => s.id === 'live')).toMatchObject({ state: 'todo' });
+
+    const key = ctx.db.getProfile().publicKeyPem;
+    const manifestAt = ctx.db.getPublishedManifestUpdatedAt()!;
+    const site = (manifestUpdatedAt: string, publicKeyPem = key) => async (url: string) =>
+      url.includes('did.json') ? { verificationMethod: [{ publicKeyPem }] } : { updatedAt: manifestUpdatedAt };
+
+    expect(await checkLiveSite(ctx, { github: fakeGitHub().api, fetchJson: site('2000-01-01T00:00:00.000Z') })).toMatchObject({
+      state: 'stale',
+    });
+    expect(await checkLiveSite(ctx, { github: fakeGitHub().api, fetchJson: site(manifestAt, 'another key') })).toMatchObject({
+      state: 'wrong-key',
+    });
+    expect((await getSetupStatus(ctx)).steps.find((s) => s.id === 'live')).toMatchObject({ state: 'attention' });
+
+    const live = await checkLiveSite(ctx, { github: fakeGitHub().api, fetchJson: site(manifestAt) });
+    expect(live).toMatchObject({ state: 'live', siteUrl: 'https://alice.github.io' });
+    const status = await getSetupStatus(ctx, { checkGitHub: true }, { github: fakeGitHub().api });
+    expect(status.complete).toBe(true);
+    expect(status.nextStep).toBeNull();
+
+    expect(
+      await checkLiveSite(ctx, { github: fakeGitHub({ build: { status: 'errored', message: 'Page build failed.' } }).api })
+    ).toMatchObject({ state: 'errored', message: expect.stringContaining('Page build failed.') });
+  });
+
+  it('exposes guided setup to MCP agents without revealing the GitHub token', async () => {
+    const manager = openManager();
+    const mcp = new WebringMcpServer(manager, dir);
+
+    const init = await mcp.handleJsonRpc({ jsonrpc: '2.0', id: 1, method: 'initialize' });
+    expect((init?.result as { instructions?: string }).instructions).toContain('guided-setup');
+    const prompts = await mcp.handleJsonRpc({ jsonrpc: '2.0', id: 2, method: 'prompts/list' });
+    expect((prompts?.result as { prompts: Array<{ name: string }> }).prompts.map((p) => p.name)).toContain('guided-setup');
+    const prompt = mcp.getPromptTemplate('guided-setup', {});
+    expect(prompt.messages[0].content.text).toContain('webring_github_login_start');
+    const tools = mcp.getTools().map((t) => t.name);
+    for (const name of [
+      'webring_get_setup_status',
+      'webring_github_login_start',
+      'webring_github_login_poll',
+      'webring_setup_github_site',
+      'webring_publish',
+      'webring_check_live_site',
+    ]) {
+      expect(tools).toContain(name);
+    }
+
+    const status = await mcp.executeToolCall('webring_get_setup_status', { checkGitHub: false });
+    expect(status.isError).toBeUndefined();
+    expect((status.data as SetupStatus).nextStep).toBe('profile');
+
+    // The stdio server has no keychain: sign-in and publishing need the running app
+    for (const [tool, args] of [
+      ['webring_github_login_start', {}],
+      ['webring_publish', { destination: 'github' }],
+      ['webring_setup_github_site', {}],
+    ] as const) {
+      const res = await mcp.executeToolCall(tool, args);
+      expect(res.isError).toBe(true);
+      expect(res.content[0].text).toContain('Open Webring Studio');
+    }
+
+    // With the app attached, the agent relays the code and the token goes straight to sealed storage
+    const { fetchImpl } = deviceFlowFetch([{ access_token: 'gho_secret_token', scope: 'public_repo' }]);
+    const opened: string[] = [];
+    mcp.attachAppServices({
+      publishPaths: () => ({ userDataDir: dir, tempDir: dir }),
+      deviceLogin: new GitHubDeviceLogin(fetchImpl, () => 'client-1'),
+      openExternal: (url) => opened.push(url),
+    });
+    vi.stubGlobal('fetch', async (url: string) =>
+      new URL(url).pathname === '/user'
+        ? new Response(JSON.stringify({ login: 'Alice' }), { status: 200 })
+        : new Response('{}', { status: 404 })
+    );
+    const start = await mcp.executeToolCall('webring_github_login_start', {});
+    const started = start.data as { loginId: string; userCode: string };
+    expect(started.userCode).toBe('ABCD-1234');
+    expect(opened).toEqual(['https://github.com/login/device']);
+    const poll = await mcp.executeToolCall('webring_github_login_poll', { loginId: started.loginId, waitSeconds: 0 });
+    expect(poll.data).toEqual({ status: 'approved', login: 'Alice', message: 'Signed in to GitHub as Alice.' });
+    expect(JSON.stringify(poll)).not.toContain('gho_secret_token');
+    const profile = await mcp.executeToolCall('webring_get_profile', {});
+    expect(JSON.stringify(profile)).not.toContain('gho_secret_token');
+    expect(manager.getActiveContext().db.getProfile().publishSettings.githubOwner).toBe('Alice');
   });
 });

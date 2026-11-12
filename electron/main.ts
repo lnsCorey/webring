@@ -34,6 +34,15 @@ import {
 } from './services/scheduler';
 import { publishTo, runScheduledPublish, runSyncAll, summarizeSync } from './services/jobs';
 import { parseProxyUrl } from './security/proxyAgent';
+import { GitHubDeviceLogin } from './services/githubAuth';
+import {
+  checkLiveSite,
+  configureGitHubSite,
+  connectGitHub,
+  dismissSetup,
+  getSetupStatus,
+  publishGitHubSite,
+} from './services/setupService';
 import { planWindowProxy, WindowProxyPlan } from './security/windowProxy';
 import {
   cleanUpLibrary,
@@ -104,6 +113,8 @@ app.on('login', (event, _webContents, _details, authInfo, callback) => {
 });
 
 const publishPaths = () => ({ userDataDir: app.getPath('userData'), tempDir: app.getPath('temp') });
+/** GitHub sign-in for the setup wizard and MCP agents (pending codes are kept in memory only) */
+const githubDeviceLogin = new GitHubDeviceLogin();
 
 /** Applies "start at login": launches hidden in the tray with --background. */
 function applyLoginItem(config: SchedulerConfig) {
@@ -278,6 +289,13 @@ async function initServices() {
   // Older versions generated a fictional demo friend's site here; it's no longer used
   fs.rmSync(path.join(userDataDir, DEMO_PEER_FOLDER_NAME), { recursive: true, force: true });
   webringMcpServer.attachScheduler(scheduler);
+  webringMcpServer.attachAppServices({
+    publishPaths,
+    deviceLogin: githubDeviceLogin,
+    openExternal: (url) => {
+      if (/^https:\/\/github\.com\//i.test(url)) void shell.openExternal(url);
+    },
+  });
 
   mcpHttpServer = new McpHttpServer(webringMcpServer, {
     settingsPath: path.join(userDataDir, 'mcp-http.json'),
@@ -928,6 +946,42 @@ function registerIpcHandlers() {
   ipcMain.handle('studio:publish-remote', async (_e, settings) => publishWithSettings('remote', settings));
 
   ipcMain.handle('studio:publish-github', async (_e, settings) => publishWithSettings('github', settings));
+
+  // Guided setup (shared with the MCP tools through setupService)
+  ipcMain.handle('studio:setup-status', (_e, options?: { checkGitHub?: boolean }) =>
+    getSetupStatus(personaManager.getActiveContext(), { checkGitHub: Boolean(options?.checkGitHub) })
+  );
+  ipcMain.handle('studio:github-login-start', async () => {
+    const login = await githubDeviceLogin.start();
+    return { ...login, configured: true };
+  });
+  ipcMain.handle('studio:github-login-available', () => githubDeviceLogin.isConfigured());
+  ipcMain.handle('studio:github-login-poll', async (_e, loginId: string) => {
+    const result = await githubDeviceLogin.poll(String(loginId || ''));
+    if (result.status !== 'approved') return result;
+    // The token goes straight to the persona's sealed settings; the window never sees it
+    const user = await connectGitHub(personaManager.getActiveContext(), result.token);
+    return { status: 'approved', login: user.login };
+  });
+  ipcMain.handle('studio:github-connect-token', async (_e, token: string) =>
+    connectGitHub(personaManager.getActiveContext(), String(token || ''))
+  );
+  ipcMain.handle('studio:setup-configure-site', (_e, options?: { repoName?: string; allowAddressChange?: boolean }) =>
+    configureGitHubSite(personaManager.getActiveContext(), {
+      repoName: typeof options?.repoName === 'string' && options.repoName.trim() ? options.repoName.trim() : undefined,
+      allowAddressChange: options?.allowAddressChange === true,
+    })
+  );
+  ipcMain.handle('studio:setup-publish', async () => {
+    const result = await publishGitHubSite(personaManager.getActiveContext(), publishPaths());
+    refreshTrayMenu();
+    return result;
+  });
+  ipcMain.handle('studio:setup-check-live', () => checkLiveSite(personaManager.getActiveContext()));
+  ipcMain.handle('studio:setup-dismiss', (_e, dismissed: boolean) => {
+    dismissSetup(personaManager.getActiveContext(), dismissed !== false);
+    return { ok: true };
+  });
 
   ipcMain.handle('studio:check-github-repo', async (_e, settings) => {
     const ctx = personaManager.getActiveContext();
