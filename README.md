@@ -203,13 +203,28 @@ Private friends are never published, so they can't be discovered. "Added you" an
 
 A webring is a circle of sites linked by **← Prev**, **Next →** and **Random**. Each ring has a **maintainer** who decides who's in it. Everything still runs on static files:
 
-- The maintainer publishes a **signed member list** (the ring's *hub*, `api/rings/<name>.json`) and a plain directory page (`rings/<name>/`).
-- **To join:** paste the ring's hub URL into **Join a Webring**. Studio verifies the ring and gives you a private, signed **request link** to send the maintainer however you like (as a link, Markdown or a QR code). Once they approve it and publish, your next sync makes you a member, and your next publish shows the ring's bar. Requests are never published.
-- **To host:** create a ring under **Rings You Host**, share its hub URL, and paste the request links people send you into **Review a Join Request** to approve, decline or ban. One persona can host several rings, separate from its friend list.
+- The maintainer publishes a **signed member list** (the ring's *ring file*, `api/rings/<name>.json`) and a plain directory page (`rings/<name>/`). The page's address is the **ring address** people share and paste to join.
+- **To join:** paste the ring address into **Join a Webring**. Studio verifies the ring and gives you a private, signed **request link** to send the maintainer however you like (as a link, Markdown or a QR code). Once they approve it and publish, your next sync makes you a member, and your next publish shows the ring's bar. Requests are never published.
+- **To host:** create a ring under **Rings You Host**, share its ring address, and paste the request links people send you into **Review a Join Request** to approve, decline or ban. One persona can host several rings, separate from its friend list.
 - **Leaving and removal:** if you remove a ring and publish, the maintainer's next sync drops you. If a maintainer removes, bans or closes a ring, members' Studios pick that up on their next sync. Maintainers can also hide a member from Prev/Next/Random without removing them.
-- **Navigation:** Prev/Next are written into your page when you publish. When a visitor clicks them, the page re-reads the ring's hub so removed sites are skipped, falling back to the saved link if that fails.
+- **Navigation:** Prev/Next are written into your page when you publish. When a visitor clicks them, the page re-reads the ring file so removed sites are skipped, falling back to the saved link if that fails.
 
-Studio only trusts a hub signed by its maintainer's key, served from the maintainer's own site, and never older than the last copy it saw. A key change or an unsigned hub can raise a warning but never removes anyone.
+Studio only trusts a ring file signed by its maintainer's key, served from the maintainer's own site, and never older than the last copy it saw. A key change or an unsigned ring file can raise a warning but never removes anyone.
+
+### Webring Hubs
+
+A Webring Hub is an optional website that lists Webring sites so people can find each other, and can offer more through extensions. Anyone can run one. Studio works fine without them, and your site never depends on one.
+
+- **Add a Webring Hub** in the **Publish** tab with its address. Adding it doesn't list you.
+- **Find people:** in the **Friends** tab, search a hub and click **Use in Add Friend**. Studio then reads and checks that person's own site, exactly as if you'd typed the address. Search results aren't saved.
+- **List my site** (optional, per hub): once your site is published, the hub reads and checks your signed files itself. Turning it off sends a removal request signed with your site's key.
+- **Keeping your listing fresh:** after each publish, from the app, a schedule or an MCP agent, Studio waits until your live site shows the new version, then asks each hub that lists you to re-read it. If the host hasn't updated yet, Studio tries again after 2, 6 and 15 minutes and at every **Sync All**, and gives up after 24 hours. If a hub's operator removed or blocked your listing, Studio doesn't list you again.
+- **Your key and the hub:** a hub pins your site's key the first time it lists you, the same way Studio pins friends' keys. **Rotate Signing Key…** keeps your listing, because the hub follows the signed rotation certificate. A key that changes without one is refused until the hub's operator accepts it, so whoever takes over your domain doesn't take over your listing.
+- **Extensions:** hubs can offer extra features, shown as badges next to each hub. Studio refreshes each hub's list once a day. With the **Key witness** extension, the **Check with Webring Hubs** button on a friend card compares the key Studio pinned for that friend with the keys the hub has seen. That's useful when Studio warns that a friend's key changed. It's one more opinion, not proof: nothing is saved, and your pinned key isn't changed.
+
+Webring Hub settings are kept per persona, go through that persona's proxy, and are never published.
+
+**Running your own hub.** A hub is a separate project, [`webring-hub-php`](https://github.com/lnsCorey/webring-directory-php): a PHP 8.1+ and MySQL (or SQLite) server for ordinary shared hosting, with an operator page at `/admin` for reviewing, blocking and re-checking listings. Its README covers deployment. The design is in [docs/architecture/webring-hub.md](docs/architecture/webring-hub.md).
 
 ### Scheduling
 
@@ -229,6 +244,8 @@ Schedules run while Studio is running. With **background mode** on (the default)
 Studio includes a [Model Context Protocol](https://modelcontextprotocol.io) server, so an AI agent (Claude Code, Claude Desktop, Cursor, or your own scripts) can read and manage your personas, posts, friends, rings, schedules and publishing. The **AI Agent (MCP)** tab lists every tool and has a console for trying them.
 
 **Guided setup by an agent.** The server tells agents about the `guided-setup` prompt, which walks a new user through signing in to GitHub, creating their site, publishing and checking it's live. It uses the same steps as the in-app wizard. The tools are `webring_get_setup_status`, `webring_github_login_start` / `webring_github_login_poll` (the user approves a code on github.com, and the agent never sees the token), `webring_setup_github_site`, `webring_publish` and `webring_check_live_site`. Signing in, creating the site and publishing need the live connection below.
+
+**Webring Hubs from an agent.** `webring_hubs` lists, adds and removes hubs; `webring_search_hub` searches one; `webring_set_hub_listing` lists or unlists your site; and `webring_check_key_with_hubs` compares a friend's pinned key with what key-witness hubs have seen. `webring_publish` and `webring_crawl_all_friends` also notify hubs, as the app does.
 
 There are two ways to connect.
 
@@ -275,6 +292,8 @@ Then configure your MCP client to run:
 
 **No native modules.** Storage uses Node's built-in `node:sqlite`, available in Node 22.13+ (tests, stdio MCP server) and in Electron 45's bundled Node 24 (the app), so nothing is compiled during install. If `ELECTRON_RUN_AS_NODE=1` is set in your shell (some editors set it), `npm run dev` will fail to open a window; unset it first.
 
+**Testing against local sites.** Studio refuses `http://` and local-network addresses for friends, rings and hubs. To test with a site or hub on `127.0.0.1` (for example `php -S 127.0.0.1:8080 index.php` in `webring-hub-php`), start Studio with `WEBRING_ALLOW_PRIVATE_PEERS=1` set. Never set it for everyday use.
+
 **Project layout**
 
 | Path | Contents |
@@ -292,7 +311,10 @@ Then configure your MCP client to run:
 | `src/studio/FriendEditor.tsx` | The inline editor for a friend's details |
 | `src/studio/QrCodeSvg.tsx` | Copy Link / Copy Markdown / QR code for `webring://` links (built-in QR encoder) |
 | `src/shared/markdown.ts` | Safe Markdown renderer for text blocks (also embedded in published pages) |
+| `electron/services/webringHubService.ts` | Webring Hubs: search, listing, signed unlisting, pings after publish, key check |
+| `src/studio/WebringHubPanels.tsx` | The Webring Hub panels in the Publish and Friends tabs |
 | `docs/architecture/federation.md` | How federation, signing and webrings fit together |
+| `docs/architecture/webring-hub.md` | Webring Hub design, extensions and roadmap |
 
 `AGENTS.md` and `SPEC.md` describe the project's goals and conventions for contributors, human or AI.
 
