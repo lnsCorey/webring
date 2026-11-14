@@ -34,7 +34,7 @@ import {
   Scheduler,
   SchedulerConfig,
 } from './services/scheduler';
-import { publishTo, runScheduledPublish, runSyncAll, summarizeSync } from './services/jobs';
+import { notifyWebringHubs, publishTo, runScheduledPublish, runSyncAll, summarizeSync } from './services/jobs';
 import { parseProxyUrl } from './security/proxyAgent';
 import { GitHubDeviceLogin } from './services/githubAuth';
 import {
@@ -136,6 +136,32 @@ function showMainWindow() {
 
 function personaLabel(personaId: string): string {
   return personaManager.listPersonaRecords().find((p) => p.id === personaId)?.label || personaId;
+}
+
+/**
+ * Hosts such as GitHub Pages take a few minutes to show a publish, so a Webring Hub ping that was
+ * still waiting is retried a few times after it (the next Sync All also retries). Each try opens
+ * its own persona context and is serialised with that persona's other jobs.
+ */
+const WEBRING_HUB_FOLLOW_UP_DELAYS_MS = [2, 6, 15].map((m) => m * 60 * 1000);
+const webringHubFollowUps = new Map<string, NodeJS.Timeout[]>();
+
+function scheduleWebringHubFollowUp(personaId: string): void {
+  for (const timer of webringHubFollowUps.get(personaId) || []) clearTimeout(timer);
+  const timers = WEBRING_HUB_FOLLOW_UP_DELAYS_MS.map((delay) => {
+    const timer = setTimeout(() => {
+      void scheduler
+        .runExclusive(personaId, () =>
+          personaManager.withPersonaContext(personaId, async (ctx) => {
+            if (ctx.webringHubService.hasPendingPings()) await notifyWebringHubs(ctx);
+          })
+        )
+        .catch(() => undefined);
+    }, delay);
+    timer.unref?.();
+    return timer;
+  });
+  webringHubFollowUps.set(personaId, timers);
 }
 
 /** Every persona's schedule with its next run, for the UI, tray and MCP. */
@@ -273,6 +299,7 @@ async function initServices() {
         ),
     },
     onJobFinished: (personaId, job, result) => {
+      if (job === 'publish' && result.status === 'ok') scheduleWebringHubFollowUp(personaId);
       const config = scheduler.loadConfig();
       if (result.status === 'failed' && config.notifyOnFailure && Notification.isSupported()) {
         new Notification({
@@ -297,6 +324,7 @@ async function initServices() {
     openExternal: (url) => {
       if (/^https:\/\/github\.com\//i.test(url)) void shell.openExternal(url);
     },
+    onPublished: scheduleWebringHubFollowUp,
   });
 
   mcpHttpServer = new McpHttpServer(webringMcpServer, {
@@ -780,15 +808,45 @@ function registerIpcHandlers() {
     scheduler.runExclusive(personaManager.getActivePersonaId(), fn);
 
   ipcMain.handle('studio:crawl-all-friends', async (event) => {
-    return withActiveLock(() =>
-      personaManager.getActiveContext().ringCrawler.crawlAllFriends({
+    return withActiveLock(async () => {
+      const ctx = personaManager.getActiveContext();
+      const results = await ctx.ringCrawler.crawlAllFriends({
         // Progress for the Sync button: counts only, nothing about the sites
         onProgress: ({ done, total }) => {
           if (!event.sender.isDestroyed()) event.sender.send('studio:sync-progress', { done, total });
         },
-      })
-    );
+      });
+      await notifyWebringHubs(ctx);
+      return results;
+    });
   });
+
+  // Webring Hubs (optional, per persona; see docs/architecture/webring-hub.md)
+  // Re-reads /api/info (title, extensions) for hubs not checked within a day
+  ipcMain.handle('studio:webring-hub-list', () => personaManager.getActiveContext().webringHubService.refreshStaleInfo());
+  ipcMain.handle('studio:webring-hub-add', (_e, url: string) =>
+    personaManager.getActiveContext().webringHubService.add(String(url || ''))
+  );
+  ipcMain.handle('studio:webring-hub-remove', (_e, url: string) =>
+    personaManager.getActiveContext().webringHubService.remove(String(url || ''))
+  );
+  ipcMain.handle('studio:webring-hub-search', (_e, url: string, query: string, options?: { limit?: number; offset?: number }) =>
+    personaManager
+      .getActiveContext()
+      .webringHubService.search(String(url || ''), String(query || ''), {
+        limit: Number(options?.limit) || undefined,
+        offset: Number(options?.offset) || undefined,
+      })
+  );
+  ipcMain.handle('studio:webring-hub-set-listed', (_e, url: string, listed: boolean) =>
+    withActiveLock(() => {
+      const { webringHubService } = personaManager.getActiveContext();
+      return listed ? webringHubService.listSite(String(url || '')) : webringHubService.unlistSite(String(url || ''));
+    })
+  );
+  ipcMain.handle('studio:webring-hub-check-key', (_e, siteUrl: string) =>
+    personaManager.getActiveContext().webringHubService.checkKeyWithWebringHubs(String(siteUrl || ''))
+  );
 
   ipcMain.handle('studio:ring-request-join', async (_e, hubUrl: string) => {
     return await personaManager.getActiveContext().ringService.requestToJoin(hubUrl);
@@ -912,9 +970,11 @@ function registerIpcHandlers() {
   });
 
   ipcMain.handle('studio:export-local', (_e, targetDir?: string) => {
-    return withActiveLock(() =>
-      publishTo(personaManager.getActiveContext(), 'local', publishPaths(), { targetDir })
-    );
+    return withActiveLock(async () => {
+      const result = await publishTo(personaManager.getActiveContext(), 'local', publishPaths(), { targetDir });
+      if (result.success) scheduleWebringHubFollowUp(personaManager.getActivePersonaId());
+      return result;
+    });
   });
 
   ipcMain.handle('studio:test-export-preview', async (_e, openInBrowser?: boolean) => {
@@ -948,6 +1008,12 @@ function registerIpcHandlers() {
   // The Publish tab sends its current form; save it, then publish with the saved settings
   const publishWithSettings = (destination: PublishDestination, settings: unknown) =>
     withActiveLock(async () => {
+      const result = await publishWithSettingsNow(destination, settings);
+      if (result.success) scheduleWebringHubFollowUp(personaManager.getActivePersonaId());
+      return result;
+    });
+  const publishWithSettingsNow = (destination: PublishDestination, settings: unknown) =>
+    (async () => {
       const ctx = personaManager.getActiveContext();
       const currentProfile = ctx.db.getProfile();
       ctx.db.updateProfile({
@@ -957,7 +1023,7 @@ function registerIpcHandlers() {
         },
       });
       return publishTo(ctx, destination, publishPaths());
-    });
+    })();
 
   ipcMain.handle('studio:publish-remote', async (_e, settings) => publishWithSettings('remote', settings));
 
@@ -990,6 +1056,7 @@ function registerIpcHandlers() {
   );
   ipcMain.handle('studio:setup-publish', async () => {
     const result = await publishGitHubSite(personaManager.getActiveContext(), publishPaths());
+    if (result.success) scheduleWebringHubFollowUp(personaManager.getActivePersonaId());
     refreshTrayMenu();
     return result;
   });

@@ -150,6 +150,37 @@ export interface SetupState {
   lastLiveCheck?: { at: string; state: string; message: string };
 }
 
+/** An extension a Webring Hub advertises in `/api/info` (see docs/architecture/webring-hub.md). */
+export interface WebringHubExtensionInfo {
+  id: string;
+  version: string;
+  apiVersion: number;
+}
+
+/**
+ * A Webring Hub this persona uses (see `electron/services/webringHubService.ts` and
+ * `docs/architecture/webring-hub.md`). Local only, never exported.
+ */
+export interface WebringHubRecord {
+  /** The hub's base address, e.g. https://hub.example */
+  url: string;
+  /** The hub's own title from `/api/info`, for display only. */
+  title: string;
+  addedAt: string;
+  /** The user chose to list this persona's site here (opt-in; off when added). */
+  listMe: boolean;
+  state: 'not-listed' | 'listed' | 'blocked' | 'key-changed' | 'error';
+  lastListedAt?: string;
+  lastPingAt?: string;
+  /** `updatedAt` of the published manifest the hub should be asked to re-read. */
+  pendingPingFor?: string;
+  pendingSince?: string;
+  lastError?: string;
+  /** Extensions the hub advertised in `/api/info` when last checked. Metadata only. */
+  extensions?: WebringHubExtensionInfo[];
+  infoCheckedAt?: string;
+}
+
 export interface PublishSettings {
   exportPath: string;
   protocol: 'sftp' | 'ftp';
@@ -2997,6 +3028,54 @@ export class StudioDatabase {
       this.clearFetchCache();
     }
     return next;
+  }
+
+  // ---------------------------------------------------------------------------
+  // Webring Hubs this persona uses (local only, never exported). Search results are never
+  // stored; only the hub addresses and this persona's listing state are.
+
+  /**
+   * One-time move of the setting saved before the rename to Webring Hubs (`directoriesJson`).
+   * Copies it to `webringHubsJson` only when that key doesn't exist yet, then drops the old key.
+   */
+  private migrateLegacyWebringHubsSetting(): void {
+    const legacy = this.db
+      .prepare("SELECT value FROM local_settings WHERE key = 'directoriesJson'")
+      .get() as { value: string } | undefined;
+    if (!legacy) return;
+    // No transaction (callers may already be in one). Safe to repeat: if the delete never ran,
+    // the next call finds the new key in place and only deletes the old one.
+    this.db
+      .prepare("INSERT INTO local_settings (key, value) VALUES ('webringHubsJson', ?) ON CONFLICT(key) DO NOTHING")
+      .run(legacy.value);
+    this.db.prepare("DELETE FROM local_settings WHERE key = 'directoriesJson'").run();
+  }
+
+  public getWebringHubs(): WebringHubRecord[] {
+    this.migrateLegacyWebringHubsSetting();
+    const row = this.db
+      .prepare("SELECT value FROM local_settings WHERE key = 'webringHubsJson'")
+      .get() as { value: string } | undefined;
+    if (!row?.value) return [];
+    try {
+      const parsed = JSON.parse(row.value) as unknown;
+      if (!Array.isArray(parsed)) return [];
+      return parsed.filter(
+        (d): d is WebringHubRecord =>
+          Boolean(d) && typeof d === 'object' && typeof (d as WebringHubRecord).url === 'string'
+      );
+    } catch {
+      return [];
+    }
+  }
+
+  public saveWebringHubs(hubs: WebringHubRecord[]): void {
+    this.migrateLegacyWebringHubsSetting();
+    this.db
+      .prepare(
+        "INSERT INTO local_settings (key, value) VALUES ('webringHubsJson', ?) ON CONFLICT(key) DO UPDATE SET value = excluded.value"
+      )
+      .run(JSON.stringify(hubs));
   }
 
   // ---------------------------------------------------------------------------

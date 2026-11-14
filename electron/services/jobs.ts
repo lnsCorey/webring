@@ -3,6 +3,7 @@ import * as path from 'path';
 import { ActivePersonaContext } from './personaManager';
 import { PublishResult } from './publisher';
 import { CrawlSiteResult } from './ringCrawler';
+import { WebringHubPingResult } from './webringHubService';
 import { HostedRingSyncResult, JoinedRingSyncResult } from './ringService';
 import { JobResult, PublishDestination } from './scheduler';
 
@@ -14,13 +15,28 @@ import { JobResult, PublishDestination } from './scheduler';
 export interface SyncAllResult {
   friends: CrawlSiteResult[];
   rings: { joined: JoinedRingSyncResult[]; hosted: HostedRingSyncResult[] };
+  /** Webring Hub pings that were waiting for the live site to show the last publish. */
+  webringHubs: WebringHubPingResult[];
 }
 
 export async function runSyncAll(ctx: ActivePersonaContext): Promise<SyncAllResult> {
   const friends = await ctx.ringCrawler.crawlAllFriends();
   const joined = await ctx.ringService.syncJoinedRings();
   const hosted = await ctx.ringService.syncHostedRings();
-  return { friends, rings: { joined, hosted } };
+  const webringHubs = await notifyWebringHubs(ctx);
+  return { friends, rings: { joined, hosted }, webringHubs };
+}
+
+/**
+ * Asks the Webring Hubs this site is listed in to re-read it, once the live site shows the last
+ * publish (GitHub Pages can take minutes). Best effort: never throws, never fails a job.
+ */
+export async function notifyWebringHubs(ctx: ActivePersonaContext): Promise<WebringHubPingResult[]> {
+  try {
+    return await ctx.webringHubService.flushPendingPings();
+  } catch {
+    return [];
+  }
 }
 
 export function summarizeSync(result: SyncAllResult): JobResult {
@@ -34,6 +50,8 @@ export function summarizeSync(result: SyncAllResult): JobResult {
   if (failedFriends) parts.push(`${failedFriends} friend site(s) unreachable`);
   if (deferredFriends) parts.push(`${deferredFriends} unreachable lately (skipped for now)`);
   if (ringErrors) parts.push(`${ringErrors} ring(s) couldn't be checked`);
+  const pinged = (result.webringHubs || []).filter((d) => d.outcome === 'pinged').length;
+  if (pinged) parts.push(`${pinged} Webring Hub listing(s) refreshed`);
   return {
     at: new Date().toISOString(),
     // Some unreachable peers are normal; the job itself still worked
@@ -58,6 +76,20 @@ export function defaultExportPath(ctx: ActivePersonaContext, paths: PublishPaths
  * publishing anything) when the destination isn't set up.
  */
 export async function publishTo(
+  ctx: ActivePersonaContext,
+  destination: PublishDestination,
+  paths: PublishPaths,
+  overrides?: { targetDir?: string }
+): Promise<PublishResult> {
+  const result = await publishToDestination(ctx, destination, paths, overrides);
+  if (result.success) {
+    ctx.webringHubService.markPublished(ctx.db.getPublishedManifestUpdatedAt());
+    await notifyWebringHubs(ctx);
+  }
+  return result;
+}
+
+async function publishToDestination(
   ctx: ActivePersonaContext,
   destination: PublishDestination,
   paths: PublishPaths,

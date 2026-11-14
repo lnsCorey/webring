@@ -582,8 +582,9 @@ export const ConnectionsDocumentSchema = z.object({
 export type ConnectionsDocument = z.infer<typeof ConnectionsDocumentSchema>;
 
 /**
- * Webring hub: a ring's signed member list, published by its maintainer (api/rings/<slug>.json)
- * Allows any user or community to host a static JSON file that acts as a Webring directory.
+ * Ring file (the ring's "hub" in code): a ring's signed member list, published by its maintainer
+ * (api/rings/<slug>.json). Unrelated to Webring Hubs, the optional third-party servers in
+ * electron/services/webringHubService.ts.
  */
 export const WebringHubDocumentSchema = z.object({
   schemaVersion: z.string().default(WEBRING_SCHEMA_VERSION),

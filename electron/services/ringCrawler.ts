@@ -103,6 +103,46 @@ export async function fetchPublicImage(url: string, proxyUrl?: string): Promise<
 
 const MAX_JSON_BYTES = 5 * 1024 * 1024; // 5 MB limit per crawled JSON document
 
+/** A JSON API answer: the HTTP status and the parsed body (undefined when empty or not JSON). */
+export interface PublicJsonResponse {
+  status: number;
+  json: unknown;
+}
+
+/**
+ * Calls a JSON API on the public internet (used for optional services such as a Webring
+ * Hub), with the same guards as the crawler: private addresses refused, the persona's
+ * proxy, a size limit and a timeout. Any HTTP status is returned rather than thrown, so callers
+ * can read the service's error body. POSTs are never retried or redirected.
+ */
+export async function requestPublicJson(
+  url: string,
+  init: { method?: 'GET' | 'POST'; body?: unknown; proxyUrl?: string } = {}
+): Promise<PublicJsonResponse> {
+  if (!/^https?:\/\//i.test(url)) throw new Error(`Not a web address: ${url}`);
+  const res = await fetchPublic(url, {
+    accept: 'application/json',
+    maxBytes: MAX_JSON_BYTES,
+    validators: null,
+    compressed: true,
+    proxyUrl: init.proxyUrl,
+    method: init.method || 'GET',
+    body: init.body === undefined ? undefined : JSON.stringify(init.body),
+    anyStatus: true,
+  });
+  if (res.status === 'not-modified') throw new Error(`Unexpected 304 from ${url}`);
+  const text = res.body.toString('utf8').trim();
+  let json: unknown;
+  if (text) {
+    try {
+      json = JSON.parse(text);
+    } catch {
+      json = undefined;
+    }
+  }
+  return { status: res.httpStatus, json };
+}
+
 /**
  * Default fetcher that supports both HTTP(S) URLs and local `file://` or directory paths
  * (making local multi-site testing and offline ring folders work seamlessly).
@@ -141,7 +181,7 @@ const FETCH_TIMEOUT_MS = 10000;
 
 type PublicFetchResult =
   | { status: 'not-modified' }
-  | { status: 'ok'; body: Buffer; contentType: string; etag: string; lastModified: string };
+  | { status: 'ok'; httpStatus: number; body: Buffer; contentType: string; etag: string; lastModified: string };
 
 interface PublicFetchOptions {
   accept: string;
@@ -152,6 +192,12 @@ interface PublicFetchOptions {
   compressed?: boolean;
   /** Optional per-persona outbound proxy URL (socks5://, socks5h://, or http://). */
   proxyUrl?: string;
+  /** Defaults to GET. A POST is never retried and never follows redirects. */
+  method?: 'GET' | 'POST';
+  /** JSON request body (POST only). */
+  body?: string;
+  /** Resolve with any HTTP status (and its body) instead of rejecting non-2xx answers. */
+  anyStatus?: boolean;
 }
 
 /** Errors where the connection dropped (often a reused keep-alive socket the host had closed). */
@@ -170,7 +216,8 @@ async function fetchPublic(rawUrl: string, options: PublicFetchOptions): Promise
   try {
     return await fetchPublicOnce(rawUrl, options);
   } catch (err) {
-    if (!isConnectionReset(err)) throw err;
+    // Only GETs are safe to repeat
+    if (!isConnectionReset(err) || (options.method && options.method !== 'GET')) throw err;
     return fetchPublicOnce(rawUrl, options);
   }
 }
@@ -209,13 +256,19 @@ function fetchPublicOnce(
         return;
       }
     }
-    const req = client.get(
+    const method = options.method || 'GET';
+    const requestBody = method === 'POST' && options.body !== undefined ? Buffer.from(options.body, 'utf8') : undefined;
+    const req = client.request(
       url,
       {
+        method,
         // Some hosts (including api.github.com) refuse requests without a User-Agent
         headers: {
           Accept: options.accept,
           'User-Agent': 'WebringStudio/1.0 (+ring crawler)',
+          ...(requestBody
+            ? { 'Content-Type': 'application/json', 'Content-Length': String(requestBody.length) }
+            : {}),
           ...(options.compressed ? { 'Accept-Encoding': 'gzip, br' } : {}),
           ...(options.validators?.etag ? { 'If-None-Match': options.validators.etag } : {}),
           ...(options.validators?.lastModified ? { 'If-Modified-Since': options.validators.lastModified } : {}),
@@ -232,6 +285,10 @@ function fetchPublicOnce(
         }
         if (status >= 300 && status < 400 && res.headers.location) {
           res.resume();
+          if (method !== 'GET') {
+            reject(new Error(`${rawUrl} answered a ${method} with a redirect, which isn't followed`));
+            return;
+          }
           if (redirectsLeft <= 0) {
             reject(new Error(`Too many redirects fetching ${rawUrl}`));
             return;
@@ -239,7 +296,7 @@ function fetchPublicOnce(
           fetchPublicOnce(new URL(res.headers.location, url).toString(), options, redirectsLeft - 1).then(resolve, reject);
           return;
         }
-        if (status < 200 || status >= 300) {
+        if ((status < 200 || status >= 300) && !options.anyStatus) {
           res.resume();
           reject(new Error(`HTTP ${status} fetching ${rawUrl}`));
           return;
@@ -281,6 +338,7 @@ function fetchPublicOnce(
         body.on('end', () =>
           resolve({
             status: 'ok',
+            httpStatus: status,
             body: Buffer.concat(chunks),
             contentType: header('content-type'),
             etag: header('etag'),
@@ -299,6 +357,7 @@ function fetchPublicOnce(
     req.on('close', () => clearTimeout(deadline));
     req.on('timeout', () => req.destroy(new Error(`Timed out fetching ${rawUrl}`)));
     req.on('error', reject);
+    req.end(requestBody);
   });
 }
 

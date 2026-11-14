@@ -7,7 +7,7 @@ import { savePost, unsavePost } from '../services/savedPosts';
 import { jobNextRunAt, Scheduler, SchedulePreset } from '../services/scheduler';
 import { parseProxyUrl } from '../security/proxyAgent';
 import { GitHubDeviceLogin } from '../services/githubAuth';
-import { publishTo, PublishPaths } from '../services/jobs';
+import { notifyWebringHubs, publishTo, PublishPaths } from '../services/jobs';
 import {
   checkLiveSite,
   configureGitHubSite,
@@ -96,6 +96,11 @@ export interface McpAppServices {
   publishPaths: () => PublishPaths;
   deviceLogin: GitHubDeviceLogin;
   openExternal?: (url: string) => void;
+  /**
+   * After a successful publish. The app schedules its Webring Hub ping follow-ups here, since the
+   * host (GitHub Pages) rarely shows a publish by the time `publishTo` makes its first attempt.
+   */
+  onPublished?: (personaId: string) => void;
 }
 
 export class WebringMcpServer {
@@ -666,7 +671,7 @@ export class WebringMcpServer {
       {
         name: 'webring_crawl_all_friends',
         description:
-          'Crawl all friends in the persona’s ring and return a summary of newly indexed posts, photos, and back-endorsements.',
+          'Crawl all friends in the persona’s ring and return a summary of newly indexed posts, photos, and back-endorsements. Like the Sync button, it also asks Webring Hubs the site is listed in to re-read it once the live site shows the last publish.',
         inputSchema: {
           type: 'object',
           properties: {
@@ -758,12 +763,12 @@ export class WebringMcpServer {
       {
         name: 'webring_join_ring',
         description:
-          'Verify a ring hub (https URL of its signed hub JSON) and create a private signed join request. Returns a webring://ring-request link the user must send to the ring maintainer. The persona’s site must already be published.',
+          'Verify a ring from its ring address (the https URL of its ring page or of its ring file, the signed member list JSON) and create a private signed join request. Returns a webring://ring-request link the user must send to the ring maintainer. The persona’s site must already be published.',
         inputSchema: {
           type: 'object',
           properties: {
             personaId: personaIdProp,
-            hubUrl: { type: 'string', description: 'https URL of the ring’s hub JSON.' },
+            hubUrl: { type: 'string', description: 'The ring address: https URL of the ring’s page or of its ring file (signed member list JSON).' },
           },
           required: ['hubUrl'],
         },
@@ -781,12 +786,12 @@ export class WebringMcpServer {
       {
         name: 'webring_sync_rings',
         description:
-          'Refresh joined rings from their hubs (membership, neighbours, removals) and check hosted rings’ members (leavers are removed after a grace period).',
+          'Refresh joined rings from their ring files (membership, neighbours, removals) and check hosted rings’ members (leavers are removed after a grace period).',
         inputSchema: { type: 'object', properties: { personaId: personaIdProp } },
       },
       {
         name: 'webring_create_hosted_ring',
-        description: 'Create a new ring this persona maintains. It is published as a signed hub at the next publish.',
+        description: 'Create a new ring this persona maintains. Its page and ring file (signed member list) are published at the next publish.',
         inputSchema: {
           type: 'object',
           properties: {
@@ -848,6 +853,63 @@ export class WebringMcpServer {
         },
       },
       {
+        name: 'webring_hubs',
+        description:
+          'Manage the optional Webring Hubs this persona uses (third-party servers that index published sites). action "list" shows them with this persona’s listing state; "add" checks a hub answers /api/info and adds it (it does not list your site); "remove" forgets one (unlist first). Stored locally per persona, never exported.',
+        inputSchema: {
+          type: 'object',
+          properties: {
+            personaId: personaIdProp,
+            action: { type: 'string', enum: ['list', 'add', 'remove'] },
+            url: { type: 'string', description: 'Webring Hub address, e.g. https://hub.example (add/remove).' },
+          },
+          required: ['action'],
+        },
+      },
+      {
+        name: 'webring_search_hub',
+        description:
+          'Search a Webring Hub for people. Results are hints only: nothing is stored, blocked sites are left out, and adding someone still goes through webring_add_friend, which crawls and verifies their own site.',
+        inputSchema: {
+          type: 'object',
+          properties: {
+            personaId: personaIdProp,
+            url: { type: 'string', description: 'Webring Hub address (must already be added).' },
+            query: { type: 'string', description: 'Words to search for; empty lists recent entries.' },
+            limit: { type: 'number' },
+            offset: { type: 'number' },
+          },
+          required: ['url'],
+        },
+      },
+      {
+        name: 'webring_set_hub_listing',
+        description:
+          'List or unlist this persona’s published site in a Webring Hub. Listing tells the hub your site exists (it then crawls and verifies your signed files itself, and is pinged after each publish). Unlisting sends a removal request signed with the site key. Only do this when the user asked for it.',
+        inputSchema: {
+          type: 'object',
+          properties: {
+            personaId: personaIdProp,
+            url: { type: 'string', description: 'Webring Hub address (must already be added).' },
+            listed: { type: 'boolean' },
+          },
+          required: ['url', 'listed'],
+        },
+      },
+      {
+        name: 'webring_check_key_with_hubs',
+        description:
+          'Compare the signing key Studio pinned for a friend’s site with what independent Webring Hubs have seen, using hubs that advertise the key-witness extension (others are not asked). Results are evidence for the user only: nothing is stored and the pinned key is never changed. Useful when a friend shows keyStatus "changed".',
+        inputSchema: {
+          type: 'object',
+          properties: {
+            personaId: personaIdProp,
+            friendSiteUrl: { type: 'string', description: 'The friend’s site address.' },
+          },
+          required: ['friendSiteUrl'],
+        },
+      },
+      {
         name: 'webring_get_schedule',
         description:
           'Show the persona’s sync and publish schedules (preset, next run, last result) and the app-level background settings.',
@@ -880,7 +942,7 @@ export class WebringMcpServer {
       {
         name: 'webring_set_proxy',
         description:
-          'Configure per-persona outbound SOCKS5 / Tor (socks5h://) / HTTP proxy routing for crawling friends and webring hubs. Kept in local_settings and never exported.',
+          'Configure per-persona outbound SOCKS5 / Tor (socks5h://) / HTTP proxy routing for crawling friends and rings and for Webring Hub requests. Kept in local_settings and never exported.',
         inputSchema: {
           type: 'object',
           properties: {
@@ -1608,11 +1670,14 @@ export class WebringMcpServer {
         case 'webring_crawl_all_friends': {
           const ctx = this.resolveContext(args);
           const results = await ctx.ringCrawler.crawlAllFriends();
+          // Same as the Sync button: send Webring Hub pings that were waiting for the live site
+          const webringHubs = await notifyWebringHubs(ctx);
           resultData = {
             crawledCount: results.length,
             results,
             totalEndorsements: ctx.db.getCuratedEndorsements().entries.length,
             totalFeedEntries: ctx.db.getCuratedNetworkFeed().entries.length,
+            webringHubs,
           };
           summary = `Crawled all ${results.length} friend(s) in ring`;
           break;
@@ -1781,6 +1846,60 @@ export class WebringMcpServer {
           ctx.db.dismissFriendNotice(String(args.siteUrl || ''));
           resultData = { dismissed: String(args.siteUrl || '') };
           summary = `Dismissed ${String(args.siteUrl || '')} from Added you`;
+          break;
+        }
+
+        case 'webring_hubs': {
+          const ctx = this.resolveContext(args);
+          const action = String(args.action || 'list');
+          const url = String(args.url || '');
+          if (action === 'add') {
+            const added = await ctx.webringHubService.add(url);
+            resultData = { added, webringHubs: ctx.webringHubService.list() };
+            summary = `Added Webring Hub ${added.title}`;
+          } else if (action === 'remove') {
+            resultData = { webringHubs: ctx.webringHubService.remove(url) };
+            summary = `Removed Webring Hub ${url}`;
+          } else if (action === 'list') {
+            resultData = { webringHubs: await ctx.webringHubService.refreshStaleInfo() };
+            summary = 'Listed Webring Hubs';
+          } else {
+            throw new Error('action must be list, add or remove');
+          }
+          break;
+        }
+
+        case 'webring_search_hub': {
+          const ctx = this.resolveContext(args);
+          const res = await ctx.webringHubService.search(String(args.url || ''), String(args.query || ''), {
+            limit: Number(args.limit) || undefined,
+            offset: Number(args.offset) || undefined,
+          });
+          resultData = res;
+          summary = `Found ${res.results.length} of ${res.total} in ${res.webringHubUrl}`;
+          break;
+        }
+
+        case 'webring_set_hub_listing': {
+          const ctx = this.resolveContext(args);
+          const url = String(args.url || '');
+          const webringHub = args.listed === true
+            ? await ctx.webringHubService.listSite(url)
+            : await ctx.webringHubService.unlistSite(url);
+          resultData = { webringHub };
+          summary = `${args.listed === true ? 'Listed in' : 'Unlisted from'} ${webringHub.title}`;
+          break;
+        }
+
+        case 'webring_check_key_with_hubs': {
+          const ctx = this.resolveContext(args);
+          const check = await ctx.webringHubService.checkKeyWithWebringHubs(String(args.friendSiteUrl || ''));
+          resultData = check;
+          const matches = check.results.filter((r) => r.result === 'match').length;
+          const mismatches = check.results.filter((r) => r.result === 'mismatch').length;
+          summary = check.results.length === 0
+            ? 'No Webring Hub with the key-witness extension to ask'
+            : `${matches} Webring Hub${matches === 1 ? ' agrees' : 's agree'}, ${mismatches} saw a different key`;
           break;
         }
 
@@ -1982,6 +2101,7 @@ export class WebringMcpServer {
               ? await publishGitHubSite(ctx, app.publishPaths())
               : await publishTo(ctx, destination, app.publishPaths());
           if (!res.success) throw new Error(res.message);
+          app.onPublished?.(ctx.persona.id);
           resultData = res;
           summary = res.message;
           break;
