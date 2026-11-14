@@ -32,6 +32,13 @@ import { MarkdownField } from './MarkdownField';
 import { renderMarkdown } from '../shared/markdown';
 import { ProfileImagePicker } from './ProfileImagePicker';
 import { HostedRingPageEditor } from './HostedRingPageEditor';
+import {
+  WebringHubApi,
+  WebringHubListingsPanel,
+  WebringHubSearchPanel,
+  KeyWitnessCheck,
+  useWebringHubs,
+} from './WebringHubPanels';
 import { WebringShareBlock } from './QrCodeSvg';
 import { SetupApi, SetupHealthCard, SetupWizard } from './SetupWizard';
 import type { SetupStatus } from '../shared/setup';
@@ -465,6 +472,12 @@ declare global {
         rotationCount: number;
       }>;
       trustFriendKey?: (friendId: string, newPublicKeyPem?: string) => Promise<FriendConnection>;
+      listWebringHubs?: WebringHubApi['listWebringHubs'];
+      addWebringHub?: WebringHubApi['addWebringHub'];
+      removeWebringHub?: WebringHubApi['removeWebringHub'];
+      searchWebringHub?: WebringHubApi['searchWebringHub'];
+      setWebringHubListed?: WebringHubApi['setWebringHubListed'];
+      checkKeyWithWebringHubs?: WebringHubApi['checkKeyWithWebringHubs'];
       setProxySettings?: (input: {
         enabled?: boolean;
         proxyUrl?: string;
@@ -635,6 +648,7 @@ export const App: React.FC = () => {
     | 'mcp-agents'
     | 'privacy-faq'
     | 'webrings'
+    | 'hubs'
   >('quickstart');
   const [bundle, setBundle] = useState<CompleteSiteBundle | null>(null);
   const [allFriends, setAllFriends] = useState<FriendConnection[]>([]);
@@ -867,6 +881,17 @@ export const App: React.FC = () => {
   const [mcpToolArgsJson, setMcpToolArgsJson] = useState<string>('{}');
   const [mcpToolOutput, setMcpToolOutput] = useState<string>('');
 
+  // Optional Webring Hubs (local per persona; see WebringHubPanels.tsx)
+  const webringHubApi: WebringHubApi | undefined =
+    window.studioApi?.listWebringHubs &&
+    window.studioApi.addWebringHub &&
+    window.studioApi.removeWebringHub &&
+    window.studioApi.searchWebringHub &&
+    window.studioApi.setWebringHubListed
+      ? (window.studioApi as unknown as WebringHubApi)
+      : undefined;
+  const { webringHubs, reload: reloadWebringHubs } = useWebringHubs(webringHubApi, activePersonaId);
+
   const notify = (msg: string) => {
     setStatusMessage(msg);
     setTimeout(() => {
@@ -925,6 +950,7 @@ export const App: React.FC = () => {
   const refreshStudioData = async () => {
     if (!window.studioApi) return;
     void refreshSetupStatus();
+    void reloadWebringHubs();
     const data = await window.studioApi.getBundle();
     if (data.activePersonaId) {
       setActivePersonaId(data.activePersonaId);
@@ -1581,7 +1607,7 @@ export const App: React.FC = () => {
     setNewHostedRingName('');
     setNewHostedRingDesc('');
     await refreshStudioData();
-    notify(`Created "${ring.name}". Publish your site to put its hub online.`);
+    notify(`Created "${ring.name}". Publish your site to put its ring file online.`);
   };
 
   const handleUpdateHostedRing = async (ring: HostedRing, updates: HostedRingUpdates) => {
@@ -3669,9 +3695,25 @@ export const App: React.FC = () => {
                 </div>
               </div>
 
+              <WebringHubSearchPanel
+                api={webringHubApi}
+                webringHubs={webringHubs}
+                onManage={() => setActiveTab('publish')}
+                onUse={(result) => {
+                  // Only the address and a name to edit: the avatar and bio come from the site itself
+                  // once it's crawled and verified, never from the hub
+                  setFriendSiteUrl(result.siteUrl);
+                  setFriendName(result.displayName);
+                  setFriendAvatar('');
+                  setFriendBio('');
+                  document.getElementById('add-friend-form')?.scrollIntoView({ behavior: 'smooth', block: 'center' });
+                }}
+              />
+
               <div className="grid grid-cols-1 lg:grid-cols-2 gap-6">
                 {/* Add Friend Form */}
                 <form
+                  id="add-friend-form"
                   onSubmit={handleAddFriend}
                   className="bg-slate-900 border border-slate-800 rounded-2xl p-5 space-y-4"
                 >
@@ -3759,7 +3801,7 @@ export const App: React.FC = () => {
                   </button>
                 </form>
 
-                {/* Join a Webring (curated: verify the hub, then send the maintainer a signed request) */}
+                {/* Join a Webring (curated: verify the ring file, then send the maintainer a signed request) */}
                 <form
                   onSubmit={handleRequestToJoinRing}
                   className="bg-slate-900 border border-slate-800 rounded-2xl p-5 space-y-4"
@@ -3768,14 +3810,14 @@ export const App: React.FC = () => {
                     <Layers className="w-4 h-4 text-indigo-400" /> Join a Webring
                   </h3>
                   <p className="text-xs text-slate-400">
-                    Paste the address of the ring's page (or its hub, or use a member's{' '}
+                    Paste the ring address: its page or its ring file (or use a member's{' '}
                     <strong>Join Ring</strong> link). Studio checks the ring's signature and creates a
                     private, signed request link for you to send the ring's maintainer. Publish your
                     site first so the maintainer can verify it. To start your own ring instead, use{' '}
                     <strong>Rings You Host</strong> below.
                   </p>
                   <div>
-                    <label className="block text-xs text-slate-400 mb-1">Ring page or hub address (https)</label>
+                    <label className="block text-xs text-slate-400 mb-1">Ring address (https)</label>
                     <input
                       type="url"
                       required
@@ -3861,7 +3903,7 @@ export const App: React.FC = () => {
                                   />
                                 </div>
                                 <div>
-                                  <label className="block text-xs text-slate-400 mb-1">Webring Hub JSON URL</label>
+                                  <label className="block text-xs text-slate-400 mb-1">Ring file address (signed member list JSON)</label>
                                   <input
                                     type="text"
                                     value={editRingDraft.hubUrl}
@@ -3946,7 +3988,7 @@ export const App: React.FC = () => {
                                   {ring.status === 'member' && (
                                     <span>
                                       {ring.memberCount} member{ring.memberCount === 1 ? '' : 's'}
-                                      {ring.hubVerified ? ' · ✓ signed hub' : ' · unsigned hub'}
+                                      {ring.hubVerified ? ' · ✓ signed ring file' : ' · unsigned ring file'}
                                     </span>
                                   )}
                                   <span>
@@ -4022,8 +4064,8 @@ export const App: React.FC = () => {
                 <div className="flex flex-wrap items-center justify-between gap-2">
                   <h3 className="font-bold text-lg">Rings You Host ({hostedRings.length})</h3>
                   <p className="text-xs text-slate-400">
-                    Each ring gets a public page people can visit and join from, plus a signed hub that
-                    members' Studios sync. Changes go live when you publish.
+                    Each ring gets a public page people can visit and join from, plus a signed ring file
+                    (its member list) that members' Studios sync. Changes go live when you publish.
                   </p>
                 </div>
 
@@ -4163,12 +4205,12 @@ export const App: React.FC = () => {
                           type="button"
                           onClick={() => {
                             navigator.clipboard.writeText(ring.hubUrl);
-                            notify('Copied the hub address (the signed JSON members sync).');
+                            notify('Copied the ring file address (the signed member list members sync).');
                           }}
                           className="px-2.5 py-1.5 rounded-lg bg-slate-800 hover:bg-slate-700 flex items-center gap-1"
                           title="The signed JSON that members' Studios sync. Share the ring page instead."
                         >
-                          <Copy className="w-3 h-3" /> Hub
+                          <Copy className="w-3 h-3" /> Ring File
                         </button>
                         <label className="flex items-center gap-1.5 px-2.5 py-1.5 rounded-lg bg-slate-800">
                           <input
@@ -4497,6 +4539,14 @@ export const App: React.FC = () => {
                             >
                               Trust New Key &amp; Re-sync
                             </button>
+                          )}
+                          {friend.keyStatus !== 'unverified' && (
+                            <KeyWitnessCheck
+                              api={webringHubApi}
+                              webringHubs={webringHubs}
+                              siteUrl={friend.siteUrl}
+                              emphasized={friend.keyStatus === 'changed'}
+                            />
                           )}
                           {!mutualFriendUrls.includes(friend.siteUrl) && (
                             <button
@@ -5581,6 +5631,14 @@ export const App: React.FC = () => {
                 </div>
               )}
 
+              <WebringHubListingsPanel
+                api={webringHubApi}
+                webringHubs={webringHubs}
+                reload={reloadWebringHubs}
+                hasPublished={Boolean(publishSettings.lastPublishedAt)}
+                notify={notify}
+              />
+
               {/* Pre-Publish Test Export & Local Browser Preview */}
               <div className="bg-indigo-950/25 border border-indigo-500/30 rounded-2xl p-6 space-y-4">
                 <div className="flex flex-wrap items-start justify-between gap-4">
@@ -5666,7 +5724,7 @@ export const App: React.FC = () => {
                   Generates <code>index.html</code>, <code>/.well-known/did.json</code>,{' '}
                   <code>/api/manifest.json</code>, <code>/api/profile.json</code>,{' '}
                   <code>/api/albums.json</code>, <code>/api/items.json</code>,{' '}
-                  <code>/api/connections.json</code>, and a signed hub plus directory page for each
+                  <code>/api/connections.json</code>, and a signed ring file plus directory page for each
                   ring you host.
                 </p>
 
@@ -6939,8 +6997,9 @@ export const App: React.FC = () => {
                     Complete documentation for compartmentalized personas, wall posts & threaded
                     comments, syncing friends with mute &amp; block, local test exports,{' '}
                     <strong>GitHub Pages</strong> & <strong>SFTP / FTP</strong> deployment and
-                    publish snapshots, <strong>Google Analytics / AdSense</strong> add-ons, and
-                    secure local <strong>AI Agent (MCP)</strong> automation.
+                    publish snapshots, <strong>Google Analytics / AdSense</strong> add-ons,{' '}
+                    <strong>Webrings</strong> and optional <strong>Webring Hubs</strong>, and secure
+                    local <strong>AI Agent (MCP)</strong> automation.
                   </p>
                 </div>
 
@@ -6955,6 +7014,7 @@ export const App: React.FC = () => {
                       { id: 'mcp-agents', label: '5. AI Agent (MCP) Guide' },
                       { id: 'privacy-faq', label: '6. Security & Privacy FAQ' },
                       { id: 'webrings', label: '7. Webrings Guide' },
+                      { id: 'hubs', label: '8. Webring Hubs' },
                     ] as const
                   ).map((sec) => (
                     <button
@@ -7941,6 +8001,15 @@ git push -u origin main --force`}
                         </div>
                         <div className="p-3 rounded-xl bg-slate-950 border border-slate-800">
                           <strong className="text-white block mb-1">
+                            📖 Webring Hubs (4 tools)
+                          </strong>
+                          <code>webring_hubs</code>,{' '}
+                          <code>webring_search_hub</code>,{' '}
+                          <code>webring_set_hub_listing</code>,{' '}
+                          <code>webring_check_key_with_hubs</code>
+                        </div>
+                        <div className="p-3 rounded-xl bg-slate-950 border border-slate-800">
+                          <strong className="text-white block mb-1">
                             🚀 Publishing, Schedules, Network & Add-Ons (9 tools)
                           </strong>
                           <code>webring_export_static_site</code>,{' '}
@@ -8005,7 +8074,7 @@ git push -u origin main --force`}
                         <strong>Next →</strong> and <strong>Random</strong>. Each ring has a{' '}
                         <strong>maintainer</strong> who decides who's in it. Everything works with static
                         files: the maintainer publishes a signed member list (the ring's{' '}
-                        <em>hub</em>), and each member's site lists the rings it belongs to. You're a
+                        <em>ring file</em>), and each member's site lists the rings it belongs to. You're a
                         member when both agree.
                       </p>
                     </div>
@@ -8017,7 +8086,7 @@ git push -u origin main --force`}
                           <li>Publish your site at least once (the maintainer checks it).</li>
                           <li>
                             In <strong>Friends &amp; Webrings → Join a Webring</strong>, paste the ring's
-                            hub URL (or click <strong>Join Ring</strong> on a member's site).
+                            address (or click <strong>Join Ring</strong> on a member's site).
                           </li>
                           <li>
                             Studio verifies the ring and gives you a private, signed{' '}
@@ -8039,10 +8108,10 @@ git push -u origin main --force`}
                         <ol className="list-decimal list-inside space-y-1 text-slate-300">
                           <li>
                             In <strong>Rings You Host</strong>, create a ring and publish. Your site now
-                            has its signed hub (<code>api/rings/&lt;name&gt;.json</code>) and a public
+                            has its signed ring file (<code>api/rings/&lt;name&gt;.json</code>) and a public
                             directory page (<code>rings/&lt;name&gt;/</code>).
                           </li>
-                          <li>Share the hub URL or the directory page with people who'd like to join.</li>
+                          <li>Share the ring address (its directory page) with people who'd like to join.</li>
                           <li>
                             Paste each request link into <strong>Review a Join Request</strong>. Studio
                             checks the applicant's signature; you choose Approve, Decline or Ban.
@@ -8063,7 +8132,7 @@ git push -u origin main --force`}
                             maintainer's next Sync All notices and removes you.
                           </li>
                           <li>
-                            <strong>Removed:</strong> the maintainer drops you from the hub. Your next
+                            <strong>Removed:</strong> the maintainer drops you from the ring file. Your next
                             sync marks the ring <em>Removed</em> and its bar disappears at your next
                             publish. You can ask to join again.
                           </li>
@@ -8092,11 +8161,11 @@ git push -u origin main --force`}
                           </li>
                           <li>
                             When a visitor clicks Prev, Next or Random, the page quickly re-reads the
-                            ring's hub so removed or hidden sites are skipped. If that fails, it uses the
+                            ring's file so removed or hidden sites are skipped. If that fails, it uses the
                             saved link.
                           </li>
                           <li>
-                            Studio only trusts a hub signed by its maintainer's key, served from the
+                            Studio only trusts a ring file signed by its maintainer's key, served from the
                             maintainer's own site, and never older than the last one it saw. A key
                             change freezes the ring until you review it; it never removes anyone.
                           </li>
@@ -8130,6 +8199,152 @@ git push -u origin main --force`}
                     </div>
 
                     <div className="flex justify-end">
+                      <button
+                        type="button"
+                        onClick={() => setActiveTab('friends')}
+                        className="px-4 py-2 rounded-xl bg-indigo-600 hover:bg-indigo-500 text-white text-xs font-semibold"
+                      >
+                        Open Friends &amp; Webrings →
+                      </button>
+                    </div>
+                  </div>
+                </div>
+              )}
+
+              {/* SECTION 8: WEBRING HUBS */}
+              {helpSection === 'hubs' && (
+                <div className="space-y-6">
+                  <div className="bg-slate-900 border border-slate-800 rounded-2xl p-6 space-y-5">
+                    <div className="border-b border-slate-800 pb-4">
+                      <h3 className="text-xl font-bold">Webring Hubs: Finding People &amp; Being Found</h3>
+                      <p className="text-xs text-slate-400 mt-1">
+                        A <strong>Webring Hub</strong> is an optional website that lists Webring sites so
+                        people can find each other, and can offer more through <em>extensions</em>.
+                        Anyone can run one. Studio works fine without them, and your site never depends on
+                        one: a hub only ever reads the same signed files everyone else can.
+                      </p>
+                    </div>
+
+                    <div className="grid grid-cols-1 md:grid-cols-2 gap-4 text-xs">
+                      <div className="p-4 rounded-xl bg-slate-950 border border-slate-800 space-y-2">
+                        <h4 className="font-bold text-sm text-indigo-300">Finding people</h4>
+                        <ol className="list-decimal list-inside space-y-1 text-slate-300">
+                          <li>
+                            In <strong>Publish &amp; SFTP → Webring Hubs</strong>, add a hub by its
+                            address. Adding a hub doesn't list you.
+                          </li>
+                          <li>
+                            In <strong>Friends &amp; Webrings</strong>, search the hub by name, interest
+                            or place.
+                          </li>
+                          <li>
+                            Click <strong>Use in Add Friend</strong>. Studio then reads and checks that
+                            person's own site, exactly as if you'd typed the address.
+                          </li>
+                        </ol>
+                        <p className="text-slate-400">
+                          Search results are only hints. They're never saved or published, and sites you
+                          blocked are left out.
+                        </p>
+                      </div>
+
+                      <div className="p-4 rounded-xl bg-slate-950 border border-slate-800 space-y-2">
+                        <h4 className="font-bold text-sm text-emerald-300">Listing your site</h4>
+                        <ul className="list-disc list-inside space-y-1 text-slate-300">
+                          <li>
+                            Publish first, then turn on <strong>List my site</strong> for a hub. The hub
+                            reads and checks your signed files itself.
+                          </li>
+                          <li>
+                            After each publish (from the app, a schedule or an MCP agent), Studio waits
+                            until your live site shows the new version, then asks the hub to re-read it.
+                          </li>
+                          <li>
+                            If your host hasn't updated yet, Studio tries again after 2, 6 and 15 minutes
+                            and at every <strong>Sync All</strong>, and gives up after 24 hours.
+                          </li>
+                          <li>
+                            Turning <strong>List my site</strong> off sends a removal request signed with
+                            your site's key, so nobody else can unlist you.
+                          </li>
+                          <li>
+                            If a hub's operator removed or blocked your listing, Studio respects that and
+                            doesn't list you again.
+                          </li>
+                        </ul>
+                      </div>
+
+                      <div className="p-4 rounded-xl bg-slate-950 border border-slate-800 space-y-2">
+                        <h4 className="font-bold text-sm text-amber-300">Your key and the hub</h4>
+                        <ul className="list-disc list-inside space-y-1 text-slate-300">
+                          <li>
+                            A hub pins your site's signing key the first time it lists you, the same way
+                            Studio pins your friends' keys.
+                          </li>
+                          <li>
+                            <strong>Rotate Signing Key…</strong> keeps your listing: the hub follows the
+                            rotation certificate signed by your old key.
+                          </li>
+                          <li>
+                            A key that changes without a certificate is refused until the hub's operator
+                            accepts it. Someone who takes over your domain doesn't take over your listing.
+                          </li>
+                        </ul>
+                      </div>
+
+                      <div className="p-4 rounded-xl bg-slate-950 border border-slate-800 space-y-2">
+                        <h4 className="font-bold text-sm text-cyan-300">Extensions &amp; Key witness</h4>
+                        <ul className="list-disc list-inside space-y-1 text-slate-300">
+                          <li>
+                            Hubs can offer extra features, shown as badges next to each hub. Studio
+                            refreshes each hub's list once a day.
+                          </li>
+                          <li>
+                            With <strong>Key witness</strong>, <strong>Check with Webring Hubs</strong> on
+                            a friend's card compares the key Studio pinned for them with the keys the hub
+                            has seen.
+                          </li>
+                          <li>
+                            It's most useful when Studio warns that a friend's key changed. It's one more
+                            opinion, not proof: nothing is saved and your pinned key isn't changed.
+                          </li>
+                        </ul>
+                      </div>
+
+                      <div className="p-4 rounded-xl bg-slate-950 border border-slate-800 space-y-2 md:col-span-2">
+                        <h4 className="font-bold text-sm text-purple-300">Privacy &amp; running your own hub</h4>
+                        <ul className="list-disc list-inside space-y-1 text-slate-300">
+                          <li>
+                            Your hub list is kept per persona, goes through that persona's proxy, and is
+                            never published.
+                          </li>
+                          <li>
+                            A listing shows only what your signed profile already publishes: name, handle,
+                            tagline, bio, location, interests, links and profile images.
+                          </li>
+                          <li>
+                            To run your own, use <code>webring-hub-php</code>: a PHP and MySQL server for
+                            ordinary shared hosting. Its operator page at <code>/admin</code> reviews,
+                            blocks and re-checks listings, and accepts a changed key once the owner
+                            confirms it.
+                          </li>
+                          <li>
+                            Agents can do all of this through the MCP tools <code>webring_hubs</code>,{' '}
+                            <code>webring_search_hub</code>, <code>webring_set_hub_listing</code> and{' '}
+                            <code>webring_check_key_with_hubs</code>.
+                          </li>
+                        </ul>
+                      </div>
+                    </div>
+
+                    <div className="flex flex-wrap justify-end gap-2">
+                      <button
+                        type="button"
+                        onClick={() => setActiveTab('publish')}
+                        className="px-4 py-2 rounded-xl bg-slate-800 hover:bg-slate-700 text-slate-200 text-xs font-semibold"
+                      >
+                        Add a Webring Hub →
+                      </button>
                       <button
                         type="button"
                         onClick={() => setActiveTab('friends')}
@@ -8195,6 +8410,27 @@ git push -u origin main --force`}
                           addition, the Persona Manager displays an automatic{' '}
                           <strong>OPSEC Correlation Warning</strong> if you accidentally assign two
                           personas to the same domain hostname.
+                        </p>
+                      </div>
+
+                      <div className="p-4 rounded-xl bg-slate-950 border border-slate-800 space-y-1.5">
+                        <h4 className="font-bold text-sm text-cyan-400">
+                          Q: What does a Webring Hub learn about me?
+                        </h4>
+                        <p className="text-xs text-slate-300 leading-relaxed">
+                          <strong>Only what you choose to share, and only what your site already
+                          publishes.</strong> Adding a hub doesn't list you; listing is a per-hub switch.
+                          When you search, the hub sees the search words. Results are never saved. Your
+                          hub list stays in that persona, goes through its proxy, and is never published.
+                          A listed site can only be unlisted with a request signed by its own key. See{' '}
+                          <button
+                            type="button"
+                            onClick={() => setHelpSection('hubs')}
+                            className="text-indigo-300 underline hover:text-indigo-200"
+                          >
+                            8. Webring Hubs
+                          </button>
+                          .
                         </p>
                       </div>
 

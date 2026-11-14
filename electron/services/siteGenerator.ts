@@ -35,7 +35,7 @@ export interface GeneratedSiteResult {
  * - /api/albums.json
  * - /api/items.json
  * - /api/connections.json
- * - /api/rings/<slug>.json + /rings/<slug>/index.html (signed hub and directory page per hosted ring)
+ * - /api/rings/<slug>.json + /rings/<slug>/index.html (signed ring file, the "hub", and directory page per hosted ring)
  * - /index.html (Standalone interactive profile site powered by the JSON files)
  */
 export class StaticSiteGenerator {
@@ -1376,7 +1376,7 @@ export function buildRingDirectoryHtml(doc: WebringHubDocument, style: RingPageS
   <meta property="og:description" content="${escapeHtml(doc.tagline || doc.description)}" />${
     banner ? `\n  <meta property="og:image" content="${escapeHtml(banner)}" />` : ''
   }${pageUrl ? `\n  <link rel="canonical" href="${escapeHtml(pageUrl)}" />` : ''}
-  <link rel="alternate" type="application/json" href="${escapeHtml(doc.hubUrl)}" title="Ring hub" />
+  <link rel="alternate" type="application/json" href="${escapeHtml(doc.hubUrl)}" title="Ring file (signed member list)" />
   <style>
     :root { ${palette} --accent: ${accent}; color-scheme: ${style.light ? 'light' : 'dark'}; }
     * { box-sizing: border-box; }
@@ -1438,7 +1438,7 @@ export function buildRingDirectoryHtml(doc: WebringHubDocument, style: RingPageS
         <li>Send the maintainer the request link Studio gives you.</li>
         <li>Once they approve and publish, Sync All adds the ring bar to your site.</li>
       </ol>
-      <p class="muted">Hub: <code>${escapeHtml(doc.hubUrl)}</code></p>
+      <p class="muted">Ring file (signed member list): <code>${escapeHtml(doc.hubUrl)}</code></p>
     </div>
   </section>`
   }

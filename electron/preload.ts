@@ -67,6 +67,14 @@ contextBridge.exposeInMainWorld('studioApi', {
   decideRingRequest: (link: string, decision: 'approve' | 'decline' | 'ban', reason?: string) =>
     ipcRenderer.invoke('studio:ring-decide-request', link, decision, reason),
   syncRings: () => ipcRenderer.invoke('studio:ring-sync-all'),
+  listWebringHubs: () => ipcRenderer.invoke('studio:webring-hub-list'),
+  addWebringHub: (url: string) => ipcRenderer.invoke('studio:webring-hub-add', url),
+  removeWebringHub: (url: string) => ipcRenderer.invoke('studio:webring-hub-remove', url),
+  searchWebringHub: (url: string, query: string, options?: { limit?: number; offset?: number }) =>
+    ipcRenderer.invoke('studio:webring-hub-search', url, query, options),
+  setWebringHubListed: (url: string, listed: boolean) =>
+    ipcRenderer.invoke('studio:webring-hub-set-listed', url, listed),
+  checkKeyWithWebringHubs: (siteUrl: string) => ipcRenderer.invoke('studio:webring-hub-check-key', siteUrl),
   createFriendNotice: (friendSiteUrl: string) => ipcRenderer.invoke('studio:friend-notice-create', friendSiteUrl),
   reviewFriendNotice: (link: string) => ipcRenderer.invoke('studio:friend-notice-review', link),
   acceptFriendNotice: (link: string) => ipcRenderer.invoke('studio:friend-notice-accept', link),

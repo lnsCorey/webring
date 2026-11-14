@@ -18,6 +18,7 @@ import {
   buildCanonicalUrl,
   buildDidDocument,
   buildWebringUri,
+  canonicalizeJson,
   createKeyRotationCertificate,
   documentFingerprint,
   generateIdentityKeyPair,
@@ -47,13 +48,24 @@ import { installPageEnhancements } from '../electron/services/pageEnhancements';
 import {
   defaultConditionalJsonFetcher,
   defaultJsonFetcher,
+  requestPublicJson,
   RingCrawler,
   SYNC_CONCURRENCY,
   type CrawlSiteResult,
 } from '../electron/services/ringCrawler';
 import { RingService } from '../electron/services/ringService';
+import {
+  WEBRING_HUB_INFO_MAX_AGE_MS,
+  WEBRING_HUB_PING_MAX_WAIT_MS,
+  WebringHubService,
+  webringHubSupports,
+  normalizeWebringHubUrl,
+  parseWebringHubExtensions,
+  publicKeyFingerprint,
+  type WebringHubRequester,
+} from '../electron/services/webringHubService';
 import { jobNextRunAt, nextRunAt, Scheduler } from '../electron/services/scheduler';
-import { runScheduledPublish } from '../electron/services/jobs';
+import { publishTo, runScheduledPublish } from '../electron/services/jobs';
 import { isPrivateNetworkAddress } from '../electron/security/networkGuard';
 import { PersonaManager } from '../electron/services/personaManager';
 import { gitBlobSha, SitePublisher } from '../electron/services/publisher';
@@ -5307,5 +5319,490 @@ describe('Guided setup: GitHub sign-in, site creation, publish and live check', 
     const profile = await mcp.executeToolCall('webring_get_profile', {});
     expect(JSON.stringify(profile)).not.toContain('gho_secret_token');
     expect(manager.getActiveContext().db.getProfile().publishSettings.githubOwner).toBe('Alice');
+  });
+});
+
+describe('Webring Hubs (optional third-party index)', () => {
+  let tempRoot: string;
+  let db: StudioDatabase;
+  let outDir: string;
+  const SITE = 'https://me.dir.test';
+  const HUB = 'https://hub.example';
+
+  /**
+   * A fake Webring Hub with the PHP edition's API. It checks removal signatures the way
+   * `Verify::verifyPayloadSignature` does: Ed25519 over canonicalizeJson(payload), base64url.
+   */
+  const makeWebringHub = (entries: Array<Record<string, unknown>> = []) => {
+    const calls: Array<{ method: string; url: string; body?: unknown }> = [];
+    const listed = new Map<string, { siteUrl: string; publicKeyPem: string }>();
+    const nonces = new Set<string>();
+    let refreshStatus = 200;
+    const request: WebringHubRequester = async (url, init) => {
+      calls.push({ method: init.method, url, body: init.body });
+      const u = new URL(url);
+      if (u.origin !== HUB) throw new Error(`HTTP 404 fetching ${url}`);
+      const p = u.pathname;
+      if (init.method === 'GET' && p === '/api/info') return { status: 200, json: { title: 'Test Hub' } };
+      if (init.method === 'GET' && p === '/api/entries') return { status: 200, json: { total: entries.length, entries } };
+      if (init.method === 'GET' && p === '/api/nonce') {
+        const nonce = crypto.randomBytes(8).toString('hex');
+        nonces.add(nonce);
+        return { status: 200, json: { nonce } };
+      }
+      if (init.method === 'POST' && p === '/api/entries') {
+        const siteUrl = String((init.body as { siteUrl?: string }).siteUrl);
+        listed.set(siteUrlToDidWeb(siteUrl), { siteUrl, publicKeyPem: db.getProfile().publicKeyPem });
+        return { status: 201, json: { entry: { siteUrl } } };
+      }
+      const refresh = p.match(/^\/api\/entries\/([^/]+)\/refresh$/);
+      if (init.method === 'POST' && refresh) {
+        if (!listed.has(decodeURIComponent(refresh[1]))) {
+          return { status: 404, json: { error: 'not_found', message: 'No such entry.' } };
+        }
+        return refreshStatus === 200
+          ? { status: 200, json: { entry: {} } }
+          : { status: refreshStatus, json: { error: 'key_changed', message: 'Key changed.' } };
+      }
+      const remove = p.match(/^\/api\/entries\/([^/]+)\/remove$/);
+      if (init.method === 'POST' && remove) {
+        const did = decodeURIComponent(remove[1]);
+        const row = listed.get(did);
+        if (!row) return { status: 404, json: { error: 'not_found', message: 'No such entry.' } };
+        const body = init.body as { siteUrl: string; nonce: string; createdAt: string; signature: string };
+        const payload = { action: 'remove', siteUrl: row.siteUrl, did, nonce: body.nonce, createdAt: body.createdAt };
+        const ok = crypto.verify(
+          null,
+          Buffer.from(canonicalizeJson(payload), 'utf8'),
+          row.publicKeyPem,
+          Buffer.from(body.signature, 'base64url')
+        );
+        if (!ok) return { status: 403, json: { error: 'invalid_signature', message: 'Bad signature.' } };
+        if (!nonces.delete(body.nonce)) return { status: 409, json: { error: 'invalid_nonce', message: 'Bad nonce.' } };
+        listed.delete(did);
+        return { status: 204, json: undefined };
+      }
+      return { status: 404, json: { error: 'not_found', message: 'Not found.' } };
+    };
+    return { calls, listed, request, setRefreshStatus: (status: number) => (refreshStatus = status) };
+  };
+
+  // Serves the persona's own published files as its live site
+  const liveSite = async (url: string): Promise<unknown> => {
+    const parsed = new URL(url);
+    const file = path.join(outDir, decodeURIComponent(parsed.pathname));
+    if (parsed.origin !== SITE || !fs.existsSync(file)) throw new Error(`HTTP 404 fetching ${url}`);
+    return JSON.parse(fs.readFileSync(file, 'utf8'));
+  };
+
+  const publish = () => new SitePublisher(new StaticSiteGenerator(db)).publishToLocalDirectory(outDir);
+
+  beforeEach(() => {
+    tempRoot = fs.mkdtempSync(path.join(os.tmpdir(), 'webring-hub-'));
+    db = new StudioDatabase(tempRoot, 'dir.sqlite');
+    db.updateProfile({ siteUrl: SITE, handle: 'me.dir.test', displayName: 'Me' });
+    outDir = path.join(tempRoot, 'public_html');
+  });
+
+  afterEach(() => {
+    db.close();
+    fs.rmSync(tempRoot, { recursive: true, force: true });
+  });
+
+  it('adds a hub only after it answers /api/info, unlisted by default, https only', async () => {
+    const hub = makeWebringHub();
+    const service = new WebringHubService(db, { request: hub.request, fetchJson: liveSite });
+    const added = await service.add('hub.example/');
+    expect(added).toMatchObject({ url: HUB, title: 'Test Hub', listMe: false, state: 'not-listed' });
+    await expect(service.add(HUB)).rejects.toThrow(/already/);
+    expect(() => normalizeWebringHubUrl('http://hub.example')).toThrow(/https/);
+    await expect(service.add('https://not-a-hub.example')).rejects.toThrow();
+    // Adding only asks /api/info, and never lists the site
+    expect(hub.calls.filter((c) => new URL(c.url).origin === HUB).map((c) => `${c.method} ${new URL(c.url).pathname}`)).toEqual([
+      'GET /api/info',
+    ]);
+  });
+
+  it('treats search results as hints: drops blocked and mismatched entries, off-site avatars, stores nothing', async () => {
+    db.addOrUpdateFriend({ siteUrl: 'https://friend.dir.test', displayName: 'Friend' });
+    db.setModeration('https://blocked.dir.test', 'block');
+    db.setModeration('https://muted.dir.test', 'mute');
+    const entry = (name: string, extra: Record<string, unknown> = {}) => ({
+      siteUrl: `https://${name}.dir.test`,
+      did: siteUrlToDidWeb(`https://${name}.dir.test`),
+      displayName: name,
+      avatarUrl: `https://${name}.dir.test/media/a.jpg`,
+      interests: ['film'],
+      ...extra,
+    });
+    const hub = makeWebringHub([
+      entry('stranger', { avatarUrl: 'https://tracker.example/pixel.gif' }),
+      entry('friend'),
+      entry('blocked'),
+      entry('muted'),
+      entry('me'),
+      entry('liar', { did: 'did:web:someone-else.dir.test' }),
+      entry('plain', { siteUrl: 'http://plain.dir.test', did: siteUrlToDidWeb('http://plain.dir.test') }),
+    ]);
+    const service = new WebringHubService(db, { request: hub.request, fetchJson: liveSite });
+    await service.add(HUB);
+    const graph = () => {
+      const { friends, webrings, endorsements } = db.buildSignedSiteBundle({ publish: true }).connections;
+      return JSON.stringify({ friends, webrings, endorsements });
+    };
+    const before = graph();
+    const res = await service.search(HUB, 'film');
+    const byName = Object.fromEntries(res.results.map((r) => [r.displayName, r]));
+    expect(Object.keys(byName).sort()).toEqual(['friend', 'me', 'muted', 'stranger']);
+    expect(byName.stranger.avatarUrl).toBe('');
+    expect(byName.friend).toMatchObject({ relation: 'friend', avatarUrl: 'https://friend.dir.test/media/a.jpg' });
+    expect(byName.me.relation).toBe('self');
+    expect(byName.muted.relation).toBe('muted');
+    // Nothing from the hub is kept or published
+    expect(db.getFriends().map((f) => f.siteUrl)).toEqual(['https://friend.dir.test']);
+    expect(graph()).toBe(before);
+    expect(JSON.stringify(db.buildSignedSiteBundle({ publish: true }))).not.toContain('hub.example');
+  });
+
+  it('lists the site only after a publish, and unlists it with a request signed by the site key', async () => {
+    const hub = makeWebringHub();
+    const service = new WebringHubService(db, { request: hub.request, fetchJson: liveSite });
+    await service.add(HUB);
+    await expect(service.listSite(HUB)).rejects.toThrow(/Publish your site first/);
+    expect(publish().success).toBe(true);
+
+    const listed = await service.listSite(HUB);
+    expect(listed).toMatchObject({ listMe: true, state: 'listed' });
+    expect(hub.calls.at(-1)).toMatchObject({ method: 'POST', body: { siteUrl: SITE } });
+    expect(() => service.remove(HUB)).toThrow(/Unlist it/);
+
+    const unlisted = await service.unlistSite(HUB);
+    expect(unlisted).toMatchObject({ listMe: false, state: 'not-listed' });
+    expect(hub.listed.size).toBe(0);
+    // The signed request carries a signature, never the key
+    expect(JSON.stringify(hub.calls)).not.toContain('PRIVATE KEY');
+    expect(service.remove(HUB)).toEqual([]);
+  });
+
+  it('pings listed hubs after publishTo, only once the live site shows that publish', async () => {
+    const hub = makeWebringHub();
+    const service = new WebringHubService(db, { request: hub.request, fetchJson: liveSite });
+    const ctx = {
+      persona: { id: 'default' },
+      db,
+      sitePublisher: new SitePublisher(new StaticSiteGenerator(db)),
+      webringHubService: service,
+    } as unknown as Parameters<typeof publishTo>[0];
+    const paths = { userDataDir: tempRoot, tempDir: tempRoot };
+    const refreshes = () => hub.calls.filter((c) => c.url.includes('/refresh')).length;
+
+    await service.add(HUB);
+    expect((await publishTo(ctx, 'local', paths, { targetDir: outDir })).success).toBe(true);
+    // Not listed: a publish pings nothing
+    expect(refreshes()).toBe(0);
+    await service.listSite(HUB);
+
+    // The live site still shows the previous publish: the ping waits
+    const staleCopy = fs.readFileSync(path.join(outDir, 'api/manifest.json'), 'utf8');
+    db.updateProfile({ tagline: 'Something new' });
+    const liveLagging = async (url: string) =>
+      new URL(url).pathname === '/api/manifest.json' ? JSON.parse(staleCopy) : liveSite(url);
+    const lagging = new WebringHubService(db, { request: hub.request, fetchJson: liveLagging });
+    await publishTo({ ...ctx, webringHubService: lagging } as typeof ctx, 'local', paths, { targetDir: outDir });
+    expect(lagging.hasPendingPings()).toBe(true);
+    expect(refreshes()).toBe(0);
+
+    // Once the live site shows it, the hub is asked to re-read
+    expect(await service.flushPendingPings()).toEqual([{ url: HUB, outcome: 'pinged' }]);
+    expect(refreshes()).toBe(1);
+    expect(service.hasPendingPings()).toBe(false);
+    expect(service.list()[0].lastPingAt).toBeTruthy();
+  });
+
+  it('MCP: a publish schedules the ping follow-ups, and Sync All sends a ping that was waiting', async () => {
+    const manager = new PersonaManager(path.join(tempRoot, 'studio'));
+    try {
+      const ctx = manager.getActiveContext();
+      ctx.db.updateProfile({ siteUrl: SITE, handle: 'me.dir.test', displayName: 'Me' });
+      ctx.db.updateProfile({ publishSettings: { ...ctx.db.getProfile().publishSettings, exportPath: outDir } });
+      const hub = makeWebringHub();
+      // A manifest the host is still serving from the previous publish, or null once it's live
+      let lagging: unknown = null;
+      const live = async (url: string) =>
+        lagging && new URL(url).pathname === '/api/manifest.json' ? lagging : liveSite(url);
+      ctx.webringHubService = new WebringHubService(ctx.db, { request: hub.request, fetchJson: live });
+      const refreshes = () => hub.calls.filter((c) => c.url.includes('/refresh')).length;
+
+      const mcp = new WebringMcpServer(manager, tempRoot);
+      const published: string[] = [];
+      mcp.attachAppServices({
+        publishPaths: () => ({ userDataDir: tempRoot, tempDir: tempRoot }),
+        deviceLogin: {} as GitHubDeviceLogin,
+        onPublished: (personaId) => published.push(personaId),
+      });
+
+      expect((await mcp.executeToolCall('webring_publish', { destination: 'local' })).isError).toBeUndefined();
+      expect(published).toEqual([ctx.persona.id]);
+      await ctx.webringHubService.add(HUB);
+      await ctx.webringHubService.listSite(HUB);
+
+      // GitHub Pages hasn't caught up: the ping waits, and the app is told to follow up
+      lagging = JSON.parse(fs.readFileSync(path.join(outDir, 'api/manifest.json'), 'utf8'));
+      ctx.db.updateProfile({ tagline: 'Something new' });
+      expect((await mcp.executeToolCall('webring_publish', { destination: 'local' })).isError).toBeUndefined();
+      expect(published).toEqual([ctx.persona.id, ctx.persona.id]);
+      expect(ctx.webringHubService.hasPendingPings()).toBe(true);
+      expect(refreshes()).toBe(0);
+
+      // Once the host shows it, the MCP Sync All sends it, like the Sync button
+      lagging = null;
+      const sync = await mcp.executeToolCall('webring_crawl_all_friends', {});
+      expect((sync.data as { webringHubs: unknown }).webringHubs).toEqual([{ url: HUB, outcome: 'pinged' }]);
+      expect(refreshes()).toBe(1);
+      expect(ctx.webringHubService.hasPendingPings()).toBe(false);
+    } finally {
+      manager.closeAll();
+    }
+  });
+
+  it('drops a ping that never goes live, and respects a hub that removed the listing', async () => {
+    const hub = makeWebringHub();
+    let now = new Date('2026-11-01T00:00:00Z');
+    const neverLive = async () => ({ updatedAt: '2000-01-01T00:00:00Z' });
+    const service = new WebringHubService(db, { request: hub.request, fetchJson: neverLive, now: () => now });
+    publish();
+    await service.add(HUB);
+    await service.listSite(HUB);
+
+    service.markPublished('2026-11-01T00:00:00.000Z');
+    expect(await service.flushPendingPings()).toEqual([{ url: HUB, outcome: 'waiting' }]);
+    now = new Date(now.getTime() + WEBRING_HUB_PING_MAX_WAIT_MS + 1000);
+    expect(await service.flushPendingPings()).toEqual([{ url: HUB, outcome: 'dropped' }]);
+    expect(service.hasPendingPings()).toBe(false);
+
+    // The operator deleted the entry: Studio stops, and doesn't quietly re-submit
+    const live = new WebringHubService(db, { request: hub.request, fetchJson: liveSite, now: () => now });
+    hub.listed.clear();
+    live.markPublished(db.getPublishedManifestUpdatedAt());
+    const [result] = await live.flushPendingPings();
+    expect(result.outcome).toBe('not-listed');
+    expect(live.list()[0]).toMatchObject({ listMe: false, state: 'not-listed' });
+    const submissions = hub.calls.filter((c) => c.method === 'POST' && new URL(c.url).pathname === '/api/entries');
+    expect(submissions).toHaveLength(1);
+  });
+
+  it('marks a listing whose key the hub refuses as key-changed', async () => {
+    const hub = makeWebringHub();
+    const service = new WebringHubService(db, { request: hub.request, fetchJson: liveSite });
+    publish();
+    await service.add(HUB);
+    await service.listSite(HUB);
+    hub.setRefreshStatus(409);
+    service.markPublished(db.getPublishedManifestUpdatedAt());
+    const [result] = await service.flushPendingPings();
+    expect(result.outcome).toBe('key-changed');
+    expect(service.list()[0].state).toBe('key-changed');
+  });
+
+  it('keeps hubs per persona and out of the published export', async () => {
+    const hub = makeWebringHub();
+    await new WebringHubService(db, { request: hub.request }).add(HUB);
+    const other = new StudioDatabase(tempRoot, 'other.sqlite');
+    try {
+      expect(other.getWebringHubs()).toEqual([]);
+    } finally {
+      other.close();
+    }
+    publish();
+    const walk = (dir: string): string[] =>
+      fs
+        .readdirSync(dir, { withFileTypes: true })
+        .flatMap((e) => (e.isDirectory() ? walk(path.join(dir, e.name)) : [path.join(dir, e.name)]));
+    for (const file of walk(outDir)) {
+      if (/\.(json|html)$/.test(file)) expect(fs.readFileSync(file, 'utf8')).not.toContain('hub.example');
+    }
+  });
+
+  it('moves the pre-rename directoriesJson setting to webringHubsJson once, without losing data', () => {
+    const raw = (d: StudioDatabase) => (d as unknown as { db: DatabaseSync }).db;
+    const setting = (d: StudioDatabase, key: string) =>
+      (raw(d).prepare('SELECT value FROM local_settings WHERE key = ?').get(key) as { value: string } | undefined)?.value;
+    const saved = [{ url: HUB, title: 'Test Hub', addedAt: '2026-11-01T00:00:00.000Z', listMe: true, state: 'listed' }];
+    raw(db).prepare("INSERT INTO local_settings (key, value) VALUES ('directoriesJson', ?)").run(JSON.stringify(saved));
+
+    expect(db.getWebringHubs()).toEqual(saved);
+    expect(setting(db, 'directoriesJson')).toBeUndefined();
+    expect(JSON.parse(setting(db, 'webringHubsJson')!)).toEqual(saved);
+
+    // Survives a reopen, and a stray old key never overwrites the new one
+    db.close();
+    db = new StudioDatabase(tempRoot, 'dir.sqlite');
+    raw(db).prepare("INSERT INTO local_settings (key, value) VALUES ('directoriesJson', '[]')").run();
+    expect(db.getWebringHubs()).toEqual(saved);
+    expect(setting(db, 'directoriesJson')).toBeUndefined();
+  });
+
+  it('sends hub API calls through the private-network guard', async () => {
+    await expect(
+      requestPublicJson('http://127.0.0.1:9/api/entries', { method: 'POST', body: { siteUrl: SITE } })
+    ).rejects.toThrow(/private or local network address/);
+  });
+
+  describe('hub extensions: key-witness', () => {
+    const FRIEND = 'https://friend.witness.test';
+    const FRIEND_DID = siteUrlToDidWeb(FRIEND);
+    const OTHER_HUB = 'https://plain-hub.example';
+    const pemOf = () =>
+      crypto.generateKeyPairSync('ed25519').publicKey.export({ type: 'spki', format: 'pem' }).toString();
+
+    /**
+     * Two fake hubs: one advertising key-witness v1 (answers with `witness`), one with no
+     * extensions. Records every request so tests can tell who was asked about what.
+     */
+    const makeWitnessWebringHubs = (witness: (did: string) => { status: number; json: unknown }) => {
+      const calls: string[] = [];
+      const request: WebringHubRequester = async (url, init) => {
+        calls.push(`${init.method} ${url}`);
+        const u = new URL(url);
+        if (u.pathname === '/api/info') {
+          return u.origin === HUB
+            ? {
+                status: 200,
+                json: {
+                  title: 'Witness Hub',
+                  extensions: [
+                    { id: 'key-witness', version: '1.0.0', apiVersion: 1 },
+                    { id: 'future-thing', version: '0.1.0', apiVersion: 3 },
+                    { id: 'Bad Id', version: '1', apiVersion: 1 },
+                  ],
+                },
+              }
+            : { status: 200, json: { title: 'Plain Hub' } };
+        }
+        const m = u.pathname.match(/^\/api\/ext\/key-witness\/v1\/keys\/([^/]+)$/);
+        if (u.origin === HUB && init.method === 'GET' && m) return witness(decodeURIComponent(m[1]));
+        return { status: 404, json: { error: 'not_found', message: 'Not found.' } };
+      };
+      return { calls, request };
+    };
+
+    it('reads advertised extensions from /api/info and keeps only well-formed ones', async () => {
+      const hubs = makeWitnessWebringHubs(() => ({ status: 404, json: {} }));
+      const service = new WebringHubService(db, { request: hubs.request, fetchJson: liveSite });
+      const witness = await service.add(HUB);
+      const plain = await service.add(OTHER_HUB);
+      expect(witness.extensions).toEqual([
+        { id: 'key-witness', version: '1.0.0', apiVersion: 1 },
+        { id: 'future-thing', version: '0.1.0', apiVersion: 3 },
+      ]);
+      expect(plain.extensions).toEqual([]);
+      expect(webringHubSupports(witness, 'key-witness')).toBe(true);
+      // Unknown ids, or a known id at an API version Studio doesn't speak, are not used
+      expect(webringHubSupports(witness, 'future-thing')).toBe(false);
+      expect(webringHubSupports({ ...witness, extensions: [{ id: 'key-witness', version: '2', apiVersion: 2 }] }, 'key-witness')).toBe(false);
+      expect(parseWebringHubExtensions({ extensions: 'nope' })).toEqual([]);
+    });
+
+    it('fingerprints keys the same way as the PHP hub (shared vector)', () => {
+      // Same vector as webring-hub-php/scripts/smoke-extensions.php: seed of 32 0x07 bytes
+      const pem =
+        '-----BEGIN PUBLIC KEY-----\nMCowBQYDK2VwAyEA6kpsY+KcUgq+9VB7Ey7F+ZVHdq6+vnuSQh7qaRRG0iw=\n-----END PUBLIC KEY-----\n';
+      expect(publicKeyFingerprint(pem)).toBe('324be2dea8bc44461b0233e51fa48902ed6b1cc671e7739af2551e0bfe68f54e');
+    });
+
+    it('compares the pinned key with witnesses, asks only hubs with the extension, stores nothing', async () => {
+      const pinnedPem = pemOf();
+      const otherPem = pemOf();
+      db.addOrUpdateFriend({ siteUrl: FRIEND, displayName: 'Friend' });
+      expect(db.pinSiteKey(FRIEND, FRIEND_DID, pinnedPem)).toBe('pinned');
+      const pinnedFp = publicKeyFingerprint(pinnedPem);
+      const otherFp = publicKeyFingerprint(otherPem);
+
+      let answer: { status: number; json: unknown } = {
+        status: 200,
+        json: {
+          did: FRIEND_DID,
+          siteUrl: FRIEND,
+          current: { fingerprint: pinnedFp, since: '2026-01-01T00:00:00.000Z' },
+          history: [
+            { fingerprint: pinnedFp, outcome: 'first-seen', firstSeenAt: '2026-01-01T00:00:00.000Z', lastSeenAt: '2026-11-01T00:00:00.000Z' },
+            { fingerprint: otherFp, outcome: 'rejected', firstSeenAt: '2026-10-01T00:00:00.000Z', lastSeenAt: '2026-10-02T00:00:00.000Z' },
+          ],
+        },
+      };
+      const hubs = makeWitnessWebringHubs(() => answer);
+      const service = new WebringHubService(db, { request: hubs.request, fetchJson: liveSite });
+      await service.add(HUB);
+      await service.add(OTHER_HUB);
+
+      const settingsBefore = JSON.stringify(db.getWebringHubs());
+      const friendsBefore = JSON.stringify(db.getFriends());
+      hubs.calls.length = 0;
+
+      const match = await service.checkKeyWithWebringHubs(FRIEND);
+      expect(match.pinnedFingerprint).toBe(pinnedFp);
+      expect(match.results).toEqual([
+        expect.objectContaining({
+          webringHubUrl: HUB,
+          result: 'match',
+          since: '2026-01-01T00:00:00.000Z',
+          pinnedKeySeen: true,
+          currentOutcome: 'first-seen',
+          rejectedKeys: 1,
+        }),
+      ]);
+      // Only the witness hub was asked about the friend; the plain one wasn't contacted
+      expect(hubs.calls).toEqual([`GET ${HUB}/api/ext/key-witness/v1/keys/${encodeURIComponent(FRIEND_DID)}`]);
+
+      // The hub followed a signed rotation to a key Studio hasn't seen
+      answer = {
+        status: 200,
+        json: {
+          did: FRIEND_DID,
+          current: { fingerprint: otherFp, since: '2026-11-01T00:00:00.000Z' },
+          history: [
+            { fingerprint: pinnedFp, outcome: 'first-seen' },
+            { fingerprint: otherFp, outcome: 'rotated' },
+          ],
+        },
+      };
+      const mismatch = await service.checkKeyWithWebringHubs(FRIEND);
+      expect(mismatch.results[0]).toMatchObject({ result: 'mismatch', currentOutcome: 'rotated', pinnedKeySeen: true, rejectedKeys: 0 });
+
+      // An answer about a different DID is not trusted
+      answer = { status: 200, json: { did: 'did:web:someone-else.test', current: { fingerprint: pinnedFp } } };
+      expect((await service.checkKeyWithWebringHubs(FRIEND)).results[0].result).toBe('error');
+
+      answer = { status: 404, json: { error: 'not_found' } };
+      expect((await service.checkKeyWithWebringHubs(FRIEND)).results[0].result).toBe('not-listed');
+
+      // Nothing was stored, the pinned key is unchanged, and nothing reaches the export
+      expect(JSON.stringify(db.getWebringHubs())).toBe(settingsBefore);
+      expect(JSON.stringify(db.getFriends())).toBe(friendsBefore);
+      expect(db.getSiteKey(FRIEND)?.publicKeyPem).toBe(pinnedPem);
+      const bundle = JSON.stringify(db.buildSignedSiteBundle({ publish: true }));
+      expect(bundle).not.toContain('key-witness');
+      expect(bundle).not.toContain(otherFp);
+    });
+
+    it('refuses to check a site with no pinned key, and re-reads stale hub info first', async () => {
+      const hubs = makeWitnessWebringHubs(() => ({ status: 404, json: {} }));
+      let clock = new Date('2026-11-12T00:00:00.000Z');
+      const service = new WebringHubService(db, { request: hubs.request, fetchJson: liveSite, now: () => clock });
+      await service.add(HUB);
+      await expect(service.checkKeyWithWebringHubs('https://unknown.witness.test')).rejects.toThrow(/pinned/);
+
+      db.addOrUpdateFriend({ siteUrl: FRIEND, displayName: 'Friend' });
+      db.pinSiteKey(FRIEND, FRIEND_DID, pemOf());
+      hubs.calls.length = 0;
+      await service.checkKeyWithWebringHubs(FRIEND);
+      expect(hubs.calls.some((c) => c.endsWith('/api/info'))).toBe(false);
+
+      clock = new Date(clock.getTime() + WEBRING_HUB_INFO_MAX_AGE_MS + 1000);
+      hubs.calls.length = 0;
+      await service.checkKeyWithWebringHubs(FRIEND);
+      expect(hubs.calls[0]).toBe(`GET ${HUB}/api/info`);
+      expect(db.getWebringHubs()[0].infoCheckedAt).toBe(clock.toISOString());
+    });
   });
 });

@@ -151,17 +151,17 @@ export class RingService {
     const raw = (await this.fetchPublicJson(url)) as Record<string, unknown>;
     const doc = WebringHubDocumentSchema.parse(raw);
     if (doc.hubUrl.trim() !== url) {
-      throw new Error(`This hub says it lives at ${doc.hubUrl}, not ${url}`);
+      throw new Error(`This ring file says it lives at ${doc.hubUrl}, not ${url}`);
     }
     const maintainerUrl = normalizeSiteUrl(doc.maintainerUrl);
     if (!isUrlWithinSite(url, maintainerUrl)) {
-      throw new Error(`Hub ${url} isn't on its maintainer's site (${maintainerUrl})`);
+      throw new Error(`The ring file ${url} isn't on its maintainer's site (${maintainerUrl})`);
     }
     if (!doc.proof) {
-      return { doc, verified: false, keyChanged: false, warning: 'Unsigned (older) hub: membership can’t be verified.' };
+      return { doc, verified: false, keyChanged: false, warning: 'Unsigned (older) ring file: membership can’t be verified.' };
     }
     if (doc.maintainerDid !== siteUrlToDidWeb(maintainerUrl)) {
-      throw new Error(`Hub maintainer DID doesn't match ${maintainerUrl}`);
+      throw new Error(`The ring file's maintainer DID doesn't match ${maintainerUrl}`);
     }
     const key = await this.fetchSiteKey(maintainerUrl);
     if (key.keyChanged) {
@@ -173,7 +173,7 @@ export class RingService {
       };
     }
     if (!verifyDocumentSignature(raw as Parameters<typeof verifyDocumentSignature>[0], key.publicKeyPem)) {
-      throw new Error('Hub signature is invalid.');
+      throw new Error("The ring file's signature is invalid.");
     }
     return { doc, verified: true, keyChanged: false };
   }
@@ -193,11 +193,11 @@ export class RingService {
     try {
       pointer = await this.fetchPublicJson(page.toString());
     } catch {
-      throw new Error(`${url} isn't a ring page or hub. Ask the maintainer for their ring page link.`);
+      throw new Error(`${url} isn't a ring address (a ring page or ring file). Ask the maintainer for their ring page link.`);
     }
     const hubUrl = String((pointer as { hubUrl?: unknown })?.hubUrl || '').trim();
     if (!hubUrl || new URL(hubUrl).origin !== page.origin) {
-      throw new Error(`The ring page at ${url} doesn't point to a hub on its own site.`);
+      throw new Error(`The ring page at ${url} doesn't point to a ring file on its own site.`);
     }
     return hubUrl;
   }
@@ -468,7 +468,7 @@ export class RingService {
       } else {
         // Legacy rows and unverified hubs are never removed automatically
         const warning =
-          hub.warning || 'This hub doesn’t list your site. Request to join, or delete the ring.';
+          hub.warning || 'This ring’s member list doesn’t include your site. Request to join, or delete the ring.';
         this.db.upsertJoinedRing({ ...common, syncWarning: warning });
         results.push({ hubUrl: ring.hubUrl, name: ring.name, outcome: 'unchanged', warning });
       }
